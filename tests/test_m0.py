@@ -74,6 +74,39 @@ def test_config_rejects_psd_larger_than_rve():
     # 16 um particles do not fit a 32 * 0.5 um = 16 um periodic box
     with pytest.raises(ValidationError):
         TinnConfig.model_validate(_base_config(rve={"grid_size": 32, "voxel_size_um": 0.5, "seed": 1}))
+    # near-extent diameters that the rasterizer halo cannot fit are rejected too
+    bad_psd = {"bins": [{"d_lo_um": 29.0, "d_hi_um": 31.0, "volume_fraction": 1.0}]}
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(_base_config(psd=bad_psd))
+
+
+def test_config_cross_validation():
+    # tabulated table must cover every reacting binder phase
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(
+            _base_config(binder={"mass_fractions": {"C3S": 0.5, "C2S": 0.5}}))
+    # output times must not exceed the tabulated horizon (168 h in the fixture)
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(_base_config(schedule={"output_times_h": [6.0, 500.0]}))
+    # stoichiometric rules must be element-balanced
+    bad_rule = {"backend": "stoichiometric",
+                "stoichiometric_rules": {"C3S": {"water_mol": 2.0, "products": {"CH": 3.0}}}}
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(_base_config(chemistry=bad_rule))
+    # stoichiometric backend needs a rule for every reacting phase
+    partial = {"backend": "stoichiometric",
+               "stoichiometric_rules": {"C2S": {"water_mol": 4.3,
+                                                "products": {"CSH": 1.0, "CH": 0.3}}}}
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(_base_config(chemistry=partial))
+    # gems3k takes no rules, and unused rules never enter its config_hash
+    with pytest.raises(ValidationError):
+        TinnConfig.model_validate(_base_config(
+            chemistry={"backend": "gems3k",
+                       "stoichiometric_rules": {"C3S": {"water_mol": 5.3,
+                                                        "products": {"CSH": 1.0, "CH": 1.3}}}}))
+    g = TinnConfig.model_validate(_base_config(chemistry={"backend": "gems3k"}))
+    assert g.chemistry.stoichiometric_rules is None
 
 
 # ---------- registry ----------

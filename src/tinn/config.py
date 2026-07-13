@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .registry import KINETIC_PHASE_IDS, default_registry
+
+# The rasterizer's periodic bounding box needs d/h + sqrt(3) + 2 voxels
+# (half-diagonal halo on each side plus floor granularity); keep in sync with
+# geometry._rasterize_sphere.
+RASTER_HALO_VOX = 2.0 + math.sqrt(3.0)
 
 _STRICT = ConfigDict(extra="forbid")
 
@@ -166,16 +172,43 @@ def _default_rules() -> Dict[str, "ReactionRule"]:
     }
 
 
+def _check_rule_element_balance(phase_id: str, rule: ReactionRule) -> None:
+    """Reactant + water elements must equal product elements (PRD §6.1 is blocking)."""
+    reg = default_registry()
+    lhs: Dict[str, float] = dict(reg.get(phase_id).formula)
+    for el, n in reg.get("H2O").formula.items():
+        lhs[el] = lhs.get(el, 0.0) + rule.water_mol * n
+    rhs: Dict[str, float] = {}
+    for pid, coeff in rule.products.items():
+        for el, n in reg.get(pid).formula.items():
+            rhs[el] = rhs.get(el, 0.0) + coeff * n
+    for el in set(lhs) | set(rhs):
+        if abs(lhs.get(el, 0.0) - rhs.get(el, 0.0)) > 1e-9:
+            raise ValueError(
+                f"stoichiometric rule for {phase_id} is not element-balanced: "
+                f"{el} lhs={lhs.get(el, 0.0)} rhs={rhs.get(el, 0.0)}"
+            )
+
+
 class ChemistryConfig(BaseModel):
     model_config = _STRICT
     backend: Literal["stoichiometric", "gems3k"]
-    stoichiometric_rules: Dict[str, ReactionRule] = Field(default_factory=_default_rules)
+    # None for gems3k (kept out of config_hash); defaults filled for stoichiometric.
+    stoichiometric_rules: Optional[Dict[str, ReactionRule]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "ChemistryConfig":
+        if self.backend == "gems3k":
+            if self.stoichiometric_rules is not None:
+                raise ValueError("gems3k backend does not take stoichiometric_rules")
+            return self
+        if self.stoichiometric_rules is None:
+            self.stoichiometric_rules = _default_rules()
         unknown = set(self.stoichiometric_rules) - set(KINETIC_PHASE_IDS)
         if unknown:
             raise ValueError(f"stoichiometric rules for unknown phases: {sorted(unknown)}")
+        for phase_id, rule in self.stoichiometric_rules.items():
+            _check_rule_element_balance(phase_id, rule)
         return self
 
 
@@ -218,12 +251,34 @@ class TinnConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> "TinnConfig":
-        extent_um = self.rve.grid_size * self.rve.voxel_size_um
-        if self.psd.d_max_um >= extent_um:
+        d_max_allowed_um = (self.rve.grid_size - RASTER_HALO_VOX) * self.rve.voxel_size_um
+        if self.psd.d_max_um > d_max_allowed_um:
             raise ValueError(
-                f"largest PSD diameter {self.psd.d_max_um} um must be smaller than the "
-                f"periodic RVE extent {extent_um} um"
+                f"largest PSD diameter {self.psd.d_max_um} um exceeds the rasterizable "
+                f"maximum {d_max_allowed_um:.3f} um for a {self.rve.grid_size}^3 periodic "
+                f"RVE at {self.rve.voxel_size_um} um/voxel"
             )
+        active = {p for p, f in self.binder.mass_fractions.items() if f > 0.0}
+        if self.kinetics.kind == "tabulated":
+            missing = active - set(self.kinetics.table.alpha)
+            if missing:
+                raise ValueError(
+                    f"tabulated kinetics has no alpha series for binder phases "
+                    f"{sorted(missing)} — every reacting phase needs a schedule"
+                )
+            horizon = self.kinetics.table.times_h[-1]
+            if self.schedule.output_times_h[-1] > horizon:
+                raise ValueError(
+                    f"output time {self.schedule.output_times_h[-1]} h is beyond the "
+                    f"tabulated kinetics horizon {horizon} h — no extrapolation"
+                )
+        if self.chemistry.backend == "stoichiometric":
+            missing = active - set(self.chemistry.stoichiometric_rules)
+            if missing:
+                raise ValueError(
+                    f"stoichiometric backend has no reaction rule for binder phases "
+                    f"{sorted(missing)}"
+                )
         return self
 
     def config_hash(self) -> str:

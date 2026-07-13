@@ -15,8 +15,11 @@ from .config import TinnConfig
 def _validate_config(path: str) -> int:
     try:
         cfg = TinnConfig.from_json_file(path)
-    except FileNotFoundError:
-        print(f"error: config file not found: {path}", file=sys.stderr)
+    except OSError as e:
+        print(f"error: cannot read config file {path}: {e}", file=sys.stderr)
+        return 2
+    except UnicodeDecodeError as e:
+        print(f"error: config file {path} is not UTF-8: {e}", file=sys.stderr)
         return 2
     except json.JSONDecodeError as e:
         print(f"error: invalid JSON in {path}: {e}", file=sys.stderr)
