@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinn"
+version = "0.2.0"
+description = "TINN cement hydration 4D platform v2"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "pydantic>=2.5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

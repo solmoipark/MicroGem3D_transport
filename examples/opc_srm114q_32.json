@@ -1,0 +1,9 @@
+{
+  "binder": {"mass_fractions": {"C3S": 0.60, "C2S": 0.14, "C3A": 0.07, "C4AF": 0.10}},
+  "w_c": 0.5,
+  "temperature_K": 293.15,
+  "kinetics": {"kind": "pk", "preset": "pk_elakneswaran_2018"},
+  "rve": {"grid_size": 32, "voxel_size_um": 1.0, "seed": 20260714},
+  "chemistry": {"backend": "stoichiometric"},
+  "schedule": {"output_times_h": [24.0, 72.0, 168.0]}
+}

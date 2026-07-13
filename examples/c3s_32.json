@@ -1,0 +1,15 @@
+{
+  "binder": {"mass_fractions": {"C3S": 1.0}},
+  "w_c": 0.5,
+  "temperature_K": 293.15,
+  "kinetics": {
+    "kind": "tabulated",
+    "table": {
+      "times_h": [0.0, 6.0, 24.0, 72.0, 168.0],
+      "alpha": {"C3S": [0.0, 0.05, 0.15, 0.28, 0.35]}
+    }
+  },
+  "rve": {"grid_size": 32, "voxel_size_um": 1.0, "seed": 42},
+  "chemistry": {"backend": "stoichiometric"},
+  "schedule": {"output_times_h": [6.0, 24.0, 72.0, 168.0]}
+}
