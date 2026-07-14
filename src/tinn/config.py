@@ -125,7 +125,8 @@ class KineticsConfig(BaseModel):
     table: Optional[TabulatedTable] = None
     blaine_m2_kg: Optional[float] = None
     # numerical policy for the P&K explicit-Euler integration (PRD §4.1)
-    pk_alpha_seed: float = Field(default=1e-8, gt=0.0, lt=1.0)
+    # >= 1e-15 keeps 1 - seed representable so the Jander denominator stays finite
+    pk_alpha_seed: float = Field(default=1e-8, ge=1e-15, lt=1.0)
     pk_max_substep_days: float = Field(default=0.01, gt=0.0)
 
     @model_validator(mode="after")

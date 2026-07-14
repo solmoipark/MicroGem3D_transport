@@ -118,6 +118,11 @@ class ParrotKilloh:
         if preset_name not in PK_PRESETS:
             raise ValueError(
                 f"unknown P&K preset {preset_name!r}; choose one of {sorted(PK_PRESETS)}")
+        for name, value in (("w_c", w_c), ("temperature_k", temperature_k),
+                            ("blaine_m2_kg", blaine_m2_kg),
+                            ("max_substep_days", max_substep_days)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive, got {value}")
         p = PK_PRESETS[preset_name]
         self.preset = p
         rows = np.asarray(p.params)
@@ -177,10 +182,13 @@ class ParrotKilloh:
     def controlling_rates(self, alpha: np.ndarray) -> np.ndarray:
         """Corrected min(R_ng, R_df, R_hs) in day^-1 (without water retardation)."""
         r_ng, r_df, r_hs = self.rate_components(alpha)
+        # every component must be finite BEFORE selection — an inf in a
+        # non-controlling rate signals a degenerate configuration, not health
+        for comp in (r_ng, r_df, r_hs):
+            if not np.all(np.isfinite(comp)):
+                raise FloatingPointError("P&K rate evaluation produced a non-finite value")
         rates = np.minimum(np.minimum(r_ng, r_df), r_hs)
         rates[np.asarray(alpha) >= 1.0] = 0.0
-        if not np.all(np.isfinite(rates)):
-            raise FloatingPointError("P&K rate evaluation produced a non-finite value")
         return rates
 
     def _step(self, alpha: np.ndarray, dt_days: float) -> np.ndarray:
@@ -189,15 +197,21 @@ class ParrotKilloh:
         return np.clip(alpha + dt_days * rates * water, alpha, 1.0)
 
     def alpha_at(self, t_h: float) -> np.ndarray:
-        """Pure function of t: integrate 0 -> t with the fixed substep policy."""
+        """Pure function of t, integrated on a FIXED absolute grid (full
+        max_substep_days steps plus one remainder step). Different query times
+        share the same grid prefix, so targets do not jitter between adjacent
+        engine steps and exact substep multiples are float-stable."""
         t_days = t_h / 24.0
         alpha = np.zeros(len(KINETIC_PHASE_IDS))
         if t_days <= 0.0:
             return alpha
-        n_sub = max(1, math.ceil(t_days / self.max_substep_days))
-        dt = t_days / n_sub
-        for _ in range(n_sub):
-            alpha = self._step(alpha, dt)
+        h = self.max_substep_days
+        n_full = int(math.floor(t_days / h + 1e-9))
+        remainder = t_days - n_full * h
+        for _ in range(n_full):
+            alpha = self._step(alpha, h)
+        if remainder > 1e-12 * max(1.0, t_days):
+            alpha = self._step(alpha, remainder)
         # phases with no mass in the recipe have no meaningful alpha target
         return np.where(self._weights > 0.0, alpha, 0.0)
 

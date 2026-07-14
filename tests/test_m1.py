@@ -429,9 +429,12 @@ def test_engine_step_metrics_within_bounds(short_run):
 
 def test_smoke_alpha_035_no_rejects(full_run):
     _, state, summary, _ = full_run
-    # a sealed wet pocket may leave a tiny honest unmet deficit (water-limited
-    # dissolution), so alpha tracks the table to ~1e-5, not exactly
-    assert state.alpha()[0] == pytest.approx(0.35, abs=1e-5)
+    # a sealed wet pocket leaves a small honest unmet deficit (water-limited
+    # dissolution); the accounting identity dissolved + unmet = summed targets
+    # must hold to ledger precision
+    assert state.alpha()[0] == pytest.approx(0.35, abs=1e-4)
+    achieved_plus_unmet = state.alpha()[0] + state.unmet_mol[0] / state.initial_phase_mol[0]
+    assert achieved_plus_unmet == pytest.approx(0.35, abs=1e-9)
     assert state.reject_counts == {}
     assert float(state.unmet_mol.max()) <= 1e-12
 

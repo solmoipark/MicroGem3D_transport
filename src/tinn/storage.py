@@ -151,6 +151,11 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
                 f"checkpoint {key} {header[key]} does not match this build "
                 f"{list(current)} — ledger vectors would be misinterpreted")
     config = TinnConfig.model_validate(header["config"])
+    if config.config_hash() != header["config_hash"]:
+        raise StorageError(
+            "checkpoint config_hash does not match the hash of its own embedded "
+            "config under this build — the config schema changed between versions; "
+            "restarting would silently poison run provenance (no silent fallback)")
 
     arrays = {f: _read_zarr_array(root / "arrays" / f) for f in _DENSE_FIELDS}
     cluster_inventory = _read_zarr_array(root / "arrays" / "cluster_inventory")

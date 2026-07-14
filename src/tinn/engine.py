@@ -88,11 +88,13 @@ class Engine:
                             for h in HYDRATE_PHASE_IDS])
         gel_eps = np.array([reg.get(h).gel_porosity for h in HYDRATE_PHASE_IDS])
 
-        # kinetic targets: reach alpha(t+dt), catching up any previous deficit
-        alpha_target = self.kinetics.alpha_at(trial.time_h + dt_h)
-        dissolved = trial.initial_phase_mol - trial.phase_mol
-        dn = np.clip(trial.initial_phase_mol * alpha_target - dissolved,
-                     0.0, trial.phase_mol)
+        # kinetic target for THIS interval only: dn = initial_mol * delta_alpha
+        # (PRD §4.2). A shortfall stays recorded as cumulative unmet — it is
+        # never re-demanded, so per-step demand always shrinks with dt and a
+        # transient blockage cannot balloon into an unplaceable catch-up burst.
+        d_alpha = (self.kinetics.alpha_at(trial.time_h + dt_h)
+                   - self.kinetics.alpha_at(trial.time_h))
+        dn = np.clip(trial.initial_phase_mol * d_alpha, 0.0, trial.phase_mol)
 
         prev_liquid = trial.capillary_liquid.copy()
         labels, n_clusters = transport.label_clusters(prev_liquid)
@@ -249,7 +251,7 @@ class Engine:
         chem_total = float(chem_mol_c.sum())
         gel_total = float(gel_mol_c.sum())
         trial.phase_mol = trial.phase_mol - dis.removed_mol
-        trial.unmet_mol = dis.unmet_mol.copy()
+        trial.unmet_mol = trial.unmet_mol + dis.unmet_mol
         trial.hydrate_mol = trial.hydrate_mol + hydrate_add
         trial.water_free_mol -= chem_total + gel_total
         trial.water_gel_mol += gel_total
