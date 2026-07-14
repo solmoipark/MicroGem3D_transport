@@ -105,7 +105,8 @@ def test_config_cross_validation():
             chemistry={"backend": "gems3k",
                        "stoichiometric_rules": {"C3S": {"water_mol": 5.3,
                                                         "products": {"CSH": 1.0, "CH": 1.3}}}}))
-    g = TinnConfig.model_validate(_base_config(chemistry={"backend": "gems3k"}))
+    g = TinnConfig.model_validate(_base_config(
+        chemistry={"backend": "gems3k", "gems_bundle_lst": "gems_bundles/PC/PC-dat.lst"}))
     assert g.chemistry.stoichiometric_rules is None
 
 

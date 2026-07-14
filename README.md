@@ -37,7 +37,10 @@ py -3 -m pytest -q
 - [x] **M2** — P&K 동역학: 2 프리셋(Elakneswaran 2018 / CemGEMS 2021) 발표 표
       그대로, SRM 114q(Blaine 381.8) 4상 alpha 스케줄, OPC 32³ 3D 런 32초에
       상별 원장 폐쇄. 수화물 외피 코팅으로 후기 unmet이 정직하게 기록됨.
-- [ ] M3 — GEMS 0D 프로브
+- [x] **M3** — GEMS 0D 프로브: 격리 워커(xgems는 워커 프로세스에서만 import),
+      번들 sha256 전후 감사, §6.2 앵커 2건 재현(pH 13.596951 / 12.6619),
+      0D 누적 프로브 원소·물 폐쇄 ≤3e-14. 워커 인터프리터:
+      `miniforge3/envs/py313-xgems` (환경변수 `TINN_GEMS_PYTHON`로 재지정).
 - [ ] M4 — GEMS→3D 결합
 - [ ] M5 — 분석과 리포트
 
@@ -55,5 +58,6 @@ py -3 -m pytest -q
 `dissolution.py`(액체 접촉 가중 배분), `transport.py`(클러스터 라벨링+리매핑),
 `backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),
 `engine.py`(트랜잭션 오케스트레이터), `storage.py`(Zarr-v2 체크포인트),
+`gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브),
 `cli.py`(validate-config/run/restart), `__init__.py`.
-남은 슬롯: `gems.py`(M3), `analysis.py`(M5).
+남은 슬롯: `analysis.py`(M5).

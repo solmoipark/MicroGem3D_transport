@@ -204,13 +204,19 @@ class ChemistryConfig(BaseModel):
     backend: Literal["stoichiometric", "gems3k"]
     # None for gems3k (kept out of config_hash); defaults filled for stoichiometric.
     stoichiometric_rules: Optional[Dict[str, ReactionRule]] = None
+    gems_bundle_lst: Optional[str] = None      # path to PC-dat.lst
+    gems_worker_python: Optional[str] = None   # interpreter with xgems installed
 
     @model_validator(mode="after")
     def _check(self) -> "ChemistryConfig":
         if self.backend == "gems3k":
             if self.stoichiometric_rules is not None:
                 raise ValueError("gems3k backend does not take stoichiometric_rules")
+            if not self.gems_bundle_lst:
+                raise ValueError("gems3k backend requires gems_bundle_lst")
             return self
+        if self.gems_bundle_lst is not None or self.gems_worker_python is not None:
+            raise ValueError("gems_* fields only apply to the gems3k backend")
         if self.stoichiometric_rules is None:
             self.stoichiometric_rules = _default_rules()
         unknown = set(self.stoichiometric_rules) - set(KINETIC_PHASE_IDS)
