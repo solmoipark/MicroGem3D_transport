@@ -34,7 +34,9 @@ py -3 -m pytest -q
 - [x] **M1** — 보존 코어: 트랜잭션 스테핑(trial→검사→commit/rollback), 원소 수지
       ~4e-25 mol, 물 수지 0, 복셀 항등식 ≤1e-12, Zarr-v2 체크포인트/재시작
       비트단위 동등, 32³ C3S 런 40초.
-- [ ] M2 — P&K 동역학과 4상 구동
+- [x] **M2** — P&K 동역학: 2 프리셋(Elakneswaran 2018 / CemGEMS 2021) 발표 표
+      그대로, SRM 114q(Blaine 381.8) 4상 alpha 스케줄, OPC 32³ 3D 런 32초에
+      상별 원장 폐쇄. 수화물 외피 코팅으로 후기 unmet이 정직하게 기록됨.
 - [ ] M3 — GEMS 0D 프로브
 - [ ] M4 — GEMS→3D 결합
 - [ ] M5 — 분석과 리포트
@@ -48,7 +50,7 @@ py -3 -m pytest -q
 ## 모듈 (상한 16, 현재 14)
 
 `src/tinn/`: `config.py`(스키마+해시), `registry.py`(상/성분 데이터),
-`geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(TabulatedKinetics),
+`geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(Tabulated+ParrotKilloh),
 `state.py`(SimulationState, mol 권위 원장), `ledger.py`(§6.1 불변식),
 `dissolution.py`(액체 접촉 가중 배분), `transport.py`(클러스터 라벨링+리매핑),
 `backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),

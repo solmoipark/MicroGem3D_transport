@@ -123,6 +123,10 @@ class KineticsConfig(BaseModel):
     kind: Literal["tabulated", "pk"]
     preset: Optional[str] = None
     table: Optional[TabulatedTable] = None
+    blaine_m2_kg: Optional[float] = None
+    # numerical policy for the P&K explicit-Euler integration (PRD §4.1)
+    pk_alpha_seed: float = Field(default=1e-8, gt=0.0, lt=1.0)
+    pk_max_substep_days: float = Field(default=0.01, gt=0.0)
 
     @model_validator(mode="after")
     def _check(self) -> "KineticsConfig":
@@ -131,11 +135,15 @@ class KineticsConfig(BaseModel):
                 raise ValueError(f"pk kinetics requires preset in {PK_PRESETS}, got {self.preset!r}")
             if self.table is not None:
                 raise ValueError("pk kinetics does not take a table")
+            if self.blaine_m2_kg is None or self.blaine_m2_kg <= 0.0:
+                raise ValueError("pk kinetics requires a positive blaine_m2_kg")
         else:
             if self.table is None:
                 raise ValueError("tabulated kinetics requires a table")
             if self.preset is not None:
                 raise ValueError("tabulated kinetics does not take a preset")
+            if self.blaine_m2_kg is not None:
+                raise ValueError("blaine_m2_kg only applies to pk kinetics")
         return self
 
 

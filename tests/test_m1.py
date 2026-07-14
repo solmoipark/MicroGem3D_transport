@@ -97,12 +97,6 @@ def test_tabulated_beyond_horizon_raises():
         kin.alpha_at(500.0)
 
 
-def test_make_kinetics_pk_not_implemented():
-    cfg = TinnConfig.from_json_file(str(EXAMPLES / "opc_srm114q_32.json"))
-    with pytest.raises(NotImplementedError):
-        make_kinetics(cfg)
-
-
 # ---------------- state ----------------
 
 def test_state_from_geometry_ledger_consistency(short_run):

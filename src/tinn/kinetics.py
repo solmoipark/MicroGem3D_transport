@@ -1,16 +1,34 @@
-"""KineticsModel: returns target per-phase alpha for a time — no geometry/chemistry involved.
+"""KineticsModel: returns target per-phase alpha for a time — no geometry/chemistry.
 
-M1 ships TabulatedKinetics; ParrotKilloh presets arrive with M2.
+TabulatedKinetics interpolates a validated alpha(t) table. ParrotKilloh integrates
+the four-phase Parrot--Killoh model (PRD §4.1) with two published presets:
+
+  pk_elakneswaran_2018  T0=293.15 K, Blaine ratio scales ALL rates
+                        (Elakneswaran et al. 2018, doi:10.3390/app8122597)
+  pk_cemgems_2021       T0=298.15 K, Blaine ratio scales nucleation/growth only
+                        (Kulik et al. 2021, doi:10.21809/rilemtechlett.2021.140)
+
+Canonical units: rates day^-1, temperature K, activation energy J/mol,
+Blaine m^2/kg (published reference 385). alpha_at(t) is a pure function of t
+(each call integrates 0 -> t with the configured substep), so straight runs and
+checkpoint restarts see bit-identical targets.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+import math
+from dataclasses import dataclass
+from typing import Dict, Protocol, Tuple
 
 import numpy as np
 
 from .config import KineticsConfig, TinnConfig
 from .registry import KINETIC_PHASE_IDS
+
+GAS_CONSTANT_J_MOL_K = 8.314
+REFERENCE_BLAINE_M2_KG = 385.0
+WATER_RETARDATION_SLOPE = 3.333
+RH_CUTOFF = 0.55
 
 
 class KineticsModel(Protocol):
@@ -44,9 +62,156 @@ class TabulatedKinetics:
                          for i in range(self._alpha.shape[0])])
 
 
+# --------------------------------------------------------------------- Parrot-Killoh
+
+@dataclass(frozen=True)
+class PKPreset:
+    name: str
+    # per-phase rows in KINETIC_PHASE_IDS order: (K1, N1, K2, K3, N3, H, Ea_J_mol)
+    params: Tuple[Tuple[float, float, float, float, float, float, float], ...]
+    reference_temperature_k: float
+    surface_scales_all_rates: bool
+    source: str
+
+
+PK_PRESETS: Dict[str, PKPreset] = {
+    "pk_elakneswaran_2018": PKPreset(
+        name="pk_elakneswaran_2018",
+        params=(
+            (1.5, 0.70, 0.050, 1.10, 3.3, 1.80, 41570.0),   # C3S
+            (0.5, 1.00, 0.006, 0.20, 5.0, 1.35, 20785.0),   # C2S
+            (1.0, 0.85, 0.040, 1.00, 3.2, 1.60, 54040.0),   # C3A
+            (0.37, 0.70, 0.015, 0.40, 3.7, 1.45, 34087.0),  # C4AF
+        ),
+        reference_temperature_k=293.15,
+        surface_scales_all_rates=True,
+        source="Elakneswaran, Owaki, Nawa (2018), doi:10.3390/app8122597, Appendix A.2",
+    ),
+    "pk_cemgems_2021": PKPreset(
+        name="pk_cemgems_2021",
+        params=(
+            (1.5, 0.70, 0.050, 1.10, 3.3, 2.00, 41570.0),   # C3S
+            (0.5, 1.00, 0.020, 0.70, 5.0, 1.55, 20785.0),   # C2S
+            (1.0, 0.85, 0.040, 1.00, 3.2, 1.80, 54040.0),   # C3A
+            (0.37, 0.70, 0.020, 0.40, 3.7, 1.65, 34087.0),  # C4AF
+        ),
+        reference_temperature_k=298.15,
+        surface_scales_all_rates=False,
+        source="Kulik et al. (2021), doi:10.21809/rilemtechlett.2021.140, Table SB1",
+    ),
+}
+
+
+class ParrotKilloh:
+    """Explicit-Euler four-phase P&K integration (PRD §4.1).
+
+    The low-water retardation uses the mass-weighted TOTAL clinker alpha
+    (sum f_m alpha_m / sum f_m over the four P&K phases only), applied after
+    selecting the controlling rate, with the bracket clipped to [0, 1] so an
+    Euler overshoot can never make hydration re-accelerate.
+    """
+
+    def __init__(self, preset_name: str, w_c: float, temperature_k: float,
+                 blaine_m2_kg: float, phase_mass_fractions: Dict[str, float],
+                 relative_humidity: float = 1.0,
+                 alpha_seed: float = 1e-8, max_substep_days: float = 0.01):
+        if preset_name not in PK_PRESETS:
+            raise ValueError(
+                f"unknown P&K preset {preset_name!r}; choose one of {sorted(PK_PRESETS)}")
+        p = PK_PRESETS[preset_name]
+        self.preset = p
+        rows = np.asarray(p.params)
+        self._k1, self._n1, self._k2, self._k3, self._n3, self._h, self._ea = rows.T
+        self.w_c = w_c
+        self.temperature_k = temperature_k
+        self.blaine_ratio = blaine_m2_kg / REFERENCE_BLAINE_M2_KG
+        self.relative_humidity = relative_humidity
+        self.alpha_seed = alpha_seed
+        self.max_substep_days = max_substep_days
+        self._weights = np.array([phase_mass_fractions.get(pid, 0.0)
+                                  for pid in KINETIC_PHASE_IDS])
+        if self._weights.sum() <= 0.0:
+            raise ValueError("P&K needs at least one kinetic phase with mass")
+
+    # -- correction factors ------------------------------------------------
+    def humidity_factor(self) -> float:
+        if self.relative_humidity <= RH_CUTOFF:
+            return 0.0
+        return ((self.relative_humidity - RH_CUTOFF) / (1.0 - RH_CUTOFF)) ** 4
+
+    def temperature_factors(self) -> np.ndarray:
+        t0 = self.preset.reference_temperature_k
+        return np.exp((self._ea / GAS_CONSTANT_J_MOL_K)
+                      * (1.0 / t0 - 1.0 / self.temperature_k))
+
+    def water_retardation_factors(self, total_alpha: float) -> np.ndarray:
+        threshold = self._h * self.w_c
+        factors = np.ones(len(KINETIC_PHASE_IDS))
+        active = total_alpha > threshold
+        bracket = 1.0 + WATER_RETARDATION_SLOPE * (threshold - total_alpha)
+        factors[active] = np.clip(bracket[active], 0.0, 1.0) ** 4
+        return factors
+
+    def total_clinker_alpha(self, alpha: np.ndarray) -> float:
+        return float((alpha * self._weights).sum() / self._weights.sum())
+
+    # -- rates ---------------------------------------------------------------
+    def rate_components(self, alpha: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Corrected (R_ng, R_df, R_hs) in day^-1 (without water retardation)."""
+        a = np.clip(alpha, self.alpha_seed, 1.0 - np.finfo(np.float64).eps)
+        remaining = 1.0 - a
+        transformed = -np.log1p(-a)
+        r_ng = (self._k1 / self._n1) * remaining * transformed ** (1.0 - self._n1)
+        r_df = self._k2 * remaining ** (2.0 / 3.0) / (1.0 - np.cbrt(remaining))
+        r_hs = self._k3 * remaining ** self._n3
+
+        common = self.humidity_factor() * self.temperature_factors()
+        r_ng, r_df, r_hs = r_ng * common, r_df * common, r_hs * common
+        if self.preset.surface_scales_all_rates:
+            r_ng, r_df, r_hs = (r_ng * self.blaine_ratio, r_df * self.blaine_ratio,
+                                r_hs * self.blaine_ratio)
+        else:
+            r_ng = r_ng * self.blaine_ratio
+        return r_ng, r_df, r_hs
+
+    def controlling_rates(self, alpha: np.ndarray) -> np.ndarray:
+        """Corrected min(R_ng, R_df, R_hs) in day^-1 (without water retardation)."""
+        r_ng, r_df, r_hs = self.rate_components(alpha)
+        rates = np.minimum(np.minimum(r_ng, r_df), r_hs)
+        rates[np.asarray(alpha) >= 1.0] = 0.0
+        if not np.all(np.isfinite(rates)):
+            raise FloatingPointError("P&K rate evaluation produced a non-finite value")
+        return rates
+
+    def _step(self, alpha: np.ndarray, dt_days: float) -> np.ndarray:
+        rates = self.controlling_rates(alpha)
+        water = self.water_retardation_factors(self.total_clinker_alpha(alpha))
+        return np.clip(alpha + dt_days * rates * water, alpha, 1.0)
+
+    def alpha_at(self, t_h: float) -> np.ndarray:
+        """Pure function of t: integrate 0 -> t with the fixed substep policy."""
+        t_days = t_h / 24.0
+        alpha = np.zeros(len(KINETIC_PHASE_IDS))
+        if t_days <= 0.0:
+            return alpha
+        n_sub = max(1, math.ceil(t_days / self.max_substep_days))
+        dt = t_days / n_sub
+        for _ in range(n_sub):
+            alpha = self._step(alpha, dt)
+        # phases with no mass in the recipe have no meaningful alpha target
+        return np.where(self._weights > 0.0, alpha, 0.0)
+
+
 def make_kinetics(config: TinnConfig) -> KineticsModel:
-    if config.kinetics.kind == "tabulated":
-        return TabulatedKinetics(config.kinetics)
-    raise NotImplementedError(
-        f"kinetics preset {config.kinetics.preset!r} arrives with milestone M2"
+    kin = config.kinetics
+    if kin.kind == "tabulated":
+        return TabulatedKinetics(kin)
+    return ParrotKilloh(
+        preset_name=kin.preset,
+        w_c=config.w_c,
+        temperature_k=config.temperature_K,
+        blaine_m2_kg=kin.blaine_m2_kg,
+        phase_mass_fractions=config.binder.mass_fractions,
+        alpha_seed=kin.pk_alpha_seed,
+        max_substep_days=kin.pk_max_substep_days,
     )
