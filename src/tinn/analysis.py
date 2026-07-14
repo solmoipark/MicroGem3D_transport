@@ -157,11 +157,12 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
     bands = {24.0: (0.25, 0.55), 168.0: (0.50, 0.80), 672.0: (0.65, 0.90)}
     for row in rows:
         t = row["time_h"]
-        if t in bands:
-            total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
-                        for p in KINETIC_PHASE_IDS) / tot_w
-            lo, hi = bands[t]
-            add(f"total_clinker_alpha@{t:g}h", lo <= total <= hi, total)
+        for band_t, (lo, hi) in bands.items():
+            # tolerant match: accumulated step times can land one ulp off
+            if abs(t - band_t) <= 1e-6 * band_t:
+                total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
+                            for p in KINETIC_PHASE_IDS) / tot_w
+                add(f"total_clinker_alpha@{band_t:g}h", lo <= total <= hi, total)
     if rows:
         add("alpha_order_C3S_ge_C2S",
             all(r["alpha"]["C3S"] >= r["alpha"]["C2S"] - 1e-12 for r in rows), None)
@@ -251,7 +252,7 @@ def report(run_dir: str, out_dir: Optional[str] = None,
                 ph = row.get("ledger_metrics", {}).get("cluster_ph")
                 if ph:
                     summary_ph[float(row["time_h"])] = ph
-        except (json.JSONDecodeError, KeyError):
+        except Exception:
             pass  # a foreign/corrupt summary never blocks a checkpoint report
 
     rows: List[dict] = []
@@ -274,6 +275,9 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name
         rows.append(row)
+    # checkpoint NAMES sort lexicographically (ckpt_1000 < ckpt_999) — time is
+    # the authority for series order
+    rows.sort(key=lambda r: r["time_h"])
 
     result = {
         "run_dir": str(run),
