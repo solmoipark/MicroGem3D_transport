@@ -233,6 +233,13 @@ class GemsWorker:
                 kind="protocol") from e
         if not response.get("ok"):
             kind = str(response.get("error_kind", "internal"))
+            if kind == "nonconvergence":
+                # recurring, expected failure mode (e.g. dry pockets probed every
+                # step) — retaining thousands of artifact dirs helps nobody
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise GemsError(
+                    f"xGEMS worker failed [nonconvergence]: {response.get('error')}",
+                    kind=kind)
             raise GemsError(
                 f"xGEMS worker failed [{kind}]: {response.get('error')}\n"
                 f"{response.get('traceback', '')}\n"
