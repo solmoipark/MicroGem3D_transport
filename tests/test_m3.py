@@ -1,7 +1,7 @@
 """M3 tests: xGEMS isolated worker, bundle audit, 0D cumulative probe (PRD §3 M3).
 
-Skipped entirely when the xgems worker interpreter or the PC bundle is absent —
-every other tinn feature must work without them (PRD §5).
+Worker-dependent tests skip when the xgems interpreter or the PC bundle is
+absent; config/scope tests run everywhere (PRD §5).
 """
 
 import json
@@ -22,7 +22,8 @@ GEMS_PYTHON = Path(os.environ.get(
     "TINN_GEMS_PYTHON",
     r"C:\Users\solmo\miniforge3\envs\py313-xgems\python.exe"))
 
-pytestmark = pytest.mark.skipif(
+# applied per-test so pure config/scope tests still run without the xgems env
+needs_gems = pytest.mark.skipif(
     not (BUNDLE.is_file() and GEMS_PYTHON.is_file()),
     reason="xgems worker interpreter or PC bundle not available")
 
@@ -42,6 +43,7 @@ def _anchor2_elements():
 
 # ---------------- anchors (PRD §6.2, regression snapshots) ----------------
 
+@needs_gems
 def test_anchor1_stored_dbr_reequilibration(worker):
     r = worker.equilibrate_stored()
     assert r.ph == pytest.approx(13.596951143910216, rel=1e-9)
@@ -51,6 +53,7 @@ def test_anchor1_stored_dbr_reequilibration(worker):
                         "No GEM re-calculation needed")
 
 
+@needs_gems
 def test_anchor2_c3s_water_o2_seed(worker):
     r = worker.equilibrate_elements(_anchor2_elements(), 293.15)
     assert r.ph == pytest.approx(12.6619326886856, rel=1e-6)
@@ -60,6 +63,7 @@ def test_anchor2_c3s_water_o2_seed(worker):
     assert r.element_closure_max_rel() <= 1e-12
 
 
+@needs_gems
 def test_worker_determinism(worker):
     a = worker.equilibrate_elements(_anchor2_elements(), 293.15)
     b = worker.equilibrate_elements(_anchor2_elements(), 293.15)
@@ -67,6 +71,7 @@ def test_worker_determinism(worker):
     assert a.phase_masses_kg == b.phase_masses_kg
 
 
+@needs_gems
 def test_element_floors_are_reported_not_hidden(worker):
     # elements we did not request (Al, Fe, ...) clamp to the cleared-state
     # numerical floor; that adjustment must be reported, never hidden
@@ -83,6 +88,7 @@ def test_element_floors_are_reported_not_hidden(worker):
 
 # ---------------- audit / isolation / errors ----------------
 
+@needs_gems
 def test_bundle_audit_detects_mutation(tmp_path):
     bundle_copy = tmp_path / "PC"
     shutil.copytree(BUNDLE.parent, bundle_copy)
@@ -95,30 +101,47 @@ def test_bundle_audit_detects_mutation(tmp_path):
         w.equilibrate_stored()
 
 
+@needs_gems
 def test_audit_missing_bundle():
     with pytest.raises(GemsError):
         audit_bundle(str(BUNDLE.parent / "does-not-exist.lst"))
 
 
+@needs_gems
 def test_source_bundle_never_polluted(worker):
     before = audit_bundle(str(BUNDLE))
     worker.equilibrate_elements(_anchor2_elements(), 293.15)
     assert audit_bundle(str(BUNDLE)) == before  # no ipmlog.txt/xGEMS.log etc.
 
 
+@needs_gems
 def test_missing_suppression_phase_is_hard_error(worker):
     with pytest.raises(GemsError, match="suppression"):
         worker.equilibrate_elements(_anchor2_elements(), 293.15,
                                     suppressed_phases=("NotAPhase",))
 
 
-def test_negative_element_rejected_client_side(worker):
-    with pytest.raises(GemsError):
+@needs_gems
+def test_negative_element_and_charge_rejected_client_side(worker):
+    with pytest.raises(GemsError) as e:
         worker.equilibrate_elements({"Ca": -1.0}, 293.15)
+    assert e.value.kind == "config"
+    with pytest.raises(GemsError):  # nonzero charge target is a loud error
+        worker.equilibrate_elements({"Ca": 1e-3, "Zz": 0.02}, 293.15)
+
+
+@needs_gems
+def test_nonconvergence_is_a_distinguishable_error(worker):
+    # nearly pure water with a trace of Ca does not converge in this bundle;
+    # the failure must carry the stable 'nonconvergence' kind for M4 rejects
+    with pytest.raises(GemsError) as e:
+        worker.equilibrate_elements({"Ca": 1e-30, "O": 1e-3, "H": 2e-3}, 293.15)
+    assert e.value.kind == "nonconvergence"
 
 
 # ---------------- 0D cumulative probe (M3 DoD) ----------------
 
+@needs_gems
 def test_0d_probe_c3s_closure_and_sanity(worker):
     cfg = TinnConfig.from_json_file(str(REPO / "examples" / "c3s_32.json"))
     rows = run_0d_probe(cfg, worker)
@@ -126,11 +149,14 @@ def test_0d_probe_c3s_closure_and_sanity(worker):
     ch_masses = []
     for r in rows:
         assert r["element_closure_max_rel"] <= 1e-12   # element + water closure
+        assert r["floor_adjust_max_rel"] <= 1e-9       # effective ~= physical ledger
+        assert r["ph_status"] == "ok"
         assert 12.4 <= r["ph"] <= 13.9                 # PRD §6.3 cluster pH band
         ch_masses.append(r["phase_masses_kg"].get("Portlandite", 0.0))
     assert all(b > a for a, b in zip(ch_masses, ch_masses[1:]))  # CH monotone
 
 
+@needs_gems
 def test_0d_probe_opc_four_phase(worker):
     cfg = TinnConfig.from_json_file(str(REPO / "examples" / "opc_srm114q_32.json"))
     rows = run_0d_probe(cfg, worker, times_h=[24.0])

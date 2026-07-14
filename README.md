@@ -50,7 +50,7 @@ py -3 -m pytest -q
 - `examples/opc_srm114q_32.json` — NIST SRM 114q 4상 레시피(60/14/7/10, 미배정 9%),
   P&K 프리셋 `pk_elakneswaran_2018` (동역학 구현은 M2).
 
-## 모듈 (상한 16, 현재 14)
+## 모듈 (상한 16, 현재 15)
 
 `src/tinn/`: `config.py`(스키마+해시), `registry.py`(상/성분 데이터),
 `geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(Tabulated+ParrotKilloh),
