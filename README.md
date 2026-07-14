@@ -17,8 +17,11 @@ $env:PYTHONPATH = "src"
 # config 검증
 py -3 -m tinn.cli validate-config examples\c3s_32.json
 
-# 32³ RVE 초기화 스모크 (M0)
-py -3 -c "from tinn.config import TinnConfig; from tinn.registry import default_registry; from tinn.geometry import initialize_rve; import json; r = initialize_rve(TinnConfig.from_json_file('examples/c3s_32.json'), default_registry()); print(json.dumps(r.report, indent=2))"
+# C3S 32³ 런 (alpha 0→0.35, 체크포인트 + summary.json 생성, 약 1분)
+py -3 -m tinn.cli run examples\c3s_32.json --out runs\c3s
+
+# 체크포인트에서 재시작 (무중단 실행과 비트단위 동일)
+py -3 -m tinn.cli restart runs\c3s\ckpt_001 --out runs\c3s_restart
 
 # 테스트
 py -3 -m pytest -q
@@ -28,7 +31,9 @@ py -3 -m pytest -q
 
 - [x] **M0** — 골격과 초기화: config/registry/geometry/cli, 32³ 다상 RVE 초기화,
       동일 시드 → 동일 해시, 고체분율·w/c 오차 리포트 (~1e-5 수준).
-- [ ] M1 — 보존 코어 (합성 백엔드 전체 루프)
+- [x] **M1** — 보존 코어: 트랜잭션 스테핑(trial→검사→commit/rollback), 원소 수지
+      ~4e-25 mol, 물 수지 0, 복셀 항등식 ≤1e-12, Zarr-v2 체크포인트/재시작
+      비트단위 동등, 32³ C3S 런 40초.
 - [ ] M2 — P&K 동역학과 4상 구동
 - [ ] M3 — GEMS 0D 프로브
 - [ ] M4 — GEMS→3D 결합
@@ -40,7 +45,13 @@ py -3 -m pytest -q
 - `examples/opc_srm114q_32.json` — NIST SRM 114q 4상 레시피(60/14/7/10, 미배정 9%),
   P&K 프리셋 `pk_elakneswaran_2018` (동역학 구현은 M2).
 
-## 모듈 (상한 16, 현재 5)
+## 모듈 (상한 16, 현재 14)
 
 `src/tinn/`: `config.py`(스키마+해시), `registry.py`(상/성분 데이터),
-`geometry.py`(주기 RVE 초기화, 3계층 입자), `cli.py`(validate-config), `__init__.py`.
+`geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(TabulatedKinetics),
+`state.py`(SimulationState, mol 권위 원장), `ledger.py`(§6.1 불변식),
+`dissolution.py`(액체 접촉 가중 배분), `transport.py`(클러스터 라벨링+리매핑),
+`backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),
+`engine.py`(트랜잭션 오케스트레이터), `storage.py`(Zarr-v2 체크포인트),
+`cli.py`(validate-config/run/restart), `__init__.py`.
+남은 슬롯: `gems.py`(M3), `analysis.py`(M5).

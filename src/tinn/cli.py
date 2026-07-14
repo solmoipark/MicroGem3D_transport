@@ -1,10 +1,11 @@
-"""CLI entry point. M0 provides validate-config; run/restart/report arrive with M1/M5."""
+"""CLI: validate-config / run / restart. The report subcommand arrives with M5."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 from pydantic import ValidationError
@@ -12,9 +13,13 @@ from pydantic import ValidationError
 from .config import TinnConfig
 
 
+def _load_config(path: str) -> TinnConfig:
+    return TinnConfig.from_json_file(path)
+
+
 def _validate_config(path: str) -> int:
     try:
-        cfg = TinnConfig.from_json_file(path)
+        cfg = _load_config(path)
     except OSError as e:
         print(f"error: cannot read config file {path}: {e}", file=sys.stderr)
         return 2
@@ -40,17 +45,78 @@ def _validate_config(path: str) -> int:
     return 0
 
 
+def _write_summary(summary: dict, out_dir: str) -> None:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def _print_outputs(summary: dict) -> None:
+    for row in summary["outputs"]:
+        alpha = ", ".join(f"{p}={v:.4f}" for p, v in row["alpha"].items() if v > 0)
+        print(f"  t={row['time_h']:9.3f} h  {alpha}  "
+              f"cap.porosity={row['porosity_capillary']:.4f}  "
+              f"accepts={row['accept_count']} rejects={sum(row['reject_counts'].values())}")
+
+
+def _run(config_path: str, out_dir: str) -> int:
+    from .engine import Engine, EngineError
+    try:
+        cfg = _load_config(config_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    engine = Engine(cfg)
+    try:
+        _, summary = engine.run(out_dir=out_dir)
+    except EngineError as e:
+        print(f"error: run aborted ({e.reason}): {e}", file=sys.stderr)
+        return 3
+    _write_summary(summary, out_dir)
+    print(f"run complete -> {out_dir}")
+    _print_outputs(summary)
+    return 0
+
+
+def _restart(ckpt_path: str, out_dir: str) -> int:
+    from .engine import Engine, EngineError
+    from .registry import default_registry
+    from .storage import StorageError, load_checkpoint
+    try:
+        state = load_checkpoint(ckpt_path, default_registry())
+    except StorageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    engine = Engine(state.config)
+    try:
+        _, summary = engine.run(state=state, out_dir=out_dir)
+    except EngineError as e:
+        print(f"error: restart aborted ({e.reason}): {e}", file=sys.stderr)
+        return 3
+    _write_summary(summary, out_dir)
+    print(f"restart complete -> {out_dir}")
+    _print_outputs(summary)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="tinn", description="TINN cement hydration platform v2")
     sub = parser.add_subparsers(dest="command", required=True)
     p_val = sub.add_parser("validate-config", help="validate a config JSON file")
     p_val.add_argument("config_path")
+    p_run = sub.add_parser("run", help="run a simulation from a config")
+    p_run.add_argument("config_path")
+    p_run.add_argument("--out", required=True, help="output directory for checkpoints/summary")
+    p_res = sub.add_parser("restart", help="continue a run from a checkpoint directory")
+    p_res.add_argument("checkpoint_path")
+    p_res.add_argument("--out", required=True, help="output directory for new checkpoints/summary")
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
         return _validate_config(args.config_path)
-    parser.error(f"unknown command {args.command!r}")
-    return 2
+    if args.command == "run":
+        return _run(args.config_path, args.out)
+    return _restart(args.checkpoint_path, args.out)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,10 @@ KINETIC_PHASE_IDS: Tuple[str, ...] = ("C3S", "C2S", "C3A", "C4AF")
 INERT_PHASE_ID = "inert"
 # Order of solid channels in the dense anhydrous_fraction array (fixed).
 SOLID_PHASE_IDS: Tuple[str, ...] = KINETIC_PHASE_IDS + (INERT_PHASE_ID,)
+# Order of hydrate channels in the dense hydrate_fraction array (fixed).
+HYDRATE_PHASE_IDS: Tuple[str, ...] = ("CSH", "CH", "C3AH6", "FH3")
+# Order of the element ledger vector (fixed).
+ELEMENT_IDS: Tuple[str, ...] = ("Ca", "Si", "Al", "Fe", "H", "O")
 
 VALID_BASIS = ("solid_skeleton", "bulk_envelope")
 VALID_KINDS = ("clinker", "hydrate", "liquid", "inert")
@@ -59,6 +63,23 @@ class PhaseEntry:
             return self.density_override_g_cm3
         assert self.formula is not None and self.molar_volume_cm3 is not None
         return self.molar_mass_g_mol / self.molar_volume_cm3
+
+    @property
+    def skeleton_molar_volume_cm3(self) -> float:
+        if self.basis == "solid_skeleton":
+            return self.molar_volume_cm3
+        if self.basis == "bulk_envelope":
+            return self.molar_volume_cm3 * (1.0 - self.gel_porosity)
+        raise RegistryError(f"{self.phase_id}: no volume basis")
+
+    @property
+    def envelope_molar_volume_cm3(self) -> float:
+        """Bulk envelope = skeleton / (1 - gel porosity) (PRD §4.4)."""
+        if self.basis == "bulk_envelope":
+            return self.molar_volume_cm3
+        if self.basis == "solid_skeleton":
+            return self.molar_volume_cm3 / (1.0 - self.gel_porosity)
+        raise RegistryError(f"{self.phase_id}: no volume basis")
 
 
 class Registry:

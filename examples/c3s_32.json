@@ -11,5 +11,5 @@
   },
   "rve": {"grid_size": 32, "voxel_size_um": 1.0, "seed": 42},
   "chemistry": {"backend": "stoichiometric"},
-  "schedule": {"output_times_h": [6.0, 24.0, 72.0, 168.0]}
+  "schedule": {"output_times_h": [6.0, 24.0, 72.0, 168.0], "dt_initial_h": 2.0, "dt_min_h": 0.001}
 }
