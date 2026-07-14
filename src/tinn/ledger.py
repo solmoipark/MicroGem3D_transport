@@ -71,6 +71,13 @@ def check_all(state: SimulationState, registry: Registry,
     if np.any(err > bound):
         bad = [ELEMENT_IDS[i] for i in np.flatnonzero(err > bound)]
         rep.violations.append(f"balance_element:{','.join(bad)}")
+    # injected mass (seeds/floors/verification slack) must stay negligible —
+    # otherwise the element check would be certifying solver-fabricated mass
+    scale = float(np.abs(state.initial_elements).max())
+    inj_max = float(np.abs(state.injected_elements).max())
+    rep.metrics["injected_max_rel"] = inj_max / scale if scale > 0.0 else 0.0
+    if scale > 0.0 and inj_max > 1e-6 * scale:
+        rep.violations.append("balance_element:injected_excess")
 
     # 2. voxel occupancy identity (no negatives, no clipping)
     total = (state.anhydrous_fraction.sum(axis=0) + state.hydrate_fraction.sum(axis=0)

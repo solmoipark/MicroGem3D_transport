@@ -66,10 +66,12 @@ class Engine:
             self.backend = backend_mod.StoichiometricBackend(
                 config.chemistry.stoichiometric_rules, self.registry)
         else:
+            import os
             from .gems import GemsBackend, GemsWorker
             worker = GemsWorker(
                 config.chemistry.gems_bundle_lst,
-                python_executable=config.chemistry.gems_worker_python,
+                python_executable=(os.environ.get("TINN_GEMS_PYTHON")
+                                   or config.chemistry.gems_worker_python),
                 work_root=None)
             self.backend = GemsBackend(worker, config.temperature_K)
         self.kinetics = kinetics or make_kinetics(config)
@@ -177,6 +179,10 @@ class Engine:
                 residual[c] = inv_in[c]
                 continue
             water_c = float(water_mol_c[c])
+            trace_water = water_c < 1e-3 * total_water_mol
+            # a nearly-dry pocket fails identically at every release scale —
+            # give it exactly one attempt instead of burning retries every step
+            max_transient = 0 if trace_water else 4
             s = 1.0
             result = None
             transient_failures = 0
@@ -189,7 +195,7 @@ class Engine:
                     # nonconvergence may be release-size dependent — scale down a
                     # few times before giving up on this cluster
                     transient_failures += 1
-                    if transient_failures > 4:
+                    if transient_failures > max_transient:
                         failure_reason = REJECT_BACKEND_FAILURE
                         break
                     s *= 0.5
@@ -214,7 +220,7 @@ class Engine:
                 # release goes back to the solid as honest unmet and its
                 # inventory is preserved; a materially wet cluster failing this
                 # way is a real backend failure and rejects the trial.
-                if water_c < 1e-3 * total_water_mol:
+                if trace_water:
                     scale_c[c] = 0.0
                     residual[c] = inv_in[c]
                     continue
@@ -291,12 +297,27 @@ class Engine:
                                        minlength=n_clusters)
         target_vol_c = prev_vol_recon_c - (chem_mol_c + gel_mol_c) * vm_w
         diff_c = cur_vol_c - target_vol_c
-        if np.any(diff_c < -1e-12 * (1.0 + np.abs(target_vol_c))):
-            return None, StepReject("balance_water"), {}
         if n_clusters > 0:
+            # negative diff: water returned to solution (e.g. solute water from
+            # the inventory re-emerging as solvent) refills capillary liquid
+            # from the cluster's own gas space; without enough local gas the
+            # returned volume has nowhere to appear
+            gas_vol_c = np.bincount(recon[recon >= 0],
+                                    weights=trial.capillary_gas[recon >= 0],
+                                    minlength=n_clusters)
+            deficit = np.clip(-diff_c, 0.0, None)
+            tol_c = 1e-12 * (1.0 + np.abs(target_vol_c))
+            if np.any((deficit > tol_c) & (deficit > gas_vol_c + tol_c)):
+                return None, StepReject("balance_water"), {}
             with np.errstate(invalid="ignore", divide="ignore"):
+                refill = np.where((deficit > tol_c) & (gas_vol_c > 0.0),
+                                  deficit / gas_vol_c, 0.0)
                 factor = np.where(cur_vol_c > 0.0,
                                   np.clip(diff_c, 0.0, None) / cur_vol_c, 0.0)
+            refill_vox = np.where(recon >= 0, refill[np.clip(recon, 0, None)], 0.0)
+            added_liq = trial.capillary_gas * refill_vox
+            trial.capillary_gas -= added_liq
+            trial.capillary_liquid += added_liq
             fac_vox = np.where(recon >= 0, factor[np.clip(recon, 0, None)], 0.0)
             removed_liq = trial.capillary_liquid * fac_vox
             trial.capillary_liquid -= removed_liq
@@ -351,6 +372,11 @@ class Engine:
     def run(self, state: Optional[SimulationState] = None,
             out_dir: Optional[str] = None) -> Tuple[SimulationState, dict]:
         state = state or self.initial_state()
+        if tuple(state.hydrate_ids) != self.hydrate_ids:
+            raise RuntimeError(
+                "checkpoint hydrate channels do not match the backend's channel "
+                f"order — bundle changed between runs? state: {state.hydrate_ids} "
+                f"backend: {self.hydrate_ids}")
         sched = self.config.schedule
         outputs = [t for t in sched.output_times_h if t > state.time_h + 1e-12]
         summary: Dict = {

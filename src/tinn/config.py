@@ -306,9 +306,14 @@ class TinnConfig(BaseModel):
         return self
 
     def config_hash(self) -> str:
-        payload = json.dumps(self.model_dump(mode="json"), sort_keys=True,
-                             separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        payload = self.model_dump(mode="json")
+        # the worker interpreter path is machine infrastructure, not physics —
+        # excluding it keeps checkpoints restartable after an env move
+        # (override at runtime with the TINN_GEMS_PYTHON environment variable)
+        if payload.get("chemistry"):
+            payload["chemistry"].pop("gems_worker_python", None)
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_json_file(cls, path: str) -> "TinnConfig":

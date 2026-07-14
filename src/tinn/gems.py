@@ -35,7 +35,10 @@ SUCCESS_STATUSES = (
 CHARGE_ELEMENT_ID = "Zz"
 BULK_VERIFY_ATOL_MOL = 1e-12
 BULK_VERIFY_RTOL = 1e-10
-O2_SEED_MOL_O = 1e-7  # tiny O2 seed so the aqueous redox state is well-posed
+# tiny O2 seed so the aqueous redox state is well-posed; 1e-9 at the canonical
+# input scale keeps the injected mass ~1e-7 relative (below the ledger's 1e-6
+# injected-excess bound) while still converging (1e-10 does not)
+O2_SEED_MOL_O = 1e-9
 
 
 class GemsError(RuntimeError):
@@ -330,7 +333,13 @@ class GemsBackend:
         for el, adj in r.element_input["floor_adjustments_mol"].items():
             if el in self._h2o_index:
                 injected[self._h2o_index[el]] += adj / s
+        # the engine may hold slightly more/less than asked (verification slack);
+        # book that signed slack too so the ledger tracks the solver exactly
+        for el, slack in r.element_input.get("verification_slack_mol", {}).items():
+            if el in self._h2o_index and slack != 0.0:
+                injected[self._h2o_index[el]] += slack / s
 
+        total_scaled = float(sum(scaled.values()))
         parcels = []
         residual_phases = [AQUEOUS_PHASE, GAS_PHASE]
         for phase, mol_scaled in r.phase_amounts_mol.items():
@@ -338,12 +347,14 @@ class GemsBackend:
                 continue
             if phase in SUPPRESSED_CLINKER_PHASES:
                 # suppression (bound=0) can leave numerical dust; dust elements
-                # stay in solution, anything material is precipitating clinker
-                if mol_scaled > 1e-10:
+                # stay in solution, anything material is precipitating clinker.
+                # The threshold is relative to the call's own input magnitude so
+                # big and small clusters get the same relative strictness.
+                if mol_scaled > 1e-9 * total_scaled:
                     raise GemsError(
                         f"suppressed clinker phase {phase} precipitated "
-                        f"{mol_scaled!r} mol (scaled) — suppression failed",
-                        kind="internal")
+                        f"{mol_scaled!r} mol (scaled, input {total_scaled!r}) — "
+                        f"suppression failed", kind="internal")
                 residual_phases.append(phase)
                 continue
             pe = r.phase_elements_mol.get(phase, {})
@@ -364,6 +375,19 @@ class GemsBackend:
                 if el in self._h2o_index:
                     residual[self._h2o_index[el]] += v / s
         residual = residual - self._h2o_vec * h2o_out
+
+        # per-call solver closure gate: outputs must equal what the engine held
+        # (input + injected) — a biased solver residual must never leak into the
+        # cumulative blocking ledger silently
+        e_out = residual + self._h2o_vec * h2o_out
+        for pc in parcels:
+            e_out = e_out + pc.elements
+        e_in = elements + injected
+        scale_mol = float(np.abs(e_in).max())
+        closure = float(np.abs(e_out - e_in).max()) / max(scale_mol, 1e-300)
+        if closure > 1e-9:
+            raise BackendTransientError(
+                f"xGEMS per-call element closure {closure:.2e} exceeds 1e-9")
 
         return ReactionResult(
             status=STATUS_OK,
@@ -502,6 +526,10 @@ def _worker_execute(request: Mapping) -> Dict:
             "requested_element_mol": requested,
             "effective_element_mol": effective,
             "floor_adjustments_mol": floor_adjust,
+            # what the engine actually holds minus what we asked it to hold —
+            # this slack is real injected/removed mass and must be booked
+            "verification_slack_mol": {el: verified[el] - effective[el]
+                                       for el in effective},
         }
     else:
         raise ValueError(f"unknown worker mode {mode!r}")
@@ -533,12 +561,13 @@ def _worker_execute(request: Mapping) -> Dict:
         if species:
             ssum = sum(species.values())
             if abs(ssum - total) > 1e-12 + 1e-9 * abs(total):
-                raise RuntimeError(
+                # protocol violation, not solver nonconvergence — must hard-fail
+                raise ValueError(
                     f"phase {phase_name} amount {total!r} != endmember sum {ssum!r}")
         if phase_name == "aq_gen":
             aqueous_h2o = species.get("H2O@")
             if aqueous_h2o is None:
-                raise RuntimeError("aqueous phase lacks the H2O@ solvent species")
+                raise ValueError("aqueous phase lacks the H2O@ solvent species")
 
     result = {
         "ok": True,
