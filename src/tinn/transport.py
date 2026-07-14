@@ -23,7 +23,9 @@ def label_clusters(liquid: np.ndarray) -> Tuple[np.ndarray, int]:
     n_vox = liquid.size
     labels = np.where(mask, np.arange(n_vox, dtype=np.int64).reshape(liquid.shape),
                       np.int64(n_vox))
-    for _ in range(3 * liquid.shape[0] * 3):
+    # min-label flooding advances >= 1 voxel per sweep along the longest geodesic,
+    # which is bounded by the voxel count — never bail out on a legal topology
+    for _ in range(n_vox + 1):
         prev = labels
         m = labels
         for ax, shift in _AXES:

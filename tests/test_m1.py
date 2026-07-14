@@ -140,14 +140,14 @@ def _dissolution_state():
     return st
 
 
-def test_dissolution_proportional_to_liquid_contact():
+def test_dissolution_proportional_to_wetted_faces():
     st = _dissolution_state()
     vm = st.vm_vox(REG, "C3S")
     res = dissolution.dissolve(st, REG, np.array([0.3 / vm, 0, 0, 0]))
     a = res.removed_vol[0, 5, 5, 4]
     b = res.removed_vol[0, 5, 5, 6]
     assert a + b == pytest.approx(0.3)
-    assert b / a == pytest.approx(1.5)  # weights 1.0 vs 1.5
+    assert b / a == pytest.approx(2.0)  # 1 wet face vs 2 wet faces
     assert res.unmet_mol[0] == 0.0
 
 
@@ -435,9 +435,11 @@ def test_engine_step_metrics_within_bounds(short_run):
 
 def test_smoke_alpha_035_no_rejects(full_run):
     _, state, summary, _ = full_run
-    assert state.alpha()[0] == pytest.approx(0.35, abs=1e-9)
+    # a sealed wet pocket may leave a tiny honest unmet deficit (water-limited
+    # dissolution), so alpha tracks the table to ~1e-5, not exactly
+    assert state.alpha()[0] == pytest.approx(0.35, abs=1e-5)
     assert state.reject_counts == {}
-    assert float(state.unmet_mol.max()) <= ledger.ELEMENT_ATOL_MOL
+    assert float(state.unmet_mol.max()) <= 1e-12
 
 
 def test_smoke_conservation_61(full_run):

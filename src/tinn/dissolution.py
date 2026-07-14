@@ -1,10 +1,11 @@
 """Per-phase dissolution allocation over liquid-accessible sites (PRD §4.2).
 
-Weights are voxel-level geometric liquid contact (own + 6-neighbor periodic liquid
-volume) — a relative surface measure, not an absolute rate. Exhausted sites are
-re-allocated iteratively; anything unachievable is returned as unmet mol, never
-hidden. The weight needs no particle attribution, so it is well-defined for all
-three solid tiers including smeared subgrid volume.
+Weights are the voxel's wetted-face count (own wetness + number of 6-neighbor
+periodic voxels holding cluster liquid) — a geometric surface-area measure,
+relative only, never an absolute rate. Exhausted sites are re-allocated
+iteratively; anything unachievable is returned as unmet mol, never hidden.
+The weight needs no particle attribution, so it is well-defined for all three
+solid tiers including smeared subgrid volume.
 """
 
 from __future__ import annotations
@@ -38,10 +39,10 @@ def dissolve(trial: SimulationState, registry: Registry,
              dn_target_mol: np.ndarray) -> DissolutionResult:
     """Remove dn_target_mol per kinetic phase from trial.anhydrous_fraction in place."""
     n = trial.grid_size
-    # weights from cluster liquid only (same threshold as labeling), so every
-    # site is guaranteed an adjacent labeled cluster
-    liq_eff = np.where(trial.capillary_liquid > LIQ_EPS, trial.capillary_liquid, 0.0)
-    weight = liq_eff + neighbor_liquid_sum(liq_eff)
+    # wetted-face count from cluster liquid only (same threshold as labeling),
+    # so every site is guaranteed an adjacent labeled cluster
+    wet = (trial.capillary_liquid > LIQ_EPS).astype(np.float64)
+    weight = wet + neighbor_liquid_sum(wet)
     removed_vol = np.zeros((len(KINETIC_PHASE_IDS), n, n, n))
     removed_mol = np.zeros(len(KINETIC_PHASE_IDS))
     unmet_mol = np.zeros(len(KINETIC_PHASE_IDS))

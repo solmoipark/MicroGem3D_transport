@@ -19,7 +19,7 @@ from .config import TinnConfig
 from .geometry import initialize_rve
 from .kinetics import KineticsModel, make_kinetics
 from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
-                       Registry, default_registry)
+                       Registry, SOLID_PHASE_IDS, default_registry)
 from .state import SimulationState, code_version
 
 REJECT_BACKEND_FAILURE = "backend_failure"
@@ -37,13 +37,21 @@ class StepReject:
     reason: str
 
 
-def _neighbor_min_label(labels: np.ndarray) -> np.ndarray:
-    big = np.iinfo(np.int64).max
-    m = np.full(labels.shape, big, dtype=np.int64)
-    lab = np.where(labels >= 0, labels, big)
+def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray) -> np.ndarray:
+    """Label of the neighboring cluster with the largest liquid contact — the
+    cluster that actually supplies the dissolution weight (deterministic:
+    argmax over the fixed axis order breaks ties)."""
+    labs = []
+    liqs = []
     for ax, shift in ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)):
-        m = np.minimum(m, np.roll(lab, shift, axis=ax))
-    return np.where(m == big, np.int64(-1), m)
+        labs.append(np.roll(labels, shift, axis=ax))
+        liqs.append(np.roll(liquid, shift, axis=ax))
+    labs = np.stack(labs)
+    liqs = np.where(labs >= 0, np.stack(liqs), -1.0)
+    best = np.argmax(liqs, axis=0)
+    best_lab = np.take_along_axis(labs, best[None], axis=0)[0]
+    best_liq = np.take_along_axis(liqs, best[None], axis=0)[0]
+    return np.where(best_liq >= 0.0, best_lab, np.int64(-1))
 
 
 class Engine:
@@ -60,15 +68,6 @@ class Engine:
         else:
             raise NotImplementedError("gems3k backend arrives with milestone M4")
         self.kinetics = kinetics or make_kinetics(config)
-        # rule coefficient matrix C[k, h]: mol hydrate h per mol kinetic phase k
-        self._coeff = np.zeros((len(KINETIC_PHASE_IDS), len(HYDRATE_PHASE_IDS)))
-        self._water_mol = np.zeros(len(KINETIC_PHASE_IDS))
-        rules = config.chemistry.stoichiometric_rules or {}
-        for k, p in enumerate(KINETIC_PHASE_IDS):
-            if p in rules:
-                self._water_mol[k] = rules[p].water_mol
-                for hid, coeff in rules[p].products.items():
-                    self._coeff[k, HYDRATE_PHASE_IDS.index(hid)] = coeff
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -101,8 +100,9 @@ class Engine:
         dis = dissolution.dissolve(trial, reg, dn)
         vacated = dis.removed_vol.sum(axis=0)
 
-        # site -> cluster attribution (own label, else smallest neighboring label)
-        site_cluster = np.where(labels >= 0, labels, _neighbor_min_label(labels))
+        # site -> cluster attribution (own label, else wettest neighboring cluster)
+        site_cluster = np.where(labels >= 0, labels,
+                                _neighbor_best_label(labels, prev_liquid))
         site_mask = vacated > 0.0
         if np.any(site_mask & (site_cluster < 0)):
             return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
@@ -120,50 +120,98 @@ class Engine:
                                 minlength=n_clusters)
         water_mol_c = liq_vol_c / vm_w
 
-        inv_in = (state.cluster_inventory if state.cluster_inventory.shape[0] == n_clusters
-                  else np.zeros((n_clusters, len(ELEMENT_IDS))))
+        if state.cluster_inventory.shape[0] == n_clusters:
+            inv_in = state.cluster_inventory
+        elif state.cluster_inventory.shape[0] == 0:
+            inv_in = np.zeros((n_clusters, len(ELEMENT_IDS)))
+        else:
+            raise RuntimeError(
+                f"cluster inventory has {state.cluster_inventory.shape[0]} rows but "
+                f"{n_clusters} clusters were labeled — state is corrupted (no fallback)")
 
+        # Backend negotiation per cluster: a water-starved cluster (e.g. a sealed
+        # wet pocket) dissolves only what its own water can react — the release is
+        # scaled down deterministically and the shortfall is returned to the solid
+        # and recorded as unmet, never hidden and never a whole-run abort.
         chem_mol_c = np.zeros(n_clusters)
         residual = np.zeros((n_clusters, len(ELEMENT_IDS)))
+        parcel_mol = np.zeros((n_clusters, len(HYDRATE_PHASE_IDS)))
         parcel_rows: List[tuple] = []
-        hydrate_add = np.zeros(len(HYDRATE_PHASE_IDS))
-        backend_bulk_vol = 0.0
+        scale_c = np.ones(n_clusters)
+        gel_per_mol = env_vm * gel_eps  # gel water volume per mol of each hydrate
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
             if not rel:
                 residual[c] = inv_in[c]
                 continue
-            try:
-                result = self.backend.react(rel, float(water_mol_c[c]), inv_in[c])
-            except Exception:
-                return None, StepReject(REJECT_BACKEND_FAILURE), {}
-            if result.status != backend_mod.STATUS_OK:
-                return None, StepReject(result.status), {}
+            water_c = float(water_mol_c[c])
+            s = 1.0
+            result = None
+            for _ in range(60):
+                scaled = {p: v * s for p, v in rel.items()}
+                try:
+                    result = self.backend.react(scaled, water_c, inv_in[c])
+                except Exception:
+                    return None, StepReject(REJECT_BACKEND_FAILURE), {}
+                if result.status == backend_mod.STATUS_OK:
+                    pm = np.zeros(len(HYDRATE_PHASE_IDS))
+                    for hid, mol in result.parcels:
+                        pm[HYDRATE_PHASE_IDS.index(hid)] += mol
+                    need = result.water_consumed_mol + float((pm * gel_per_mol).sum()) / vm_w
+                    if need <= water_c:
+                        break
+                    s *= min(0.5, water_c * (1.0 - 1e-9) / need)
+                elif result.status == backend_mod.STATUS_INSUFFICIENT_WATER:
+                    s *= 0.5
+                else:
+                    return None, StepReject(result.status), {}
+            else:
+                return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
+            scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
             residual[c] = result.residual_inventory
             for hid, mol in result.parcels:
                 hi = HYDRATE_PHASE_IDS.index(hid)
-                hydrate_add[hi] += mol
-                backend_bulk_vol += mol * env_vm[hi]
+                parcel_mol[c, hi] += mol
                 parcel_rows.append((float(trial.time_h + dt_h), int(c), hid, float(mol),
                                     float(mol * skel_vm[hi]), float(mol * env_vm[hi])))
+        hydrate_add = parcel_mol.sum(axis=0)
+        backend_bulk_vol = float((parcel_mol * env_vm).sum())
 
-        # per-voxel bulk envelope demand from local dissolution (same linear rules)
+        # give scaled-back dissolution volume back to the solid and record it unmet
+        if np.any(scale_c < 1.0):
+            for c in np.flatnonzero(scale_c < 1.0):
+                mask = site_mask & (site_cluster == c)
+                for k, p in enumerate(KINETIC_PHASE_IDS):
+                    give_back = dis.removed_vol[k] * np.where(mask, 1.0 - scale_c[c], 0.0)
+                    chan = SOLID_PHASE_IDS.index(p)
+                    trial.anhydrous_fraction[chan] += give_back
+                    dis.removed_vol[k] -= give_back
+            for k, p in enumerate(KINETIC_PHASE_IDS):
+                vm = trial.vm_vox(reg, p)
+                new_removed = float(dis.removed_vol[k].sum()) / vm
+                dis.unmet_mol[k] += dis.removed_mol[k] - new_removed
+                dis.removed_mol[k] = new_removed
+            vacated = dis.removed_vol.sum(axis=0)
+            site_mask = vacated > 0.0
+
+        # per-voxel bulk envelope demand: the backend's parcels (whatever chemistry
+        # produced them) are distributed over the cluster's dissolution sites in
+        # proportion to locally dissolved volume — the engine stays backend-agnostic
         demand = np.zeros_like(trial.hydrate_fraction)
-        for k in range(len(KINETIC_PHASE_IDS)):
-            vm = trial.vm_vox(reg, KINETIC_PHASE_IDS[k])
-            mol_vox = dis.removed_vol[k] / vm
-            for h in range(len(HYDRATE_PHASE_IDS)):
-                if self._coeff[k, h] > 0.0:
-                    demand[h] += mol_vox * (self._coeff[k, h] * env_vm[h])
+        for c in np.flatnonzero(parcel_mol.any(axis=1)):
+            mask = site_mask & (site_cluster == c)
+            wsum = float(vacated[mask].sum())
+            if wsum <= 0.0:
+                return None, StepReject(REJECT_BACKEND_FAILURE), {}
+            frac = np.where(mask, vacated, 0.0) / wsum
+            for h in np.flatnonzero(parcel_mol[c] > 0.0):
+                demand[h] += (parcel_mol[c, h] * env_vm[h]) * frac
         requested_vol = float(demand.sum())
 
         # gel water per cluster + total water feasibility (chemical + gel)
-        gel_vol_vox = (demand * gel_eps[:, None, None, None]).sum(axis=0)
-        gel_mol_c = np.bincount(site_cluster[site_mask],
-                                weights=gel_vol_vox[site_mask],
-                                minlength=n_clusters) / vm_w
+        gel_mol_c = (parcel_mol * (env_vm * gel_eps)).sum(axis=1) / vm_w
         if np.any(chem_mol_c + gel_mol_c > water_mol_c + 1e-30):
             return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
 
@@ -188,12 +236,14 @@ class Engine:
         diff_c = cur_vol_c - target_vol_c
         if np.any(diff_c < -1e-12 * (1.0 + np.abs(target_vol_c))):
             return None, StepReject("balance_water"), {}
-        with np.errstate(invalid="ignore", divide="ignore"):
-            factor = np.where(cur_vol_c > 0.0, np.clip(diff_c, 0.0, None) / cur_vol_c, 0.0)
-        fac_vox = np.where(recon >= 0, factor[np.clip(recon, 0, None)], 0.0)
-        removed_liq = trial.capillary_liquid * fac_vox
-        trial.capillary_liquid -= removed_liq
-        trial.capillary_gas += removed_liq
+        if n_clusters > 0:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                factor = np.where(cur_vol_c > 0.0,
+                                  np.clip(diff_c, 0.0, None) / cur_vol_c, 0.0)
+            fac_vox = np.where(recon >= 0, factor[np.clip(recon, 0, None)], 0.0)
+            removed_liq = trial.capillary_liquid * fac_vox
+            trial.capillary_liquid -= removed_liq
+            trial.capillary_gas += removed_liq
 
         # authoritative mol ledger (exact scalar arithmetic)
         chem_total = float(chem_mol_c.sum())
@@ -247,26 +297,38 @@ class Engine:
             "outputs": [],
         }
         last_metrics: dict = {}
-        for k_out, t_out in enumerate(outputs):
+        for t_out in outputs:
             while state.time_h < t_out - 1e-12:
-                dt = min(state.dt_h, t_out - state.time_h)
-                trial, reject, metrics = self.try_step(state, dt)
-                if trial is not None:
-                    trial.accept_count = state.accept_count + 1
-                    trial.dt_h = min(state.dt_h * 2.0, sched.dt_initial_h)
-                    state = trial
-                    last_metrics = metrics
-                else:
+                cruise = state.dt_h
+                dt_try = min(cruise, t_out - state.time_h)
+                retries = 0
+                while True:
+                    trial, reject, metrics = self.try_step(state, dt_try)
+                    if trial is not None:
+                        break
                     state.reject_counts[reject.reason] = (
                         state.reject_counts.get(reject.reason, 0) + 1)
-                    state.dt_h = dt / 2.0
-                    if state.dt_h < sched.dt_min_h:
+                    retries += 1
+                    if retries > sched.max_retries:
                         raise EngineError(
-                            f"dt underflow at t={state.time_h} h after reject "
-                            f"{reject.reason!r}", reject.reason)
+                            f"step at t={state.time_h} h rejected {retries} times "
+                            f"(last reason {reject.reason!r})", reject.reason)
+                    # halve, but never below dt_min (a boundary-alignment sliver
+                    # already below dt_min just retries at its own size)
+                    dt_try = max(dt_try / 2.0, min(sched.dt_min_h, dt_try))
+                trial.accept_count = state.accept_count + 1
+                # grow cruise dt; a sliver step clamped by the output boundary
+                # must not collapse an otherwise healthy step size
+                if retries == 0:
+                    trial.dt_h = min(max(dt_try * 2.0, cruise), sched.dt_initial_h)
+                else:
+                    trial.dt_h = min(dt_try * 2.0, sched.dt_initial_h)
+                state = trial
+                last_metrics = metrics
             summary["outputs"].append(self._snapshot_row(state, last_metrics))
             if out_dir is not None:
-                storage.save_checkpoint(state, out_dir, f"ckpt_{k_out:03d}")
+                k_global = self.config.schedule.output_times_h.index(t_out)
+                storage.save_checkpoint(state, out_dir, f"ckpt_{k_global:03d}")
         summary["final"] = self._snapshot_row(state, last_metrics)
         return state, summary
 

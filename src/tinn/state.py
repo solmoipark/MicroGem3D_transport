@@ -110,6 +110,9 @@ class SimulationState:
         return h.hexdigest()
 
     def full_hash(self) -> str:
+        """Equality oracle for restart equivalence: dense arrays, ledger, counters,
+        RNG, and all tables — nothing persisted may diverge unnoticed."""
+        import json as _json
         h = hashlib.sha256(self.dense_hash().encode())
         for arr in (self.phase_mol, self.initial_phase_mol, self.unmet_mol,
                     self.hydrate_mol, self.initial_elements, self.cluster_inventory):
@@ -119,6 +122,16 @@ class SimulationState:
                   self.inert_volume_vox, self.accept_count):
             h.update(repr(x).encode())
         h.update(repr(sorted(self.reject_counts.items())).encode())
+        for table in (self.particles, self.subgrid_bins):
+            for key in sorted(table):
+                arr = np.ascontiguousarray(table[key])
+                h.update(key.encode())
+                h.update(str(arr.dtype).encode())
+                h.update(str(arr.shape).encode())
+                h.update(arr.tobytes())
+        h.update(_json.dumps(self.parcels, sort_keys=True).encode())
+        h.update(_json.dumps(self.remap_events, sort_keys=True).encode())
+        h.update(_json.dumps(self.rng_state, sort_keys=True).encode())
         return h.hexdigest()
 
     def clone(self) -> "SimulationState":

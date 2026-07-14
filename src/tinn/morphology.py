@@ -72,22 +72,31 @@ def place(hydrate_fraction: np.ndarray, capillary_liquid: np.ndarray,
             cap = vacated[cz, cy, cx] + capillary_liquid[cz, cy, cx]
             if cap <= 0.0:
                 continue
-            take = min(rem_sum, cap)
-            part = remaining * (take / rem_sum)
+            if cap >= rem_sum - 1e-15 * max(1.0, rem_sum):
+                # final cell: place the exact remainder so no float dust is
+                # ever dropped (a ~1e-16 capacity overdraw stays within the
+                # voxel identity tolerance)
+                take = rem_sum
+                part = remaining.copy()
+                remaining[:] = 0.0
+                rem_sum = 0.0
+            else:
+                take = cap
+                part = remaining * (take / rem_sum)
+                remaining -= part
+                rem_sum = float(remaining.sum())
             for h in range(n_h):
                 hydrate_fraction[h, cz, cy, cx] += part[h]
-            remaining -= part
-            rem_sum = float(remaining.sum())
             use_vac = min(take, vacated[cz, cy, cx])
             vacated[cz, cy, cx] -= use_vac
             from_liquid = take - use_vac
             capillary_liquid[cz, cy, cx] -= from_liquid
             displaced += from_liquid
             placed += take
-        if rem_sum > 1e-15:
-            unplaced += rem_sum
+        # anything left is a genuine capacity shortfall — volume is never dropped
+        unplaced += rem_sum
 
-    status = STATUS_OK if unplaced <= 1e-12 else STATUS_CAPACITY
+    status = STATUS_OK if unplaced == 0.0 else STATUS_CAPACITY
     return PlacementOutcome(status=status, placed_vol_vox=placed,
                             unplaced_vol_vox=unplaced,
                             liquid_displaced_vol_vox=displaced)

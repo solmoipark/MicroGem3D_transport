@@ -18,7 +18,8 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import TinnConfig
-from .registry import Registry
+from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
+                       Registry, SOLID_PHASE_IDS)
 from .state import SimulationState, _DENSE_FIELDS, code_version
 
 FORMAT_VERSION = 1
@@ -86,6 +87,12 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             "config": state.config.model_dump(mode="json"),
             "rng_state": state.rng_state,
             "reject_counts": state.reject_counts,
+            # channel orderings the ledger vectors are positional over (PRD §2.3):
+            # a restart under a build with different orderings must hard-fail
+            "kinetic_phase_ids": list(KINETIC_PHASE_IDS),
+            "solid_phase_ids": list(SOLID_PHASE_IDS),
+            "hydrate_phase_ids": list(HYDRATE_PHASE_IDS),
+            "element_ids": list(ELEMENT_IDS),
         }
         for k in _LEDGER_SCALARS:
             header[k] = getattr(state, k)
@@ -135,6 +142,14 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     header = json.loads((root / "header.json").read_text(encoding="utf-8"))
     if header["format_version"] != FORMAT_VERSION:
         raise StorageError(f"unsupported checkpoint format {header['format_version']}")
+    for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
+                         ("solid_phase_ids", SOLID_PHASE_IDS),
+                         ("hydrate_phase_ids", HYDRATE_PHASE_IDS),
+                         ("element_ids", ELEMENT_IDS)):
+        if tuple(header[key]) != current:
+            raise StorageError(
+                f"checkpoint {key} {header[key]} does not match this build "
+                f"{list(current)} — ledger vectors would be misinterpreted")
     config = TinnConfig.model_validate(header["config"])
 
     arrays = {f: _read_zarr_array(root / "arrays" / f) for f in _DENSE_FIELDS}
@@ -144,8 +159,13 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
 
     def as_table(name: str) -> Dict[str, np.ndarray]:
         schema = _TABLE_SCHEMAS[name]
-        return {k: np.asarray(v, dtype=np.dtype(schema.get(k, "<f8")))
-                for k, v in tables[name].items()}
+        out = {}
+        for k, v in tables[name].items():
+            arr = np.asarray(v, dtype=np.dtype(schema.get(k, "<f8")))
+            if k == "center_zyx":
+                arr = arr.reshape(-1, 3)  # empty lists must keep the (0, 3) shape
+            out[k] = arr
+        return out
 
     return SimulationState(
         config=config,

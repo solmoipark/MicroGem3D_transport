@@ -61,6 +61,7 @@ def _print_outputs(summary: dict) -> None:
 
 def _run(config_path: str, out_dir: str) -> int:
     from .engine import Engine, EngineError
+    from .storage import StorageError
     try:
         cfg = _load_config(config_path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as e:
@@ -71,6 +72,9 @@ def _run(config_path: str, out_dir: str) -> int:
         _, summary = engine.run(out_dir=out_dir)
     except EngineError as e:
         print(f"error: run aborted ({e.reason}): {e}", file=sys.stderr)
+        return 3
+    except StorageError as e:
+        print(f"error: checkpoint write failed: {e}", file=sys.stderr)
         return 3
     _write_summary(summary, out_dir)
     print(f"run complete -> {out_dir}")
@@ -92,6 +96,9 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
         _, summary = engine.run(state=state, out_dir=out_dir)
     except EngineError as e:
         print(f"error: restart aborted ({e.reason}): {e}", file=sys.stderr)
+        return 3
+    except StorageError as e:
+        print(f"error: checkpoint write failed: {e}", file=sys.stderr)
         return 3
     _write_summary(summary, out_dir)
     print(f"restart complete -> {out_dir}")
