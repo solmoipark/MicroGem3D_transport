@@ -1,0 +1,287 @@
+"""Read-only analysis over run outputs (PRD §3 M5): porosity time series, liquid
+percolation, phase fractions, central-slice PNGs, and the §6.3 sanity-band
+judgment — plus `report(run_dir)` which regenerates §6.1 ledger checks from the
+checkpoints themselves.
+
+This module owns the single implementation of the §6.3 band table and the
+gel-porosity policy; the engine imports both (no second copy that can drift).
+The PNG writer is dependency-free (stdlib zlib/struct only, PRD §5).
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import zlib
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+
+from . import ledger
+from .config import TinnConfig
+from .registry import KINETIC_PHASE_IDS, Registry, default_registry
+from .state import SimulationState
+from .storage import load_checkpoint
+from .transport import LIQ_EPS
+
+_AXIS_NAMES = ("z", "y", "x")
+
+
+# ------------------------------------------------------------------ policies
+
+def gel_porosity_vector(config: TinnConfig, hydrate_ids: Sequence[str],
+                        registry: Registry) -> np.ndarray:
+    """Gel porosity per hydrate channel: registry values for the stoichiometric
+    backend, the declared config map for gems3k (absent phases are crystalline,
+    0.0 — documented policy). Bulk envelope = skeleton / (1 - eps)."""
+    if config.chemistry.backend == "stoichiometric":
+        return np.asarray([registry.get(h).gel_porosity for h in hydrate_ids])
+    gel_map = config.chemistry.gems_gel_porosity or {}
+    return np.asarray([gel_map.get(h, 0.0) for h in hydrate_ids])
+
+
+# ------------------------------------------------------- per-state quantities
+
+def state_row(state: SimulationState, registry: Registry,
+              gel_eps: np.ndarray) -> Dict:
+    """One summary row for a state (shared by engine summaries and reports)."""
+    alpha = state.alpha()
+    cap_por = float((state.capillary_liquid + state.capillary_gas).mean())
+    gel_por_vol = float((state.hydrate_env_vol_vox * gel_eps).sum())
+    n_vox = state.capillary_liquid.size
+    reacted_mass_g = float(np.sum(
+        (state.initial_phase_mol - state.phase_mol)
+        * np.array([registry.get(p).molar_mass_g_mol for p in KINETIC_PHASE_IDS])))
+    gas_cm3 = float(state.capillary_gas.sum()) * state.vox_cm3
+    return {
+        "time_h": state.time_h,
+        "alpha": {p: float(alpha[i]) for i, p in enumerate(KINETIC_PHASE_IDS)},
+        "phase_mol": {p: float(state.phase_mol[i])
+                      for i, p in enumerate(KINETIC_PHASE_IDS)},
+        "hydrate_mol": {h: float(state.hydrate_mol[i])
+                        for i, h in enumerate(state.hydrate_ids)
+                        if state.hydrate_mol[i] > 0.0},
+        "unmet_mol": {p: float(state.unmet_mol[i])
+                      for i, p in enumerate(KINETIC_PHASE_IDS)},
+        "water_mol": {"free": state.water_free_mol, "gel": state.water_gel_mol,
+                      "bound": state.water_bound_mol},
+        "porosity_capillary": cap_por,
+        "porosity_total": cap_por + gel_por_vol / n_vox,
+        "chem_shrinkage_ml_per_g_reacted": (gas_cm3 / reacted_mass_g
+                                            if reacted_mass_g > 0 else 0.0),
+        "accept_count": state.accept_count,
+        "reject_counts": dict(state.reject_counts),
+    }
+
+
+def phase_volume_fractions(state: SimulationState) -> Dict[str, float]:
+    """Volume fraction of the RVE per solid channel (anhydrous and hydrates)."""
+    n_vox = state.capillary_liquid.size
+    out: Dict[str, float] = {}
+    from .registry import SOLID_PHASE_IDS
+    for i, p in enumerate(SOLID_PHASE_IDS):
+        v = float(state.anhydrous_fraction[i].sum()) / n_vox
+        if v > 0.0:
+            out[p] = v
+    for i, h in enumerate(state.hydrate_ids):
+        v = float(state.hydrate_fraction[i].sum()) / n_vox
+        if v > 0.0:
+            out[h] = v
+    return out
+
+
+# --------------------------------------------------------------- percolation
+
+def _label_nonperiodic(mask: np.ndarray) -> np.ndarray:
+    """Min-label flooding with 6-connectivity and NO periodic wrap."""
+    n_vox = mask.size
+    labels = np.where(mask, np.arange(n_vox, dtype=np.int64).reshape(mask.shape),
+                      np.int64(n_vox))
+    big = np.int64(n_vox)
+    for _ in range(n_vox + 1):
+        prev = labels
+        m = labels
+        for ax in range(3):
+            fwd = np.full_like(labels, big)
+            bwd = np.full_like(labels, big)
+            sl_to = [slice(None)] * 3
+            sl_from = [slice(None)] * 3
+            sl_to[ax] = slice(1, None)
+            sl_from[ax] = slice(None, -1)
+            fwd[tuple(sl_to)] = labels[tuple(sl_from)]
+            bwd[tuple(sl_from)] = labels[tuple(sl_to)]
+            m = np.minimum(m, np.where(mask, fwd, big))
+            m = np.minimum(m, np.where(mask, bwd, big))
+        labels = np.where(mask, np.minimum(labels, m), big)
+        if np.array_equal(labels, prev):
+            break
+    return np.where(mask, labels, np.int64(-1))
+
+
+def liquid_percolation(capillary_liquid: np.ndarray) -> Dict[str, bool]:
+    """Does a connected liquid cluster span the box face-to-face per axis?
+    (Non-periodic spanning criterion.) Returns {"z","y","x","any"}."""
+    mask = capillary_liquid > LIQ_EPS
+    labels = _label_nonperiodic(mask)
+    result: Dict[str, bool] = {}
+    spans_any = False
+    for ax, name in enumerate(_AXIS_NAMES):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax] = 0
+        hi[ax] = -1
+        front = set(np.unique(labels[tuple(lo)]))
+        back = set(np.unique(labels[tuple(hi)]))
+        front.discard(-1)
+        back.discard(-1)
+        spans = bool(front & back)
+        result[name] = spans
+        spans_any = spans_any or spans
+    result["any"] = spans_any
+    return result
+
+
+# ------------------------------------------------------------- §6.3 judgment
+
+def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
+    """PRD §6.3: non-blocking physical-plausibility bands, pass/warn only."""
+    checks: List[dict] = []
+
+    def add(name: str, ok: bool, value) -> None:
+        checks.append({"check": name, "status": "pass" if ok else "warn",
+                       "value": value})
+
+    w = config.binder.mass_fractions
+    tot_w = sum(w.values())
+    bands = {24.0: (0.25, 0.55), 168.0: (0.50, 0.80), 672.0: (0.65, 0.90)}
+    for row in rows:
+        t = row["time_h"]
+        if t in bands:
+            total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
+                        for p in KINETIC_PHASE_IDS) / tot_w
+            lo, hi = bands[t]
+            add(f"total_clinker_alpha@{t:g}h", lo <= total <= hi, total)
+    if rows:
+        add("alpha_order_C3S_ge_C2S",
+            all(r["alpha"]["C3S"] >= r["alpha"]["C2S"] - 1e-12 for r in rows), None)
+        ch_name = ("Portlandite" if any("Portlandite" in r["hydrate_mol"]
+                                        for r in rows) else "CH")
+        ch = [r["hydrate_mol"].get(ch_name, 0.0) for r in rows]
+        add("CH_mass_monotone_increase",
+            all(b >= a - 1e-30 for a, b in zip(ch, ch[1:])), ch[-1])
+        por = [r["porosity_capillary"] for r in rows]
+        add("capillary_porosity_monotone_decrease",
+            all(b <= a + 1e-12 for a, b in zip(por, por[1:])), por[-1])
+        sh = rows[-1]["chem_shrinkage_ml_per_g_reacted"]
+        add("chem_shrinkage_ml_per_g", 0.03 <= sh <= 0.08, sh)
+        phs = [v for r in rows
+               for v in r.get("ledger_metrics", {}).get("cluster_ph", {}).values()]
+        if phs:
+            add("cluster_ph_band_12.4_13.9",
+                all(12.4 <= p <= 13.9 for p in phs), [min(phs), max(phs)])
+    return {
+        "note": ("physical plausibility bands (PRD 6.3), pass/warn only — "
+                 "this is not scientific validation"),
+        "checks": checks,
+    }
+
+
+# --------------------------------------------------------------- PNG writing
+
+# convex-combination colors per volume channel (fractions sum to 1 per voxel)
+_COL_ANHYDROUS = np.array([90, 90, 90], dtype=np.float64)
+_COL_HYDRATE = np.array([215, 150, 60], dtype=np.float64)
+_COL_LIQUID = np.array([40, 90, 220], dtype=np.float64)
+_COL_GAS = np.array([235, 235, 235], dtype=np.float64)
+
+
+def write_png(path: str, rgb: np.ndarray) -> None:
+    """Minimal deterministic RGB8 PNG writer (stdlib only)."""
+    arr = np.ascontiguousarray(rgb, dtype=np.uint8)
+    h, w, _ = arr.shape
+    raw = b"".join(b"\x00" + arr[i].tobytes() for i in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    payload = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+               + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    Path(path).write_bytes(payload)
+
+
+def central_slice_rgb(state: SimulationState) -> np.ndarray:
+    """Central z-slice as an RGB8 image: anhydrous gray, hydrates orange,
+    liquid blue, gas near-white (convex combination of channel colors)."""
+    z = state.grid_size // 2
+    anh = state.anhydrous_fraction[:, z].sum(axis=0)
+    hyd = state.hydrate_fraction[:, z].sum(axis=0)
+    liq = state.capillary_liquid[z]
+    gas = state.capillary_gas[z]
+    img = (anh[..., None] * _COL_ANHYDROUS + hyd[..., None] * _COL_HYDRATE
+           + liq[..., None] * _COL_LIQUID + gas[..., None] * _COL_GAS)
+    return np.clip(np.rint(img), 0, 255).astype(np.uint8)
+
+
+# -------------------------------------------------------------------- report
+
+def report(run_dir: str, out_dir: Optional[str] = None,
+           registry: Optional[Registry] = None) -> Dict:
+    """Regenerate the full report from a run directory's checkpoints: per-output
+    rows, §6.1 ledger re-checks, percolation, phase fractions, §6.3 band, and a
+    central-slice PNG per checkpoint. Writes report.json + PNGs to out_dir
+    (default: the run directory)."""
+    reg = registry or default_registry()
+    run = Path(run_dir)
+    ckpts = sorted(p for p in run.glob("ckpt_*") if p.is_dir())
+    if not ckpts:
+        raise FileNotFoundError(f"no ckpt_* checkpoints under {run}")
+    out = Path(out_dir) if out_dir else run
+    out.mkdir(parents=True, exist_ok=True)
+
+    # per-cluster pH lives only in run summaries (a solver diagnostic, not
+    # checkpointed state) — merge it in when the run wrote one
+    summary_ph: Dict[float, dict] = {}
+    summary_path = run / "summary.json"
+    if summary_path.is_file():
+        try:
+            for row in json.loads(summary_path.read_text(encoding="utf-8"))["outputs"]:
+                ph = row.get("ledger_metrics", {}).get("cluster_ph")
+                if ph:
+                    summary_ph[float(row["time_h"])] = ph
+        except (json.JSONDecodeError, KeyError):
+            pass  # a foreign/corrupt summary never blocks a checkpoint report
+
+    rows: List[dict] = []
+    config = None
+    backend_id = None
+    for ck in ckpts:
+        state = load_checkpoint(str(ck), reg)
+        config = state.config
+        backend_id = state.backend_id
+        gel_eps = gel_porosity_vector(config, state.hydrate_ids, reg)
+        row = state_row(state, reg, gel_eps)
+        check = ledger.check_all(state, reg)
+        row["ledger_metrics"] = dict(check.metrics)
+        row["ledger_violations"] = list(check.violations)
+        if row["time_h"] in summary_ph:
+            row["ledger_metrics"]["cluster_ph"] = summary_ph[row["time_h"]]
+        row["percolation"] = liquid_percolation(state.capillary_liquid)
+        row["phase_volume_fractions"] = phase_volume_fractions(state)
+        png_name = f"slice_{ck.name}.png"
+        write_png(str(out / png_name), central_slice_rgb(state))
+        row["slice_png"] = png_name
+        rows.append(row)
+
+    result = {
+        "run_dir": str(run),
+        "config_hash": config.config_hash(),
+        "backend": backend_id,
+        "outputs": rows,
+        "sanity_band": sanity_band(rows, config),
+    }
+    (out / "report.json").write_text(json.dumps(result, indent=1),
+                                     encoding="utf-8")
+    return result

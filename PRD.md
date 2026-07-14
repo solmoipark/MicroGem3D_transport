@@ -64,9 +64,9 @@ v1(2026-07 개발분)은 다음을 실제로 동작시켰고, 이 설계들은 v
 | PSD | 로그 구간 부피분율 테이블 (합성 기본값 제공) | 필수(기본값 허용) |
 | w/c (또는 w/C3S) | 질량비 | 필수 |
 | 온도 | K, 등온 | 필수 |
-| 동역학 | `tabulated` alpha(t) 테이블 **또는** `pk` 프리셋 이름 | 필수 |
+| 동역학 | `tabulated` alpha(t) 테이블 **또는** `pk` 프리셋 이름 + Blaine(m²/kg) | 필수 |
 | RVE | 격자 크기(32³/64³), 복셀 크기(0.5–1.0 µm), 시드 | 필수 |
-| 화학 백엔드 | `stoichiometric`(합성) 또는 `gems3k`(PC 번들 경로) | 필수 |
+| 화학 백엔드 | `stoichiometric`(합성) 또는 `gems3k`(PC 번들 경로 + 워커 인터프리터 + 상별 겔공극률 맵) | 필수 |
 | 시간 스케줄 | 출력 시각 리스트 + dt 정책(최소 dt, 최대 재시도) | 필수 |
 
 ### 1.3 출력
@@ -120,9 +120,12 @@ src/tinn/
   좌표를 모른다. 계산 불가 필드는 NaN + `not_available`이지 0이 아니다.
   - `StoichiometricBackend`: 4상 각각에 고정 합성 화학식(C3S→C1.7SH4+1.3CH 등 config 명시)을 적용하는
     결정론 백엔드. GEMS 없이 전체 파이프라인을 구동·테스트하기 위한 것.
-  - `GemsBackend`: xGEMS ChemicalEngine. 트라이얼당 클러스터당 1회 호출, 격리 작업 디렉터리
+  - `GemsBackend`: xGEMS ChemicalEngine. 트라이얼당 클러스터당 기본 1회 호출(물 부족·비수렴 시
+    방출량 스케일다운 협상으로 제한된 추가 호출 허용; 미달분은 unmet 기록), 격리 작업 디렉터리
     (ipmlog.txt/xGEMS.log 오염 방지), 소스 번들 해시 전후 검증, 클링커 상 억제(bound=0),
-    cold-start 실패 시 trial reject.
+    cold-start 실패 시 trial reject. 입력은 정준 크기로 스케일 후 출력을 정확히 역스케일
+    (평형은 세기성질; 솔버 플로어·O2 시드·검증 슬랙은 주입 원장으로 정확 계상, 상한 초과는 블로킹).
+    물이 극미한(전체의 1e-3 미만) 비수렴 클러스터는 해당 스텝 반응을 포기하고 unmet 기록.
 - **MorphologyModel**: parcel의 벌크 외피 부피(V_skel/(1-ε_gel))를 소스 입자 주변
   내부(inner)/외부(outer) 분할로 배치. 부피를 버리거나 임의 이동 금지 — 용량 부족은 reject.
 - **TransportModel**: 액체분율 임계 + 면 전도 기준의 6-이웃 주기 클러스터. 화학·배치 무관여.
@@ -141,8 +144,10 @@ src/tinn/
 product_parcels(시각·클러스터·상별 불변 행: 상량, 원소 매핑, 골격/벌크 부피 — 누적 이중 원장 금지),
 remap_events(overlap 행렬 기록).
 
-**헤더:** `kinetic_phase_ids`(순서 고정), `phase_alpha`/`initial_phase_mol`/`unmet_mol` 벡터,
-time, dt, config_hash, code_version(git), backend_id, RNG 전체 상태, accept/reject 카운트.
+**헤더:** `kinetic_phase_ids`(순서 고정), `hydrate_phase_ids`(런 스코프: 합성=레지스트리 4상,
+gems3k=번들 고체상 목록), `phase_alpha`/`initial_phase_mol`/`unmet_mol` 벡터,
+time, dt, config_hash(워커 인터프리터 경로 제외), code_version(git), backend_id,
+RNG 전체 상태, accept/reject 카운트, 수화물 원소/외피부피/주입 원장 벡터.
 
 **물 원장:** 자유 모세관수 / 겔수(수화물 외피 내부, 점유율 비가산) / 결합수(상 조성 유래) — 상호배타,
 mol이 권위이고 kg은 파생.

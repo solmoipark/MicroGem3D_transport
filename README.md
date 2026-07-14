@@ -23,6 +23,12 @@ py -3 -m tinn.cli run examples\c3s_32.json --out runs\c3s
 # 체크포인트에서 재시작 (무중단 실행과 비트단위 동일)
 py -3 -m tinn.cli restart runs\c3s\ckpt_001 --out runs\c3s_restart
 
+# 리포트 (요약 JSON + 슬라이스 PNG + §6.3 판정)
+py -3 -m tinn.cli report runs\c3s
+
+# GEMS 백엔드 런 (xgems 환경 + PC 번들 필요; 인터프리터는 config 또는 TINN_GEMS_PYTHON)
+py -3 -m tinn.cli run examples\opc_gems_32.json --out runs\opc_gems
+
 # 테스트
 py -3 -m pytest -q
 ```
@@ -43,9 +49,11 @@ py -3 -m pytest -q
       `miniforge3/envs/py313-xgems` (환경변수 `TINN_GEMS_PYTHON`로 재지정).
 - [x] **M4** — GEMS→3D 결합: product-parcel 원장(파슬이 자체 원소 벡터·골격
       부피 보유, CSHQ 고정 화학식 재해석 없음), 클러스터별 정준 스케일 평형,
-      OPC 32³ GEMS 런 1/3/7일 완주(25분, 거부 0), §6.1 폐쇄(원소 ≤9.5e-24)
-      + §6.3 sanity band 7항목 전부 pass. 예제: `examples/opc_gems_32.json`.
-- [ ] M5 — 분석과 리포트
+      OPC 32³ GEMS 런 1/3/7일 완주(12분, 거부 0), §6.1 폐쇄(원소 ≤2.8e-22)
+      + §6.3 sanity band 전부 pass. 예제: `examples/opc_gems_32.json`.
+- [x] **M5** — 분석과 리포트: `tinn report RUN_DIR`가 체크포인트에서 §6.1
+      원장 재검증, 공극률 시계열, 액체 percolation, 상 분율, 중앙 슬라이스
+      PNG(의존성 없는 자체 PNG writer), §6.3 자동 판정을 일괄 생성.
 
 ## 예제 config
 
@@ -53,7 +61,7 @@ py -3 -m pytest -q
 - `examples/opc_srm114q_32.json` — NIST SRM 114q 4상 레시피(60/14/7/10, 미배정 9%),
   P&K 프리셋 `pk_elakneswaran_2018` (동역학 구현은 M2).
 
-## 모듈 (상한 16, 현재 15)
+## 모듈 (상한 16, 현재 16 — 상한 도달, 추가 시 통합·삭제 선행)
 
 `src/tinn/`: `config.py`(스키마+해시), `registry.py`(상/성분 데이터),
 `geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(Tabulated+ParrotKilloh),
@@ -62,5 +70,5 @@ py -3 -m pytest -q
 `backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),
 `engine.py`(트랜잭션 오케스트레이터), `storage.py`(Zarr-v2 체크포인트),
 `gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브+GemsBackend),
-`cli.py`(validate-config/run/restart), `__init__.py`.
-남은 슬롯: `analysis.py`(M5).
+`analysis.py`(읽기 전용 분석+리포트+§6.3 판정+PNG),
+`cli.py`(validate-config/run/restart/report), `__init__.py`.

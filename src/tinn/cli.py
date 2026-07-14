@@ -1,4 +1,4 @@
-"""CLI: validate-config / run / restart. The report subcommand arrives with M5."""
+"""CLI: validate-config / run / restart / report."""
 
 from __future__ import annotations
 
@@ -106,6 +106,32 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
     return 0
 
 
+def _report(run_dir: str, out_dir: Optional[str]) -> int:
+    from .analysis import report
+    from .storage import StorageError
+    try:
+        result = report(run_dir, out_dir)
+    except (FileNotFoundError, StorageError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    target = out_dir or run_dir
+    print(f"report written -> {Path(target) / 'report.json'}")
+    for row in result["outputs"]:
+        perc = "percolating" if row["percolation"]["any"] else "isolated"
+        viol = f" VIOLATIONS: {row['ledger_violations']}" if row["ledger_violations"] else ""
+        print(f"  t={row['time_h']:9.3f} h  cap.por={row['porosity_capillary']:.4f}  "
+              f"tot.por={row['porosity_total']:.4f}  liquid {perc}  "
+              f"[{row['slice_png']}]{viol}")
+    band = result["sanity_band"]
+    n_warn = sum(1 for c in band["checks"] if c["status"] == "warn")
+    print(f"  sanity band: {len(band['checks']) - n_warn} pass, {n_warn} warn "
+          f"({band['note']})")
+    for c in band["checks"]:
+        if c["status"] == "warn":
+            print(f"    [warn] {c['check']}: {c['value']}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="tinn", description="TINN cement hydration platform v2")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -117,13 +143,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_res = sub.add_parser("restart", help="continue a run from a checkpoint directory")
     p_res.add_argument("checkpoint_path")
     p_res.add_argument("--out", required=True, help="output directory for new checkpoints/summary")
+    p_rep = sub.add_parser("report", help="generate report.json + slice PNGs from a run directory")
+    p_rep.add_argument("run_dir")
+    p_rep.add_argument("--out", default=None, help="output directory (default: the run directory)")
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
         return _validate_config(args.config_path)
     if args.command == "run":
         return _run(args.config_path, args.out)
-    return _restart(args.checkpoint_path, args.out)
+    if args.command == "restart":
+        return _restart(args.checkpoint_path, args.out)
+    return _report(args.run_dir, args.out)
 
 
 if __name__ == "__main__":

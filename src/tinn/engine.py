@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from . import backend as backend_mod
+from . import analysis, backend as backend_mod
 from . import dissolution, ledger, morphology, storage, transport
 from .config import TinnConfig
 from .geometry import initialize_rve
@@ -76,15 +76,9 @@ class Engine:
             self.backend = GemsBackend(worker, config.temperature_K)
         self.kinetics = kinetics or make_kinetics(config)
         self.hydrate_ids = tuple(self.backend.hydrate_ids)
-        # bulk envelope = skeleton / (1 - gel_porosity); gel porosity per channel
-        # comes from the registry (stoichiometric) or the declared config map
-        # (gems3k) — an undeclared source is 0.0 (crystalline), documented policy
-        if config.chemistry.backend == "stoichiometric":
-            eps = [self.registry.get(h).gel_porosity for h in self.hydrate_ids]
-        else:
-            gel_map = config.chemistry.gems_gel_porosity or {}
-            eps = [gel_map.get(h, 0.0) for h in self.hydrate_ids]
-        self._gel_eps = np.asarray(eps)
+        # single implementation of the gel-porosity policy lives in analysis
+        self._gel_eps = analysis.gel_porosity_vector(config, self.hydrate_ids,
+                                                     self.registry)
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -419,79 +413,11 @@ class Engine:
                 k_global = self.config.schedule.output_times_h.index(t_out)
                 storage.save_checkpoint(state, out_dir, f"ckpt_{k_global:03d}")
         summary["final"] = self._snapshot_row(state, last_metrics)
-        summary["sanity_band"] = self._sanity_band(summary["outputs"])
+        summary["sanity_band"] = analysis.sanity_band(summary["outputs"],
+                                                      self.config)
         return state, summary
 
-    def _sanity_band(self, rows: List[dict]) -> dict:
-        """PRD §6.3: non-blocking physical-plausibility bands, pass/warn only."""
-        checks: List[dict] = []
-
-        def add(name: str, ok: bool, value) -> None:
-            checks.append({"check": name, "status": "pass" if ok else "warn",
-                           "value": value})
-
-        w = self.config.binder.mass_fractions
-        tot_w = sum(w.values())
-        bands = {24.0: (0.25, 0.55), 168.0: (0.50, 0.80), 672.0: (0.65, 0.90)}
-        for row in rows:
-            t = row["time_h"]
-            if t in bands:
-                total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
-                            for p in KINETIC_PHASE_IDS) / tot_w
-                lo, hi = bands[t]
-                add(f"total_clinker_alpha@{t:g}h", lo <= total <= hi, total)
-        if rows:
-            add("alpha_order_C3S_ge_C2S",
-                all(r["alpha"]["C3S"] >= r["alpha"]["C2S"] - 1e-12 for r in rows), None)
-            ch_name = ("Portlandite" if any("Portlandite" in r["hydrate_mol"]
-                                            for r in rows) else "CH")
-            ch = [r["hydrate_mol"].get(ch_name, 0.0) for r in rows]
-            add("CH_mass_monotone_increase",
-                all(b >= a - 1e-30 for a, b in zip(ch, ch[1:])), ch[-1])
-            por = [r["porosity_capillary"] for r in rows]
-            add("capillary_porosity_monotone_decrease",
-                all(b <= a + 1e-12 for a, b in zip(por, por[1:])), por[-1])
-            sh = rows[-1]["chem_shrinkage_ml_per_g_reacted"]
-            add("chem_shrinkage_ml_per_g", 0.03 <= sh <= 0.08, sh)
-            phs = [v for r in rows
-                   for v in r["ledger_metrics"].get("cluster_ph", {}).values()]
-            if phs:
-                add("cluster_ph_band_12.4_13.9",
-                    all(12.4 <= p <= 13.9 for p in phs),
-                    [min(phs), max(phs)])
-        return {
-            "note": ("physical plausibility bands (PRD 6.3), pass/warn only — "
-                     "this is not scientific validation"),
-            "checks": checks,
-        }
-
     def _snapshot_row(self, state: SimulationState, metrics: dict) -> dict:
-        reg = self.registry
-        alpha = state.alpha()
-        cap_por = float((state.capillary_liquid + state.capillary_gas).mean())
-        gel_por_vol = float((state.hydrate_env_vol_vox * self._gel_eps).sum())
-        n_vox = state.capillary_liquid.size
-        reacted_mass_g = float(np.sum(
-            (state.initial_phase_mol - state.phase_mol)
-            * np.array([reg.get(p).molar_mass_g_mol for p in KINETIC_PHASE_IDS])))
-        gas_cm3 = float(state.capillary_gas.sum()) * state.vox_cm3
-        return {
-            "time_h": state.time_h,
-            "alpha": {p: float(alpha[i]) for i, p in enumerate(KINETIC_PHASE_IDS)},
-            "phase_mol": {p: float(state.phase_mol[i])
-                          for i, p in enumerate(KINETIC_PHASE_IDS)},
-            "hydrate_mol": {h: float(state.hydrate_mol[i])
-                            for i, h in enumerate(state.hydrate_ids)
-                            if state.hydrate_mol[i] > 0.0},
-            "unmet_mol": {p: float(state.unmet_mol[i])
-                          for i, p in enumerate(KINETIC_PHASE_IDS)},
-            "water_mol": {"free": state.water_free_mol, "gel": state.water_gel_mol,
-                          "bound": state.water_bound_mol},
-            "porosity_capillary": cap_por,
-            "porosity_total": cap_por + gel_por_vol / n_vox,
-            "chem_shrinkage_ml_per_g_reacted": (gas_cm3 / reacted_mass_g
-                                                if reacted_mass_g > 0 else 0.0),
-            "accept_count": state.accept_count,
-            "reject_counts": dict(state.reject_counts),
-            "ledger_metrics": dict(metrics),
-        }
+        row = analysis.state_row(state, self.registry, self._gel_eps)
+        row["ledger_metrics"] = dict(metrics)
+        return row
