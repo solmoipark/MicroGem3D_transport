@@ -20,7 +20,7 @@ import numpy as np
 from .config import TinnConfig
 from .geometry import RVEInit
 from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, INERT_PHASE_ID,
-                       KINETIC_PHASE_IDS, Registry)
+                       KINETIC_PHASE_IDS, Registry, element_vector)
 
 _DENSE_FIELDS = ("anhydrous_fraction", "hydrate_fraction", "capillary_liquid",
                  "capillary_gas", "particle_id", "cluster_id")
@@ -42,18 +42,18 @@ def code_version() -> str:
 
 
 def formula_elements(formula: Dict[str, float]) -> np.ndarray:
-    v = np.zeros(len(ELEMENT_IDS))
-    for el, count in formula.items():
-        v[ELEMENT_IDS.index(el)] += count
-    return v
+    return element_vector(formula, 1.0)
 
 
 @dataclass
 class SimulationState:
     config: TinnConfig
+    # run-scoped hydrate channel order: registry HYDRATE_PHASE_IDS for the
+    # stoichiometric backend, the bundle's solid phases for gems3k
+    hydrate_ids: tuple
     # --- dense fields, (z, y, x), float64 / int64 ---
     anhydrous_fraction: np.ndarray   # (5, N, N, N), channels = SOLID_PHASE_IDS
-    hydrate_fraction: np.ndarray     # (4, N, N, N) bulk envelope incl. gel pores
+    hydrate_fraction: np.ndarray     # (H, N, N, N) bulk envelope incl. gel pores
     capillary_liquid: np.ndarray     # (N, N, N)
     capillary_gas: np.ndarray        # (N, N, N) fixed-RVE residual (chem. shrinkage)
     particle_id: np.ndarray          # (N, N, N) int64, initial placement label
@@ -70,7 +70,10 @@ class SimulationState:
     phase_mol: np.ndarray            # (4,) remaining anhydrous mol
     initial_phase_mol: np.ndarray    # (4,)
     unmet_mol: np.ndarray            # (4,) current deficit vs kinetic target
-    hydrate_mol: np.ndarray          # (4,) channels = HYDRATE_PHASE_IDS
+    hydrate_mol: np.ndarray          # (H,) over hydrate_ids
+    hydrate_env_vol_vox: np.ndarray  # (H,) authoritative placed bulk-envelope volume
+    hydrate_elements: np.ndarray     # (E,) total element mol in all parcels
+    injected_elements: np.ndarray    # (E,) backend-injected seeds/solver floors
     water_free_mol: float
     water_gel_mol: float
     water_bound_mol: float
@@ -115,8 +118,11 @@ class SimulationState:
         import json as _json
         h = hashlib.sha256(self.dense_hash().encode())
         for arr in (self.phase_mol, self.initial_phase_mol, self.unmet_mol,
-                    self.hydrate_mol, self.initial_elements, self.cluster_inventory):
+                    self.hydrate_mol, self.hydrate_env_vol_vox,
+                    self.hydrate_elements, self.injected_elements,
+                    self.initial_elements, self.cluster_inventory):
             h.update(np.ascontiguousarray(arr).tobytes())
+        h.update(repr(self.hydrate_ids).encode())
         for x in (self.time_h, self.dt_h, self.water_free_mol, self.water_gel_mol,
                   self.water_bound_mol, self.initial_water_mol,
                   self.inert_volume_vox, self.accept_count):
@@ -150,7 +156,8 @@ class SimulationState:
 
     @classmethod
     def from_geometry(cls, config: TinnConfig, registry: Registry,
-                      rve: RVEInit, backend_id: str) -> "SimulationState":
+                      rve: RVEInit, backend_id: str,
+                      hydrate_ids: tuple = HYDRATE_PHASE_IDS) -> "SimulationState":
         n = config.rve.grid_size
         vox_cm3 = config.rve.voxel_size_um ** 3 * 1e-12
         phase_mol = np.zeros(len(KINETIC_PHASE_IDS))
@@ -168,8 +175,9 @@ class SimulationState:
         rng = np.random.Generator(np.random.PCG64(config.rve.seed))
         return cls(
             config=config,
+            hydrate_ids=tuple(hydrate_ids),
             anhydrous_fraction=rve.anhydrous_fraction.copy(),
-            hydrate_fraction=np.zeros((len(HYDRATE_PHASE_IDS), n, n, n)),
+            hydrate_fraction=np.zeros((len(hydrate_ids), n, n, n)),
             capillary_liquid=rve.capillary_liquid.copy(),
             capillary_gas=rve.capillary_gas.copy(),
             particle_id=rve.particle_id.copy(),
@@ -185,7 +193,10 @@ class SimulationState:
             phase_mol=phase_mol,
             initial_phase_mol=phase_mol.copy(),
             unmet_mol=np.zeros(len(KINETIC_PHASE_IDS)),
-            hydrate_mol=np.zeros(len(HYDRATE_PHASE_IDS)),
+            hydrate_mol=np.zeros(len(hydrate_ids)),
+            hydrate_env_vol_vox=np.zeros(len(hydrate_ids)),
+            hydrate_elements=np.zeros(len(ELEMENT_IDS)),
+            injected_elements=np.zeros(len(ELEMENT_IDS)),
             water_free_mol=water_mol,
             water_gel_mol=0.0,
             water_bound_mol=0.0,

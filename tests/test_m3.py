@@ -179,10 +179,3 @@ def test_config_gems3k_requires_bundle():
         TinnConfig.model_validate(raw)
 
 
-def test_engine_gems3k_still_pending_m4():
-    from tinn.engine import Engine
-    raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(encoding="utf-8"))
-    raw["chemistry"] = {"backend": "gems3k", "gems_bundle_lst": str(BUNDLE)}
-    cfg = TinnConfig.model_validate(raw)
-    with pytest.raises(NotImplementedError):
-        Engine(cfg)

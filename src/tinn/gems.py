@@ -81,6 +81,7 @@ class GemsResult:
     phase_masses_kg: Dict[str, float]
     phase_volumes_m3: Dict[str, float]
     phase_elements_mol: Dict[str, Dict[str, float]]
+    aqueous_h2o_mol: Optional[float] = None  # solvent split of the aqueous phase
     element_input: Dict[str, object] = field(default_factory=dict)
     xgems_version: str = "not_available"
 
@@ -124,6 +125,13 @@ class GemsWorker:
         self.baseline_audit = audit_bundle(self.bundle_lst)
 
     # ---------------------------------------------------------------- public
+    def info(self) -> Dict:
+        """Bundle metadata: phase names, independent element names, species per
+        phase — needed to fix the run's hydrate channel set before state creation."""
+        run_dir = self.work_root / f"info-{uuid.uuid4().hex[:12]}"
+        result = self._raw_call({"mode": "info", "dat_lst": self.bundle_lst}, run_dir)
+        return result
+
     def equilibrate_stored(self) -> GemsResult:
         """Re-equilibrate the bundle's stored DBR node (PRD §6.2 anchor 1)."""
         return self._call({"mode": "stored", "dat_lst": self.bundle_lst})
@@ -155,13 +163,32 @@ class GemsWorker:
 
     # --------------------------------------------------------------- private
     def _call(self, request: Dict) -> GemsResult:
+        run_dir = self.work_root / f"run-{uuid.uuid4().hex[:12]}"
+        response = self._raw_call(request, run_dir)
+        ph = response["pH"]
+        ionic = response["ionic_strength"]
+        return GemsResult(
+            status=response["status"],
+            ph=math.nan if ph is None else float(ph),
+            ph_status="not_available" if ph is None else "ok",
+            ionic_strength=math.nan if ionic is None else float(ionic),
+            ionic_strength_status="not_available" if ionic is None else "ok",
+            phase_amounts_mol=response["phase_amounts_mol"],
+            phase_masses_kg=response["phase_masses_kg"],
+            phase_volumes_m3=response["phase_volumes_m3"],
+            phase_elements_mol=response["phase_elements_mol"],
+            aqueous_h2o_mol=response.get("aqueous_h2o_mol"),
+            element_input=response.get("element_input", {}),
+            xgems_version=response.get("xgems_version", "not_available"),
+        )
+
+    def _raw_call(self, request: Dict, run_dir: Path) -> Dict:
         before = audit_bundle(self.bundle_lst)
         if before != self.baseline_audit:
             changed = sorted(k for k in set(before) | set(self.baseline_audit)
                              if before.get(k) != self.baseline_audit.get(k))
             raise BundleAuditError(
                 f"bundle changed since worker construction: {changed}")
-        run_dir = self.work_root / f"run-{uuid.uuid4().hex[:12]}"
         run_dir.mkdir(parents=True, exist_ok=False)
         req_path = run_dir / "request.json"
         resp_path = run_dir / "response.json"
@@ -212,20 +239,132 @@ class GemsWorker:
                 f"artifacts kept in {run_dir}", kind=kind)
         # solver artifacts are only discarded on success
         shutil.rmtree(run_dir, ignore_errors=True)
-        ph = response["pH"]
-        ionic = response["ionic_strength"]
-        return GemsResult(
-            status=response["status"],
-            ph=math.nan if ph is None else float(ph),
-            ph_status="not_available" if ph is None else "ok",
-            ionic_strength=math.nan if ionic is None else float(ionic),
-            ionic_strength_status="not_available" if ionic is None else "ok",
-            phase_amounts_mol=response["phase_amounts_mol"],
-            phase_masses_kg=response["phase_masses_kg"],
-            phase_volumes_m3=response["phase_volumes_m3"],
-            phase_elements_mol=response["phase_elements_mol"],
-            element_input=response.get("element_input", {}),
-            xgems_version=response.get("xgems_version", "not_available"),
+        return response
+
+
+# --------------------------------------------------------------- ReactionBackend
+
+AQUEOUS_PHASE = "aq_gen"
+GAS_PHASE = "gas_gen"
+# equilibrium is intensive: inputs are scaled to a canonical magnitude where the
+# solver is accurate (RVE clusters hold ~1e-10 mol; floors are ~1e-15 mol) and
+# every extensive output is scaled back exactly
+CANONICAL_MAX_ELEMENT_MOL = 1e-2
+
+
+class GemsBackend:
+    """ReactionBackend over an isolated xGEMS worker (PRD §2.2).
+
+    Per cluster: (existing solution inventory + newly released elements + free
+    water) -> equilibrate with clinker suppressed -> (new solid parcels with
+    their own element vectors and skeleton volumes, residual solution inventory).
+    Unreacted clinker is never an input; re-dissolution of existing hydrates is
+    inactive (they are simply never fed back). Nonconvergence/timeouts raise
+    BackendTransientError (trial reject); config errors propagate.
+    """
+
+    backend_id = "gems3k"
+
+    def __init__(self, worker: GemsWorker, temperature_k: float):
+        from .registry import (ELEMENT_IDS, KINETIC_PHASE_IDS, default_registry,
+                               element_vector)
+        self._element_ids = ELEMENT_IDS
+        self._worker = worker
+        self.temperature_k = temperature_k
+        info = worker.info()
+        missing = sorted(set(ELEMENT_IDS) - set(info["element_names"]))
+        if missing:
+            raise GemsError(f"bundle lacks ledger elements: {missing}", kind="config")
+        excluded = set(SUPPRESSED_CLINKER_PHASES) | {AQUEOUS_PHASE, GAS_PHASE}
+        self.hydrate_ids = tuple(p for p in info["phase_names"] if p not in excluded)
+        reg = default_registry()
+        self._formula_vec = {p: element_vector(reg.get(p).formula, 1.0)
+                             for p in KINETIC_PHASE_IDS}
+        self._h2o_vec = element_vector(reg.get("H2O").formula, 1.0)
+        self._h2o_index = {el: i for i, el in enumerate(ELEMENT_IDS)}
+
+    def react(self, released_mol, water_available_mol: float, inventory):
+        import numpy as np
+        from .backend import (BackendTransientError, Parcel, ReactionResult,
+                              STATUS_OK)
+
+        e_ids = self._element_ids
+        elements = np.asarray(inventory, dtype=np.float64).copy()
+        for phase_id, mol in released_mol.items():
+            if mol > 0.0:
+                elements = elements + self._formula_vec[phase_id] * mol
+        elements = elements + self._h2o_vec * water_available_mol
+        # tiny negatives are float dust from previous residual splits
+        elements = np.where(np.abs(elements) < 1e-30, 0.0, elements)
+        if np.any(elements < 0.0):
+            raise GemsError(f"negative element input: {dict(zip(e_ids, elements))}",
+                            kind="config")
+        peak = float(elements.max())
+        if peak <= 0.0:
+            raise GemsError("empty element input to GEMS backend", kind="config")
+        s = CANONICAL_MAX_ELEMENT_MOL / peak
+
+        scaled = {el: float(elements[i] * s) for i, el in enumerate(e_ids)
+                  if elements[i] > 0.0}
+        injected = np.zeros(len(e_ids))
+        if not np.any(np.asarray(inventory) != 0.0):
+            # first equilibration of this cluster: O2 seed fixes the redox state;
+            # it returns via the residual inventory on later calls
+            scaled["O"] = scaled.get("O", 0.0) + O2_SEED_MOL_O
+            injected[e_ids.index("O")] += O2_SEED_MOL_O / s
+
+        try:
+            r = self._worker.equilibrate_elements(scaled, self.temperature_k)
+        except GemsError as e:
+            if e.kind in ("nonconvergence", "timeout"):
+                raise BackendTransientError(str(e)) from e
+            raise
+
+        for el, adj in r.element_input["floor_adjustments_mol"].items():
+            if el in self._h2o_index:
+                injected[self._h2o_index[el]] += adj / s
+
+        parcels = []
+        residual_phases = [AQUEOUS_PHASE, GAS_PHASE]
+        for phase, mol_scaled in r.phase_amounts_mol.items():
+            if phase in (AQUEOUS_PHASE, GAS_PHASE) or mol_scaled <= 0.0:
+                continue
+            if phase in SUPPRESSED_CLINKER_PHASES:
+                # suppression (bound=0) can leave numerical dust; dust elements
+                # stay in solution, anything material is precipitating clinker
+                if mol_scaled > 1e-10:
+                    raise GemsError(
+                        f"suppressed clinker phase {phase} precipitated "
+                        f"{mol_scaled!r} mol (scaled) — suppression failed",
+                        kind="internal")
+                residual_phases.append(phase)
+                continue
+            pe = r.phase_elements_mol.get(phase, {})
+            vec = np.zeros(len(e_ids))
+            for el, v in pe.items():
+                if el in self._h2o_index:
+                    vec[self._h2o_index[el]] = v / s
+            parcels.append(Parcel(
+                phase_id=phase, mol=mol_scaled / s, elements=vec,
+                skel_vol_cm3=r.phase_volumes_m3.get(phase, 0.0) * 1e6 / s))
+
+        if r.aqueous_h2o_mol is None:
+            raise GemsError("worker did not split the aqueous solvent", kind="protocol")
+        h2o_out = r.aqueous_h2o_mol / s
+        residual = np.zeros(len(e_ids))
+        for phase in residual_phases:
+            for el, v in r.phase_elements_mol.get(phase, {}).items():
+                if el in self._h2o_index:
+                    residual[self._h2o_index[el]] += v / s
+        residual = residual - self._h2o_vec * h2o_out
+
+        return ReactionResult(
+            status=STATUS_OK,
+            parcels=parcels,
+            water_consumed_mol=water_available_mol - h2o_out,
+            residual_inventory=residual,
+            injected_elements=injected,
+            ph=r.ph, ph_status=r.ph_status,
         )
 
 
@@ -295,6 +434,18 @@ def _worker_execute(request: Mapping) -> Dict:
     mode = request["mode"]
     element_input: Dict[str, object] = {}
 
+    if mode == "info":
+        engine = xgems.ChemicalEngineDicts(str(dat))
+        phase_species = {str(p): sorted(str(s) for s in engine.phase_species_amounts(p))
+                         for p in engine.phase_names}
+        return {
+            "ok": True,
+            "phase_names": [str(p) for p in engine.phase_names],
+            "element_names": [str(e) for e in engine.bulk_composition],
+            "phase_species": phase_species,
+            "xgems_version": version,
+        }
+
     if mode == "stored":
         engine = xgems.ChemicalEngineDicts(str(dat))
     elif mode == "elements":
@@ -363,15 +514,35 @@ def _worker_execute(request: Mapping) -> Dict:
 
     phase_elements = {str(ph): {str(e): float(v) for e, v in row.items()}
                       for ph, row in engine.phases_elements_moles.items()}
+    phase_amounts = _mapping("phase_amounts")
+
+    # every multi-species phase amount must equal the sum of its species
+    # (endmember-sum verification, PRD M4: CSHQ never reinterpreted as a fixed
+    # formula) and the aqueous solvent is split out for the water ledger
+    aqueous_h2o = None
+    for phase_name, total in phase_amounts.items():
+        species = {str(k): float(v)
+                   for k, v in engine.phase_species_amounts(phase_name).items()}
+        if species:
+            ssum = sum(species.values())
+            if abs(ssum - total) > 1e-12 + 1e-9 * abs(total):
+                raise RuntimeError(
+                    f"phase {phase_name} amount {total!r} != endmember sum {ssum!r}")
+        if phase_name == "aq_gen":
+            aqueous_h2o = species.get("H2O@")
+            if aqueous_h2o is None:
+                raise RuntimeError("aqueous phase lacks the H2O@ solvent species")
+
     result = {
         "ok": True,
         "status": status,
         "pH": _nullable(engine.pH),
         "ionic_strength": _nullable(engine.IS),
-        "phase_amounts_mol": _mapping("phase_amounts"),
+        "phase_amounts_mol": phase_amounts,
         "phase_masses_kg": _mapping("phase_masses"),
         "phase_volumes_m3": _mapping("phase_volumes"),
         "phase_elements_mol": phase_elements,
+        "aqueous_h2o_mol": aqueous_h2o,
         "element_input": element_input,
         "xgems_version": version,
     }

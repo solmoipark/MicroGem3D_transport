@@ -25,6 +25,7 @@ from .state import SimulationState, _DENSE_FIELDS, code_version
 FORMAT_VERSION = 1
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
+                   "hydrate_env_vol_vox", "hydrate_elements", "injected_elements",
                    "initial_elements")
 _LEDGER_SCALARS = ("time_h", "dt_h", "water_free_mol", "water_gel_mol",
                    "water_bound_mol", "initial_water_mol", "inert_volume_vox",
@@ -88,10 +89,11 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             "rng_state": state.rng_state,
             "reject_counts": state.reject_counts,
             # channel orderings the ledger vectors are positional over (PRD §2.3):
-            # a restart under a build with different orderings must hard-fail
+            # a restart under a build with different orderings must hard-fail.
+            # hydrate channels are RUN-scoped (bundle-derived for gems3k).
             "kinetic_phase_ids": list(KINETIC_PHASE_IDS),
             "solid_phase_ids": list(SOLID_PHASE_IDS),
-            "hydrate_phase_ids": list(HYDRATE_PHASE_IDS),
+            "hydrate_phase_ids": list(state.hydrate_ids),
             "element_ids": list(ELEMENT_IDS),
         }
         for k in _LEDGER_SCALARS:
@@ -144,12 +146,12 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         raise StorageError(f"unsupported checkpoint format {header['format_version']}")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
-                         ("hydrate_phase_ids", HYDRATE_PHASE_IDS),
                          ("element_ids", ELEMENT_IDS)):
         if tuple(header[key]) != current:
             raise StorageError(
                 f"checkpoint {key} {header[key]} does not match this build "
                 f"{list(current)} — ledger vectors would be misinterpreted")
+    hydrate_ids = tuple(header["hydrate_phase_ids"])  # run-scoped, header-owned
     config = TinnConfig.model_validate(header["config"])
     if config.config_hash() != header["config_hash"]:
         raise StorageError(
@@ -174,6 +176,7 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
 
     return SimulationState(
         config=config,
+        hydrate_ids=hydrate_ids,
         **arrays,
         particles=as_table("particles"),
         subgrid_bins=as_table("subgrid_bins"),
@@ -186,6 +189,9 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         initial_phase_mol=np.asarray(header["initial_phase_mol"]),
         unmet_mol=np.asarray(header["unmet_mol"]),
         hydrate_mol=np.asarray(header["hydrate_mol"]),
+        hydrate_env_vol_vox=np.asarray(header["hydrate_env_vol_vox"]),
+        hydrate_elements=np.asarray(header["hydrate_elements"]),
+        injected_elements=np.asarray(header["injected_elements"]),
         water_free_mol=header["water_free_mol"],
         water_gel_mol=header["water_gel_mol"],
         water_bound_mol=header["water_bound_mol"],

@@ -4,3 +4,4 @@ __pycache__/
 model_outputs/
 runs/
 *.egg-info/
+.gems_runs/

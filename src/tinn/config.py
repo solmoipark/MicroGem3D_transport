@@ -206,6 +206,9 @@ class ChemistryConfig(BaseModel):
     stoichiometric_rules: Optional[Dict[str, ReactionRule]] = None
     gems_bundle_lst: Optional[str] = None      # path to PC-dat.lst
     gems_worker_python: Optional[str] = None   # interpreter with xgems installed
+    # declared gel porosity per GEMS solid phase; phases absent from the map are
+    # crystalline (0.0). GEMS volumes are solid skeletons; envelope = skel/(1-eps).
+    gems_gel_porosity: Optional[Dict[str, float]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "ChemistryConfig":
@@ -214,8 +217,14 @@ class ChemistryConfig(BaseModel):
                 raise ValueError("gems3k backend does not take stoichiometric_rules")
             if not self.gems_bundle_lst:
                 raise ValueError("gems3k backend requires gems_bundle_lst")
+            if self.gems_gel_porosity is None:
+                self.gems_gel_porosity = {"CSHQ": 0.28}
+            for phase, eps in self.gems_gel_porosity.items():
+                if not (0.0 <= eps < 1.0):
+                    raise ValueError(f"gel porosity of {phase} must be in [0, 1)")
             return self
-        if self.gems_bundle_lst is not None or self.gems_worker_python is not None:
+        if (self.gems_bundle_lst is not None or self.gems_worker_python is not None
+                or self.gems_gel_porosity is not None):
             raise ValueError("gems_* fields only apply to the gems3k backend")
         if self.stoichiometric_rules is None:
             self.stoichiometric_rules = _default_rules()

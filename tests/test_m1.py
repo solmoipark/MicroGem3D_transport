@@ -59,6 +59,7 @@ def _blank_state(n_liquid_voxels=0) -> SimulationState:
     n = cfg.rve.grid_size
     st = SimulationState(
         config=cfg,
+        hydrate_ids=HYDRATE_PHASE_IDS,
         anhydrous_fraction=np.zeros((len(SOLID_PHASE_IDS), n, n, n)),
         hydrate_fraction=np.zeros((len(HYDRATE_PHASE_IDS), n, n, n)),
         capillary_liquid=np.zeros((n, n, n)),
@@ -73,6 +74,9 @@ def _blank_state(n_liquid_voxels=0) -> SimulationState:
         time_h=0.0, dt_h=1.0,
         phase_mol=np.zeros(4), initial_phase_mol=np.zeros(4),
         unmet_mol=np.zeros(4), hydrate_mol=np.zeros(4),
+        hydrate_env_vol_vox=np.zeros(4),
+        hydrate_elements=np.zeros(len(ELEMENT_IDS)),
+        injected_elements=np.zeros(len(ELEMENT_IDS)),
         water_free_mol=0.0, water_gel_mol=0.0, water_bound_mol=0.0,
         initial_water_mol=0.0, inert_volume_vox=0.0,
         initial_elements=np.zeros(len(ELEMENT_IDS)),
@@ -239,7 +243,12 @@ def test_stoichiometric_products_and_water():
                 inventory=np.zeros(len(ELEMENT_IDS)))
     assert r.status == STATUS_OK
     assert r.water_consumed_mol == pytest.approx(10.6)
-    assert dict(r.parcels) == pytest.approx({"CSH": 2.0, "CH": 2.6})
+    by_phase = {pc.phase_id: pc.mol for pc in r.parcels}
+    assert by_phase == pytest.approx({"CSH": 2.0, "CH": 2.6})
+    # parcels carry their own element vectors and skeleton volumes
+    csh = next(pc for pc in r.parcels if pc.phase_id == "CSH")
+    assert csh.skel_vol_cm3 == pytest.approx(2.0 * 107.3)
+    assert csh.elements[ELEMENT_IDS.index("Si")] == pytest.approx(2.0)
 
 
 def test_stoichiometric_insufficient_water():
@@ -323,7 +332,7 @@ def test_placement_volume_accounting():
 def test_ledger_detects_element_imbalance(short_run):
     _, _, state, _ = short_run
     bad = state.clone()
-    bad.hydrate_mol[0] *= 1.5
+    bad.hydrate_elements[0] *= 1.5
     rep = ledger.check_all(bad, REG)
     assert any(v.startswith("balance_element") for v in rep.violations)
 
@@ -356,15 +365,17 @@ def test_ledger_detects_placement_imbalance(short_run):
 class _FailingOnceBackend:
     """Delegates to the real backend after failing the first call."""
     backend_id = "stoichiometric"
+    hydrate_ids = HYDRATE_PHASE_IDS
 
     def __init__(self, inner):
         self.inner = inner
-        self.failed = False
+        self.failures = 0
 
     def react(self, released_mol, water_available_mol, inventory):
-        if not self.failed:
-            self.failed = True
-            raise RuntimeError("injected failure")
+        from tinn.backend import BackendTransientError
+        if self.failures < 6:   # outlast the engine's in-step scale-down retries
+            self.failures += 1
+            raise BackendTransientError("injected failure")
         return self.inner.react(released_mol, water_available_mol, inventory)
 
 
@@ -389,12 +400,16 @@ def test_engine_recovers_after_reject(short_run):
         cfg.chemistry.stoichiometric_rules, REG))
     eng2 = Engine(cfg, reaction_backend=failing)
     state, summary = eng2.run(state=state0.clone())
-    assert state.reject_counts.get("backend_failure") == 1
-    assert state.alpha()[0] == pytest.approx(0.1, abs=1e-9)
+    assert state.reject_counts.get("backend_failure", 0) >= 1
+    # transient failures may scale part of the release into honest unmet;
+    # the accounting identity dissolved + unmet = summed targets always holds
+    achieved_plus_unmet = state.alpha()[0] + state.unmet_mol[0] / state.initial_phase_mol[0]
+    assert achieved_plus_unmet == pytest.approx(0.1, abs=1e-9)
 
 
 class _AlwaysThirstyBackend:
     backend_id = "stoichiometric"
+    hydrate_ids = HYDRATE_PHASE_IDS
 
     def react(self, released_mol, water_available_mol, inventory):
         from tinn.backend import ReactionResult

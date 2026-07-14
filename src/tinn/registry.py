@@ -28,10 +28,22 @@ KINETIC_PHASE_IDS: Tuple[str, ...] = ("C3S", "C2S", "C3A", "C4AF")
 INERT_PHASE_ID = "inert"
 # Order of solid channels in the dense anhydrous_fraction array (fixed).
 SOLID_PHASE_IDS: Tuple[str, ...] = KINETIC_PHASE_IDS + (INERT_PHASE_ID,)
-# Order of hydrate channels in the dense hydrate_fraction array (fixed).
+# Hydrate channels of the STOICHIOMETRIC backend (a gems3k run derives its
+# channel set from the bundle's solid phases; the run's channels live in
+# SimulationState.hydrate_ids and in the checkpoint header).
 HYDRATE_PHASE_IDS: Tuple[str, ...] = ("CSH", "CH", "C3AH6", "FH3")
-# Order of the element ledger vector (fixed).
-ELEMENT_IDS: Tuple[str, ...] = ("Ca", "Si", "Al", "Fe", "H", "O")
+# Order of the element ledger vector (fixed; covers the PC bundle's elements).
+ELEMENT_IDS: Tuple[str, ...] = ("Ca", "Si", "Al", "Fe", "S", "Na", "K", "Mg",
+                                "C", "H", "O")
+
+
+def element_vector(formula: dict, mol: float = 1.0):
+    """Element mol vector over ELEMENT_IDS for `mol` of a formula unit."""
+    import numpy as np
+    v = np.zeros(len(ELEMENT_IDS))
+    for el, count in formula.items():
+        v[ELEMENT_IDS.index(el)] += count * mol
+    return v
 
 VALID_BASIS = ("solid_skeleton", "bulk_envelope")
 VALID_KINDS = ("clinker", "hydrate", "liquid", "inert")

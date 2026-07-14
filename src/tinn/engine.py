@@ -66,14 +66,30 @@ class Engine:
             self.backend = backend_mod.StoichiometricBackend(
                 config.chemistry.stoichiometric_rules, self.registry)
         else:
-            raise NotImplementedError("gems3k backend arrives with milestone M4")
+            from .gems import GemsBackend, GemsWorker
+            worker = GemsWorker(
+                config.chemistry.gems_bundle_lst,
+                python_executable=config.chemistry.gems_worker_python,
+                work_root=None)
+            self.backend = GemsBackend(worker, config.temperature_K)
         self.kinetics = kinetics or make_kinetics(config)
+        self.hydrate_ids = tuple(self.backend.hydrate_ids)
+        # bulk envelope = skeleton / (1 - gel_porosity); gel porosity per channel
+        # comes from the registry (stoichiometric) or the declared config map
+        # (gems3k) — an undeclared source is 0.0 (crystalline), documented policy
+        if config.chemistry.backend == "stoichiometric":
+            eps = [self.registry.get(h).gel_porosity for h in self.hydrate_ids]
+        else:
+            gel_map = config.chemistry.gems_gel_porosity or {}
+            eps = [gel_map.get(h, 0.0) for h in self.hydrate_ids]
+        self._gel_eps = np.asarray(eps)
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
         rve = initialize_rve(self.config, self.registry)
         return SimulationState.from_geometry(self.config, self.registry, rve,
-                                             self.backend.backend_id)
+                                             self.backend.backend_id,
+                                             hydrate_ids=self.hydrate_ids)
 
     # ------------------------------------------------------------------- step
     def try_step(self, state: SimulationState, dt_h: float
@@ -82,11 +98,10 @@ class Engine:
         or (None, StepReject, metrics) on rejection; `state` is never mutated."""
         trial = state.clone()
         reg = self.registry
+        n_h = len(self.hydrate_ids)
+        h_index = {h: i for i, h in enumerate(self.hydrate_ids)}
         vm_w = trial.vm_vox(reg, "H2O")
-        env_vm = np.array([trial.vm_vox(reg, h, envelope=True) for h in HYDRATE_PHASE_IDS])
-        skel_vm = np.array([reg.get(h).skeleton_molar_volume_cm3 / trial.vox_cm3
-                            for h in HYDRATE_PHASE_IDS])
-        gel_eps = np.array([reg.get(h).gel_porosity for h in HYDRATE_PHASE_IDS])
+        gel_eps = self._gel_eps
 
         # kinetic target for THIS interval only: dn = initial_mol * delta_alpha
         # (PRD §4.2). A shortfall stays recorded as cumulative unmet — it is
@@ -137,10 +152,24 @@ class Engine:
         # and recorded as unmet, never hidden and never a whole-run abort.
         chem_mol_c = np.zeros(n_clusters)
         residual = np.zeros((n_clusters, len(ELEMENT_IDS)))
-        parcel_mol = np.zeros((n_clusters, len(HYDRATE_PHASE_IDS)))
+        parcel_env = np.zeros((n_clusters, n_h))   # bulk envelope volume, vox units
+        parcel_mol_sum = np.zeros(n_h)
+        hydrate_elements_add = np.zeros(len(ELEMENT_IDS))
+        injected_add = np.zeros(len(ELEMENT_IDS))
+        cluster_ph: Dict[int, float] = {}
         parcel_rows: List[tuple] = []
         scale_c = np.ones(n_clusters)
-        gel_per_mol = env_vm * gel_eps  # gel water volume per mol of each hydrate
+
+        def _envelope_vox(parcel) -> float:
+            try:
+                hi = h_index[parcel.phase_id]
+            except KeyError:
+                raise RuntimeError(
+                    f"backend produced unknown phase {parcel.phase_id!r}; declared "
+                    f"channels: {self.hydrate_ids}") from None
+            return (parcel.skel_vol_cm3 / trial.vox_cm3) / (1.0 - gel_eps[hi])
+
+        total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
@@ -150,36 +179,62 @@ class Engine:
             water_c = float(water_mol_c[c])
             s = 1.0
             result = None
+            transient_failures = 0
+            failure_reason: Optional[str] = None
             for _ in range(60):
                 scaled = {p: v * s for p, v in rel.items()}
                 try:
                     result = self.backend.react(scaled, water_c, inv_in[c])
-                except Exception:
-                    return None, StepReject(REJECT_BACKEND_FAILURE), {}
-                if result.status == backend_mod.STATUS_OK:
-                    pm = np.zeros(len(HYDRATE_PHASE_IDS))
-                    for hid, mol in result.parcels:
-                        pm[HYDRATE_PHASE_IDS.index(hid)] += mol
-                    need = result.water_consumed_mol + float((pm * gel_per_mol).sum()) / vm_w
-                    if need <= water_c:
+                except backend_mod.BackendTransientError:
+                    # nonconvergence may be release-size dependent — scale down a
+                    # few times before giving up on this cluster
+                    transient_failures += 1
+                    if transient_failures > 4:
+                        failure_reason = REJECT_BACKEND_FAILURE
                         break
-                    s *= min(0.5, water_c * (1.0 - 1e-9) / need)
+                    s *= 0.5
+                    continue
+                if result.status == backend_mod.STATUS_OK:
+                    gel_vol = sum(_envelope_vox(pc) * gel_eps[h_index[pc.phase_id]]
+                                  for pc in result.parcels)
+                    need = result.water_consumed_mol + gel_vol / vm_w
+                    if need <= water_c:
+                        failure_reason = None
+                        break
+                    s *= min(0.5, water_c * (1.0 - 1e-9) / max(need, 1e-300))
                 elif result.status == backend_mod.STATUS_INSUFFICIENT_WATER:
                     s *= 0.5
                 else:
                     return None, StepReject(result.status), {}
             else:
-                return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
+                failure_reason = backend_mod.STATUS_INSUFFICIENT_WATER
+            if failure_reason is not None:
+                # A nearly-dry pocket (e.g. dissolved inventory outweighing its
+                # trace water) can never equilibrate at ANY release scale. Its
+                # release goes back to the solid as honest unmet and its
+                # inventory is preserved; a materially wet cluster failing this
+                # way is a real backend failure and rejects the trial.
+                if water_c < 1e-3 * total_water_mol:
+                    scale_c[c] = 0.0
+                    residual[c] = inv_in[c]
+                    continue
+                return None, StepReject(failure_reason), {}
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
             residual[c] = result.residual_inventory
-            for hid, mol in result.parcels:
-                hi = HYDRATE_PHASE_IDS.index(hid)
-                parcel_mol[c, hi] += mol
-                parcel_rows.append((float(trial.time_h + dt_h), int(c), hid, float(mol),
-                                    float(mol * skel_vm[hi]), float(mol * env_vm[hi])))
-        hydrate_add = parcel_mol.sum(axis=0)
-        backend_bulk_vol = float((parcel_mol * env_vm).sum())
+            injected_add += result.injected_elements
+            if result.ph_status == "ok":
+                cluster_ph[c] = result.ph
+            for pc in result.parcels:
+                hi = h_index[pc.phase_id]
+                env = _envelope_vox(pc)
+                parcel_env[c, hi] += env
+                parcel_mol_sum[hi] += pc.mol
+                hydrate_elements_add += pc.elements
+                parcel_rows.append((float(trial.time_h + dt_h), int(c), pc.phase_id,
+                                    float(pc.mol),
+                                    float(pc.skel_vol_cm3 / trial.vox_cm3), float(env)))
+        backend_bulk_vol = float(parcel_env.sum())
 
         # give scaled-back dissolution volume back to the solid and record it unmet
         if np.any(scale_c < 1.0):
@@ -202,18 +257,18 @@ class Engine:
         # produced them) are distributed over the cluster's dissolution sites in
         # proportion to locally dissolved volume — the engine stays backend-agnostic
         demand = np.zeros_like(trial.hydrate_fraction)
-        for c in np.flatnonzero(parcel_mol.any(axis=1)):
+        for c in np.flatnonzero(parcel_env.any(axis=1)):
             mask = site_mask & (site_cluster == c)
             wsum = float(vacated[mask].sum())
             if wsum <= 0.0:
                 return None, StepReject(REJECT_BACKEND_FAILURE), {}
             frac = np.where(mask, vacated, 0.0) / wsum
-            for h in np.flatnonzero(parcel_mol[c] > 0.0):
-                demand[h] += (parcel_mol[c, h] * env_vm[h]) * frac
+            for h in np.flatnonzero(parcel_env[c] > 0.0):
+                demand[h] += parcel_env[c, h] * frac
         requested_vol = float(demand.sum())
 
         # gel water per cluster + total water feasibility (chemical + gel)
-        gel_mol_c = (parcel_mol * (env_vm * gel_eps)).sum(axis=1) / vm_w
+        gel_mol_c = (parcel_env * gel_eps).sum(axis=1) / vm_w
         if np.any(chem_mol_c + gel_mol_c > water_mol_c + 1e-30):
             return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
 
@@ -252,7 +307,10 @@ class Engine:
         gel_total = float(gel_mol_c.sum())
         trial.phase_mol = trial.phase_mol - dis.removed_mol
         trial.unmet_mol = trial.unmet_mol + dis.unmet_mol
-        trial.hydrate_mol = trial.hydrate_mol + hydrate_add
+        trial.hydrate_mol = trial.hydrate_mol + parcel_mol_sum
+        trial.hydrate_env_vol_vox = trial.hydrate_env_vol_vox + parcel_env.sum(axis=0)
+        trial.hydrate_elements = trial.hydrate_elements + hydrate_elements_add
+        trial.injected_elements = trial.injected_elements + injected_add
         trial.water_free_mol -= chem_total + gel_total
         trial.water_gel_mol += gel_total
         trial.water_bound_mol += chem_total
@@ -284,7 +342,10 @@ class Engine:
         report = ledger.check_all(trial, reg, placement)
         if not report.ok:
             return None, StepReject(report.violations[0]), report.metrics
-        return trial, None, report.metrics
+        metrics = dict(report.metrics)
+        if cluster_ph:
+            metrics["cluster_ph"] = {int(k): float(v) for k, v in cluster_ph.items()}
+        return trial, None, metrics
 
     # -------------------------------------------------------------------- run
     def run(self, state: Optional[SimulationState] = None,
@@ -332,14 +393,57 @@ class Engine:
                 k_global = self.config.schedule.output_times_h.index(t_out)
                 storage.save_checkpoint(state, out_dir, f"ckpt_{k_global:03d}")
         summary["final"] = self._snapshot_row(state, last_metrics)
+        summary["sanity_band"] = self._sanity_band(summary["outputs"])
         return state, summary
+
+    def _sanity_band(self, rows: List[dict]) -> dict:
+        """PRD §6.3: non-blocking physical-plausibility bands, pass/warn only."""
+        checks: List[dict] = []
+
+        def add(name: str, ok: bool, value) -> None:
+            checks.append({"check": name, "status": "pass" if ok else "warn",
+                           "value": value})
+
+        w = self.config.binder.mass_fractions
+        tot_w = sum(w.values())
+        bands = {24.0: (0.25, 0.55), 168.0: (0.50, 0.80), 672.0: (0.65, 0.90)}
+        for row in rows:
+            t = row["time_h"]
+            if t in bands:
+                total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
+                            for p in KINETIC_PHASE_IDS) / tot_w
+                lo, hi = bands[t]
+                add(f"total_clinker_alpha@{t:g}h", lo <= total <= hi, total)
+        if rows:
+            add("alpha_order_C3S_ge_C2S",
+                all(r["alpha"]["C3S"] >= r["alpha"]["C2S"] - 1e-12 for r in rows), None)
+            ch_name = ("Portlandite" if any("Portlandite" in r["hydrate_mol"]
+                                            for r in rows) else "CH")
+            ch = [r["hydrate_mol"].get(ch_name, 0.0) for r in rows]
+            add("CH_mass_monotone_increase",
+                all(b >= a - 1e-30 for a, b in zip(ch, ch[1:])), ch[-1])
+            por = [r["porosity_capillary"] for r in rows]
+            add("capillary_porosity_monotone_decrease",
+                all(b <= a + 1e-12 for a, b in zip(por, por[1:])), por[-1])
+            sh = rows[-1]["chem_shrinkage_ml_per_g_reacted"]
+            add("chem_shrinkage_ml_per_g", 0.03 <= sh <= 0.08, sh)
+            phs = [v for r in rows
+                   for v in r["ledger_metrics"].get("cluster_ph", {}).values()]
+            if phs:
+                add("cluster_ph_band_12.4_13.9",
+                    all(12.4 <= p <= 13.9 for p in phs),
+                    [min(phs), max(phs)])
+        return {
+            "note": ("physical plausibility bands (PRD 6.3), pass/warn only — "
+                     "this is not scientific validation"),
+            "checks": checks,
+        }
 
     def _snapshot_row(self, state: SimulationState, metrics: dict) -> dict:
         reg = self.registry
         alpha = state.alpha()
         cap_por = float((state.capillary_liquid + state.capillary_gas).mean())
-        gel_por_vol = sum(float(state.hydrate_fraction[i].sum()) * reg.get(h).gel_porosity
-                          for i, h in enumerate(HYDRATE_PHASE_IDS))
+        gel_por_vol = float((state.hydrate_env_vol_vox * self._gel_eps).sum())
         n_vox = state.capillary_liquid.size
         reacted_mass_g = float(np.sum(
             (state.initial_phase_mol - state.phase_mol)
@@ -351,7 +455,8 @@ class Engine:
             "phase_mol": {p: float(state.phase_mol[i])
                           for i, p in enumerate(KINETIC_PHASE_IDS)},
             "hydrate_mol": {h: float(state.hydrate_mol[i])
-                            for i, h in enumerate(HYDRATE_PHASE_IDS)},
+                            for i, h in enumerate(state.hydrate_ids)
+                            if state.hydrate_mol[i] > 0.0},
             "unmet_mol": {p: float(state.unmet_mol[i])
                           for i, p in enumerate(KINETIC_PHASE_IDS)},
             "water_mol": {"free": state.water_free_mol, "gel": state.water_gel_mol,

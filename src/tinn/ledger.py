@@ -42,13 +42,14 @@ class LedgerReport:
 
 
 def current_elements(state: SimulationState, registry: Registry) -> np.ndarray:
-    """Element totals from the mol ledger (anhydrous + hydrates + free/gel water +
-    dissolved cluster inventories). Bound water lives inside hydrate formulas."""
+    """Element totals from the mol ledger (anhydrous + parcel element vectors +
+    free/gel water + dissolved cluster inventories). Bound water lives inside
+    the parcels' element vectors — variable-composition phases (CSHQ) are never
+    reinterpreted as fixed formulas."""
     e = np.zeros(len(ELEMENT_IDS))
     for i, p in enumerate(KINETIC_PHASE_IDS):
         e += formula_elements(registry.get(p).formula) * state.phase_mol[i]
-    for i, h in enumerate(HYDRATE_PHASE_IDS):
-        e += formula_elements(registry.get(h).formula) * state.hydrate_mol[i]
+    e = e + state.hydrate_elements
     e += formula_elements(registry.get("H2O").formula) * (
         state.water_free_mol + state.water_gel_mol)
     if state.cluster_inventory.size:
@@ -60,10 +61,12 @@ def check_all(state: SimulationState, registry: Registry,
               placement: Optional[PlacementBalance] = None) -> LedgerReport:
     rep = LedgerReport()
 
-    # 1. element balance
+    # 1. element balance (expected = initial + anything the backend injected:
+    # redox seeds and solver floors, both tracked exactly)
     cur = current_elements(state, registry)
-    err = np.abs(cur - state.initial_elements)
-    bound = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(state.initial_elements)
+    expected = state.initial_elements + state.injected_elements
+    err = np.abs(cur - expected)
+    bound = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(expected)
     rep.metrics["max_element_err_mol"] = float(err.max())
     if np.any(err > bound):
         bad = [ELEMENT_IDS[i] for i in np.flatnonzero(err > bound)]
@@ -94,9 +97,9 @@ def check_all(state: SimulationState, registry: Registry,
         dense = float(state.anhydrous_fraction[SOLID_PHASE_IDS.index(p)].sum())
         led = state.phase_mol[i] * state.vm_vox(registry, p)
         max_rel = max(max_rel, abs(dense - led) / (1.0 + abs(led)))
-    for i, h in enumerate(HYDRATE_PHASE_IDS):
+    for i in range(len(state.hydrate_ids)):
         dense = float(state.hydrate_fraction[i].sum())
-        led = state.hydrate_mol[i] * state.vm_vox(registry, h, envelope=True)
+        led = float(state.hydrate_env_vol_vox[i])
         max_rel = max(max_rel, abs(dense - led) / (1.0 + abs(led)))
     liq = float(state.capillary_liquid.sum())
     # free water fills capillary space; gel water volume lives inside hydrate envelopes

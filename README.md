@@ -41,7 +41,10 @@ py -3 -m pytest -q
       번들 sha256 전후 감사, §6.2 앵커 2건 재현(pH 13.596951 / 12.6619),
       0D 누적 프로브 원소·물 폐쇄 ≤3e-14. 워커 인터프리터:
       `miniforge3/envs/py313-xgems` (환경변수 `TINN_GEMS_PYTHON`로 재지정).
-- [ ] M4 — GEMS→3D 결합
+- [x] **M4** — GEMS→3D 결합: product-parcel 원장(파슬이 자체 원소 벡터·골격
+      부피 보유, CSHQ 고정 화학식 재해석 없음), 클러스터별 정준 스케일 평형,
+      OPC 32³ GEMS 런 1/3/7일 완주(25분, 거부 0), §6.1 폐쇄(원소 ≤9.5e-24)
+      + §6.3 sanity band 7항목 전부 pass. 예제: `examples/opc_gems_32.json`.
 - [ ] M5 — 분석과 리포트
 
 ## 예제 config
@@ -58,6 +61,6 @@ py -3 -m pytest -q
 `dissolution.py`(액체 접촉 가중 배분), `transport.py`(클러스터 라벨링+리매핑),
 `backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),
 `engine.py`(트랜잭션 오케스트레이터), `storage.py`(Zarr-v2 체크포인트),
-`gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브),
+`gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브+GemsBackend),
 `cli.py`(validate-config/run/restart), `__init__.py`.
 남은 슬롯: `analysis.py`(M5).
