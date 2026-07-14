@@ -188,11 +188,21 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
         v_full = _sphere_volume(rv)
         if rv <= RV_FRACTIONAL_MAX:
             p_tier[i] = TIER_FRACTIONAL
-            cand = np.flatnonzero(occ_flat <= 1.0 - _CAPACITY_MARGIN - v_full)
-            if cand.size == 0:
-                unplaced_volume += v_full
-                continue
-            k = int(cand[rng.integers(cand.size)])
+            # rejection sampling is O(1) expected while most voxels have
+            # capacity; the exhaustive scan only runs as a rare fallback
+            k = -1
+            limit = 1.0 - _CAPACITY_MARGIN - v_full
+            for _ in range(200):
+                j = int(rng.integers(occ_flat.size))
+                if occ_flat[j] <= limit:
+                    k = j
+                    break
+            if k < 0:
+                cand = np.flatnonzero(occ_flat <= limit)
+                if cand.size == 0:
+                    unplaced_volume += v_full
+                    continue
+                k = int(cand[rng.integers(cand.size)])
             occ_flat[k] += v_full
             if v_full > best_flat[k]:
                 best_flat[k] = v_full

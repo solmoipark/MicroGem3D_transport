@@ -61,10 +61,15 @@ def place(hydrate_fraction: np.ndarray, capillary_liquid: np.ndarray,
         c_src = source_cluster[z, y, x]
         remaining = demand_vol[:, z, y, x].copy()
         rem_sum = float(remaining.sum())
-        cells = [(int(z), int(y), int(x))]
-        cells.extend(((z + dz) % n, (y + dy) % n, (x + dx) % n)
-                     for _, dz, dy, dx in _OFFSETS)
-        for (cz, cy, cx) in cells:
+
+        def _cells(z=int(z), y=int(y), x=int(x)):
+            # shells are generated lazily: most sources finish in their own
+            # voxel and never pay for the 63-cell neighborhood
+            yield z, y, x
+            for _, dz, dy, dx in _OFFSETS:
+                yield (z + dz) % n, (y + dy) % n, (x + dx) % n
+
+        for (cz, cy, cx) in _cells():
             if rem_sum <= 0.0:
                 break
             if cell_cluster[cz, cy, cx] != c_src:
