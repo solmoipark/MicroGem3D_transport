@@ -105,6 +105,25 @@ def test_morphology_remove_exact_and_overrequest():
     assert hyd[0].min() >= 0.0
     with pytest.raises(ValueError, match="exceeds available"):
         morphology.remove(hyd, 0, 5.0, member)
+    # place() overflow pass: all capacity sits FAR outside the 3-shell radius
+    # of the source — the remainder must precipitate cluster-wide, not reject
+    hyd2 = np.zeros((4, 8, 8, 8))
+    liq = np.zeros((8, 8, 8))
+    liq[4, 4, 4] = 1.0                      # Manhattan distance 12 from source
+    vac = np.zeros((8, 8, 8))
+    dem = np.zeros((4, 8, 8, 8))
+    dem[1, 0, 0, 0] = 0.5
+    clu = np.zeros((8, 8, 8), dtype=np.int64)
+    out = morphology.place(hyd2, liq, vac, dem, clu, clu)
+    assert out.status == morphology.STATUS_OK
+    assert out.placed_vol_vox == pytest.approx(0.5)
+    assert hyd2[1, 4, 4, 4] == pytest.approx(0.5)
+    assert liq[4, 4, 4] == pytest.approx(0.5)
+    # cluster-wide shortfall is still an honest capacity reject
+    dem[1, 0, 0, 0] = 2.0
+    out2 = morphology.place(hyd2, liq, vac, dem, clu, clu)
+    assert out2.status == morphology.STATUS_CAPACITY
+    assert out2.unplaced_vol_vox == pytest.approx(2.0)
 
 
 # ---------------- snapshot engine mechanics (no xgems needed) ----------------

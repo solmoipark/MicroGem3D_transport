@@ -150,7 +150,10 @@ src/tinn/
     클러스터는 해당 스텝 반응을 포기(소유분 동결)하고 unmet 기록. 지속 워커(--serve,
     요청마다 fresh cold-start 엔진 = 스폰 호출과 비트 동일, 번들 감사 유지)는 인프라 토글.
 - **MorphologyModel**: parcel의 벌크 외피 부피(V_skel/(1-ε_gel))를 소스 입자 주변
-  내부(inner)/외부(outer) 분할로 배치. 부피를 버리거나 임의 이동 금지 — 용량 부족은 reject.
+  내부(inner)/외부(outer) 분할로 배치. 부피를 버리거나 임의 이동 금지. 셸 반경(3) 내
+  용량 부족 잔여분은 동일 연결 액체 클러스터의 잔여 (공동+액체) 용량에 비례해 용액 통과
+  침전(성장 캐스케이드 (c)티어와 동일 물리, 결정론·정확 잔차) — 클러스터 전체 용량
+  부족만 reject.
 - **TransportModel**: 액체분율 임계 + 면 전도 기준의 6-이웃 주기 클러스터. 화학·배치 무관여.
 - **Engine**: 유일한 상태 변경 주체. trial 생성 → kinetics → dissolution → backend → morphology →
   ledger/불변식 → commit 또는 rollback+dt 축소. 거부 사유는 안정 식별자

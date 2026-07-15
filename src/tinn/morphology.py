@@ -1,7 +1,9 @@
 """Hydrate bulk-envelope placement: inner (vacated dissolution space) first, then
 outer (displacing capillary liquid) over periodic 6-neighbor BFS shells around each
 source voxel. Volume is never dropped or teleported — anything unplaceable within
-the shell radius is a placement_capacity reject (PRD §2.2).
+the shell radius overflows into the source cluster's remaining pore capacity
+(through-solution precipitation within the same connected liquid); only a
+cluster-wide shortfall is a placement_capacity reject (PRD §2.2).
 """
 
 from __future__ import annotations
@@ -92,6 +94,7 @@ def place(hydrate_fraction: np.ndarray, capillary_liquid: np.ndarray,
     placed = 0.0
     displaced = 0.0
     unplaced = 0.0
+    leftovers: dict = {}
 
     for flat in sources:
         z, y, x = np.unravel_index(flat, (n, n, n))
@@ -135,8 +138,46 @@ def place(hydrate_fraction: np.ndarray, capillary_liquid: np.ndarray,
             capillary_liquid[cz, cy, cx] -= from_liquid
             displaced += from_liquid
             placed += take
-        # anything left is a genuine capacity shortfall — volume is never dropped
-        unplaced += rem_sum
+        # anything left overflows the shell radius — retried cluster-wide below
+        if rem_sum > 0.0:
+            acc = leftovers.setdefault(int(c_src), np.zeros(n_h))
+            acc += remaining
+
+    # overflow pass: a dense late-age neighborhood can lock all capacity out of
+    # the shell radius while the cluster still has ample pore space. The excess
+    # precipitates through solution anywhere in the SAME connected liquid,
+    # spread in proportion to local remaining capacity (exact-residual
+    # corrected). Only a cluster-wide shortfall is a capacity reject.
+    for c_src in sorted(leftovers):
+        remaining = leftovers[c_src]
+        rem_sum = float(remaining.sum())
+        member = cell_cluster == c_src
+        cap_field = np.where(member, vacated + capillary_liquid, 0.0)
+        total_cap = float(cap_field.sum())
+        if total_cap < rem_sum:
+            unplaced += rem_sum  # genuine shortfall — volume is never dropped
+            continue
+        take_field = cap_field * (rem_sum / total_cap)
+        residual = rem_sum - float(take_field.sum())
+        if residual != 0.0:
+            flat_t = take_field.ravel()
+            flat_c = cap_field.ravel()
+            for j in np.flatnonzero(flat_c > 0.0):
+                room = flat_c[j] - flat_t[j]
+                t = min(residual, room) if residual > 0.0 else max(residual, -flat_t[j])
+                flat_t[j] += t
+                residual -= t
+                if residual == 0.0:
+                    break
+        frac_h = remaining / rem_sum
+        for h in range(n_h):
+            hydrate_fraction[h] += frac_h[h] * take_field
+        use_vac = np.minimum(take_field, vacated)
+        vacated -= use_vac
+        from_liquid = take_field - use_vac
+        capillary_liquid -= from_liquid
+        displaced += float(from_liquid.sum())
+        placed += rem_sum
 
     status = STATUS_OK if unplaced == 0.0 else STATUS_CAPACITY
     return PlacementOutcome(status=status, placed_vol_vox=placed,
