@@ -40,14 +40,17 @@ class StepReject:
 def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray) -> np.ndarray:
     """Label of the neighboring cluster with the largest liquid contact — the
     cluster that actually supplies the dissolution weight (deterministic:
-    argmax over the fixed axis order breaks ties)."""
+    argmax over the fixed axis order breaks ties). Liquid is clamped to >= 0:
+    placement float dust can leave ~-1e-19 in a voxel, and a labeled neighbor
+    must never be disqualified by noise (it would stall the ring propagation
+    for coated sites and misreport cluster_dryout)."""
     labs = []
     liqs = []
     for ax, shift in ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)):
         labs.append(np.roll(labels, shift, axis=ax))
         liqs.append(np.roll(liquid, shift, axis=ax))
     labs = np.stack(labs)
-    liqs = np.where(labs >= 0, np.stack(liqs), -1.0)
+    liqs = np.where(labs >= 0, np.maximum(np.stack(liqs), 0.0), -1.0)
     best = np.argmax(liqs, axis=0)
     best_lab = np.take_along_axis(labs, best[None], axis=0)[0]
     best_liq = np.take_along_axis(liqs, best[None], axis=0)[0]
