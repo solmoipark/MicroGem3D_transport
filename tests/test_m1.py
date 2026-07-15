@@ -75,7 +75,7 @@ def _blank_state(n_liquid_voxels=0) -> SimulationState:
         phase_mol=np.zeros(len(KINETIC_PHASE_IDS)), initial_phase_mol=np.zeros(len(KINETIC_PHASE_IDS)),
         unmet_mol=np.zeros(len(KINETIC_PHASE_IDS)), hydrate_mol=np.zeros(4),
         hydrate_env_vol_vox=np.zeros(4),
-        hydrate_elements=np.zeros(len(ELEMENT_IDS)),
+        hydrate_elements_ch=np.zeros((4, len(ELEMENT_IDS))),
         injected_elements=np.zeros(len(ELEMENT_IDS)),
         water_free_mol=0.0, water_gel_mol=0.0, water_bound_mol=0.0,
         initial_water_mol=0.0, inert_volume_vox=0.0,
@@ -338,7 +338,7 @@ def test_placement_volume_accounting():
 def test_ledger_detects_element_imbalance(short_run):
     _, _, state, _ = short_run
     bad = state.clone()
-    bad.hydrate_elements[0] *= 1.5
+    bad.hydrate_elements_ch[:, 0] *= 1.5
     rep = ledger.check_all(bad, REG)
     assert any(v.startswith("balance_element") for v in rep.violations)
 
@@ -372,6 +372,7 @@ class _FailingOnceBackend:
     """Delegates to the real backend after failing the first call."""
     backend_id = "stoichiometric"
     hydrate_ids = HYDRATE_PHASE_IDS
+    mode = "incremental"
 
     def __init__(self, inner):
         self.inner = inner
@@ -416,6 +417,7 @@ def test_engine_recovers_after_reject(short_run):
 class _AlwaysThirstyBackend:
     backend_id = "stoichiometric"
     hydrate_ids = HYDRATE_PHASE_IDS
+    mode = "incremental"
 
     def react(self, released_mol, water_available_mol, inventory):
         from tinn.backend import ReactionResult

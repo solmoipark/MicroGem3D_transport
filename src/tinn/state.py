@@ -72,7 +72,9 @@ class SimulationState:
     unmet_mol: np.ndarray            # (4,) current deficit vs kinetic target
     hydrate_mol: np.ndarray          # (H,) over hydrate_ids
     hydrate_env_vol_vox: np.ndarray  # (H,) authoritative placed bulk-envelope volume
-    hydrate_elements: np.ndarray     # (E,) total element mol in all parcels
+    hydrate_elements_ch: np.ndarray  # (H, E) per-channel element pools of the
+                                     # CURRENT hydrate holdings (signed updates
+                                     # under full re-equilibration)
     injected_elements: np.ndarray    # (E,) backend-injected seeds/solver floors
     water_free_mol: float
     water_gel_mol: float
@@ -119,7 +121,7 @@ class SimulationState:
         h = hashlib.sha256(self.dense_hash().encode())
         for arr in (self.phase_mol, self.initial_phase_mol, self.unmet_mol,
                     self.hydrate_mol, self.hydrate_env_vol_vox,
-                    self.hydrate_elements, self.injected_elements,
+                    self.hydrate_elements_ch, self.injected_elements,
                     self.initial_elements, self.cluster_inventory):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(repr(self.hydrate_ids).encode())
@@ -195,7 +197,7 @@ class SimulationState:
             unmet_mol=np.zeros(len(KINETIC_PHASE_IDS)),
             hydrate_mol=np.zeros(len(hydrate_ids)),
             hydrate_env_vol_vox=np.zeros(len(hydrate_ids)),
-            hydrate_elements=np.zeros(len(ELEMENT_IDS)),
+            hydrate_elements_ch=np.zeros((len(hydrate_ids), len(ELEMENT_IDS))),
             injected_elements=np.zeros(len(ELEMENT_IDS)),
             water_free_mol=water_mol,
             water_gel_mol=0.0,

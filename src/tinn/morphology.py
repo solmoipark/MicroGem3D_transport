@@ -31,6 +31,39 @@ def _shell_offsets() -> List[Tuple[int, int, int, int]]:
 _OFFSETS = _shell_offsets()
 
 
+def remove(hydrate_fraction: np.ndarray, channel: int, request_vol: float,
+           member_mask: np.ndarray) -> tuple:
+    """Remove request_vol of one hydrate channel over the member voxels,
+    proportional to local volume with a deterministic flat-index residual
+    correction so removed == request exactly (v1 reversible pattern).
+    Returns (removal_field (N,N,N), removed_vol). Over-request is a hard error
+    — volume is never fabricated."""
+    field = hydrate_fraction[channel]
+    local = np.where(member_mask, field, 0.0)
+    available = float(local.sum())
+    if request_vol > available * (1.0 + 1e-12) + 1e-30:
+        raise ValueError(
+            f"removal request {request_vol!r} exceeds available {available!r} "
+            f"on channel {channel}")
+    if request_vol <= 0.0 or available <= 0.0:
+        return np.zeros_like(field), 0.0
+    removal = local * (request_vol / available)
+    # exact-residual pass: fix float dust deterministically in flat-index order
+    residual = request_vol - float(removal.sum())
+    if residual != 0.0:
+        flat = removal.ravel()
+        loc = local.ravel()
+        for j in np.flatnonzero(loc > 0.0):
+            room = loc[j] - flat[j]
+            take = min(residual, room) if residual > 0.0 else max(residual, -flat[j])
+            flat[j] += take
+            residual -= take
+            if residual == 0.0:
+                break
+    hydrate_fraction[channel] -= removal
+    return removal, float(removal.sum())
+
+
 @dataclass
 class PlacementOutcome:
     status: str

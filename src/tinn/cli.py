@@ -106,11 +106,12 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
     return 0
 
 
-def _report(run_dir: str, out_dir: Optional[str]) -> int:
+def _report(run_dir: str, out_dir: Optional[str],
+            kc_constant_m2: Optional[float] = None) -> int:
     from .analysis import report
     from .storage import StorageError
     try:
-        result = report(run_dir, out_dir)
+        result = report(run_dir, out_dir, kc_constant_m2=kc_constant_m2)
     except (FileNotFoundError, StorageError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -146,6 +147,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_rep = sub.add_parser("report", help="generate report.json + slice PNGs from a run directory")
     p_rep.add_argument("run_dir")
     p_rep.add_argument("--out", default=None, help="output directory (default: the run directory)")
+    p_rep.add_argument("--kc-constant-m2", type=float, default=None,
+                       help="Kozeny-Carman C override (default: d_mean^2/180)")
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
@@ -154,7 +157,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run(args.config_path, args.out)
     if args.command == "restart":
         return _restart(args.checkpoint_path, args.out)
-    return _report(args.run_dir, args.out)
+    return _report(args.run_dir, args.out, args.kc_constant_m2)
 
 
 if __name__ == "__main__":

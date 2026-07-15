@@ -142,19 +142,26 @@ class Engine:
                 f"cluster inventory has {state.cluster_inventory.shape[0]} rows but "
                 f"{n_clusters} clusters were labeled — state is corrupted (no fallback)")
 
-        # Backend negotiation per cluster: a water-starved cluster (e.g. a sealed
-        # wet pocket) dissolves only what its own water can react — the release is
-        # scaled down deterministically and the shortfall is returned to the solid
-        # and recorded as unmet, never hidden and never a whole-run abort.
+        # ---- reaction phase (mode-dependent) --------------------------------
+        # incremental (stoichiometric): parcels are NEW precipitates appended.
+        # snapshot (gems3k, PRD v2.2): each cluster's owned hydrates + solution
+        # inventory + released elements + free water are re-equilibrated as ONE
+        # system; the result replaces the cluster's assemblage (re-dissolution,
+        # CH consumption and phase rearrangement emerge from equilibrium).
+        recon = np.where(labels >= 0, labels, site_cluster)
+        snapshot = self.backend.mode == "snapshot"
+
         chem_mol_c = np.zeros(n_clusters)
+        gel_mol_c = np.zeros(n_clusters)
         residual = np.zeros((n_clusters, len(ELEMENT_IDS)))
-        parcel_env = np.zeros((n_clusters, n_h))   # bulk envelope volume, vox units
-        parcel_mol_sum = np.zeros(n_h)
-        hydrate_elements_add = np.zeros(len(ELEMENT_IDS))
+        parcel_env = np.zeros((n_clusters, n_h))   # NEW assemblage envelopes, vox
+        parcel_mol = np.zeros((n_clusters, n_h))
+        parcel_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
         injected_add = np.zeros(len(ELEMENT_IDS))
         cluster_ph: Dict[int, float] = {}
         parcel_rows: List[tuple] = []
         scale_c = np.ones(n_clusters)
+        solved = np.zeros(n_clusters, dtype=bool)
 
         def _envelope_vox(parcel) -> float:
             try:
@@ -165,11 +172,35 @@ class Engine:
                     f"channels: {self.hydrate_ids}") from None
             return (parcel.skel_vol_cm3 / trial.vox_cm3) / (1.0 - gel_eps[hi])
 
+        # cluster ownership of the spatial hydrates (Scheme S, PRD 4.5): the
+        # recon partition splits each channel's dense volume; element/mol pools
+        # are shared proportionally. The dry bin (recon == -1) keeps the exact
+        # remainder untouched — dry hydrates are chemically frozen this step.
+        own_vol = np.zeros((n_clusters, n_h))
+        owned_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
+        owned_mol = np.zeros((n_clusters, n_h))
+        if snapshot and n_clusters > 0:
+            recon_b = (recon + 1).ravel()
+            for h in range(n_h):
+                dense = trial.hydrate_fraction[h]
+                tot = float(dense.sum())
+                if tot <= 0.0:
+                    continue
+                b = np.bincount(recon_b, weights=dense.ravel(),
+                                minlength=n_clusters + 1)
+                own_vol[:, h] = b[1:]
+                share = b[1:] / tot
+                owned_elem[:, h, :] = share[:, None] * trial.hydrate_elements_ch[h]
+                owned_mol[:, h] = share * trial.hydrate_mol[h]
+        owned_gel_c = (own_vol * gel_eps).sum(axis=1)
+
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
-            if not rel:
+            has_solids = snapshot and own_vol[c].sum() > 0.0
+            has_inventory = bool(np.any(inv_in[c] != 0.0))
+            if not rel and not has_solids and not has_inventory:
                 residual[c] = inv_in[c]
                 continue
             water_c = float(water_mol_c[c])
@@ -181,10 +212,15 @@ class Engine:
             result = None
             transient_failures = 0
             failure_reason: Optional[str] = None
+            solid_elem_c = owned_elem[c].sum(axis=0) if has_solids else None
             for _ in range(60):
                 scaled = {p: v * s for p, v in rel.items()}
                 try:
-                    result = self.backend.react(scaled, water_c, inv_in[c])
+                    if snapshot:
+                        result = self.backend.react(scaled, water_c, inv_in[c],
+                                                    solid_elements=solid_elem_c)
+                    else:
+                        result = self.backend.react(scaled, water_c, inv_in[c])
                 except backend_mod.BackendTransientError:
                     # nonconvergence may be release-size dependent — scale down a
                     # few times before giving up on this cluster
@@ -195,9 +231,10 @@ class Engine:
                     s *= 0.5
                     continue
                 if result.status == backend_mod.STATUS_OK:
-                    gel_vol = sum(_envelope_vox(pc) * gel_eps[h_index[pc.phase_id]]
+                    gel_new = sum(_envelope_vox(pc) * gel_eps[h_index[pc.phase_id]]
                                   for pc in result.parcels)
-                    need = result.water_consumed_mol + gel_vol / vm_w
+                    gel_owned = owned_gel_c[c] if snapshot else 0.0
+                    need = result.water_consumed_mol + (gel_new - gel_owned) / vm_w
                     if need <= water_c:
                         failure_reason = None
                         break
@@ -211,14 +248,15 @@ class Engine:
             if failure_reason is not None:
                 # A nearly-dry pocket (e.g. dissolved inventory outweighing its
                 # trace water) can never equilibrate at ANY release scale. Its
-                # release goes back to the solid as honest unmet and its
-                # inventory is preserved; a materially wet cluster failing this
-                # way is a real backend failure and rejects the trial.
+                # release goes back to the solid as honest unmet, its inventory
+                # and (under snapshot) its owned hydrates stay frozen in place;
+                # a materially wet cluster failing this way rejects the trial.
                 if trace_water:
                     scale_c[c] = 0.0
                     residual[c] = inv_in[c]
                     continue
                 return None, StepReject(failure_reason), {}
+            solved[c] = True
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
             residual[c] = result.residual_inventory
@@ -229,12 +267,13 @@ class Engine:
                 hi = h_index[pc.phase_id]
                 env = _envelope_vox(pc)
                 parcel_env[c, hi] += env
-                parcel_mol_sum[hi] += pc.mol
-                hydrate_elements_add += pc.elements
+                parcel_mol[c, hi] += pc.mol
+                parcel_elem[c, hi] += pc.elements
                 parcel_rows.append((float(trial.time_h + dt_h), int(c), pc.phase_id,
                                     float(pc.mol),
                                     float(pc.skel_vol_cm3 / trial.vox_cm3), float(env)))
-        backend_bulk_vol = float(parcel_env.sum())
+            gel_new = float((parcel_env[c] * gel_eps).sum())
+            gel_mol_c[c] = (gel_new - (owned_gel_c[c] if snapshot else 0.0)) / vm_w
 
         # give scaled-back dissolution volume back to the solid and record it unmet
         if np.any(scale_c < 1.0):
@@ -253,31 +292,72 @@ class Engine:
             vacated = dis.removed_vol.sum(axis=0)
             site_mask = vacated > 0.0
 
-        # per-voxel bulk envelope demand: the backend's parcels (whatever chemistry
-        # produced them) are distributed over the cluster's dissolution sites in
-        # proportion to locally dissolved volume — the engine stays backend-agnostic
-        demand = np.zeros_like(trial.hydrate_fraction)
-        for c in np.flatnonzero(parcel_env.any(axis=1)):
-            mask = site_mask & (site_cluster == c)
-            wsum = float(vacated[mask].sum())
-            if wsum <= 0.0:
-                return None, StepReject(REJECT_BACKEND_FAILURE), {}
-            frac = np.where(mask, vacated, 0.0) / wsum
-            for h in np.flatnonzero(parcel_env[c] > 0.0):
-                demand[h] += parcel_env[c, h] * frac
-        requested_vol = float(demand.sum())
+        # ---- spatial application -------------------------------------------
+        backend_removal_vol = 0.0
+        removed_total = 0.0
+        if snapshot:
+            # deltas vs owned volume; NEGATIVES FIRST — re-dissolved hydrate
+            # frees pore capacity before growth is placed (v1 pattern)
+            delta_env = np.where(solved[:, None], parcel_env - own_vol, 0.0)
+            freed = np.zeros_like(vacated)
+            for c in np.flatnonzero(solved):
+                member = recon == c
+                for h in np.flatnonzero(delta_env[c] < 0.0):
+                    request = -float(delta_env[c, h])
+                    backend_removal_vol += request
+                    removal_field, removed = morphology.remove(
+                        trial.hydrate_fraction, h, request, member)
+                    freed += removal_field
+                    removed_total += removed
+            vacated = vacated + freed
+            site_mask = vacated > 0.0
 
-        # gel water per cluster + total water feasibility (chemical + gel)
-        gel_mol_c = (parcel_env * gel_eps).sum(axis=1) / vm_w
+            demand = np.zeros_like(trial.hydrate_fraction)
+            for c in np.flatnonzero(solved):
+                pos = np.flatnonzero(delta_env[c] > 0.0)
+                if pos.size == 0:
+                    continue
+                member = recon == c
+                # growth anchor cascade: freed/vacated space -> existing hydrate
+                # surfaces -> pore liquid (deterministic, same-cluster only)
+                w = np.where(member, vacated, 0.0)
+                if float(w.sum()) <= 0.0:
+                    w = np.where(member, trial.hydrate_fraction.sum(axis=0), 0.0)
+                if float(w.sum()) <= 0.0:
+                    w = np.where(member, trial.capillary_liquid, 0.0)
+                wsum = float(w.sum())
+                if wsum <= 0.0:
+                    return None, StepReject(morphology.STATUS_CAPACITY), {}
+                frac = w / wsum
+                for h in pos:
+                    demand[h] += delta_env[c, h] * frac
+            requested_vol = float(demand.sum())
+            backend_bulk_vol = float(np.clip(delta_env, 0.0, None).sum())
+        else:
+            # incremental: demand distributed over the cluster's dissolution
+            # sites in proportion to locally dissolved volume
+            demand = np.zeros_like(trial.hydrate_fraction)
+            for c in np.flatnonzero(parcel_env.any(axis=1)):
+                mask = site_mask & (site_cluster == c)
+                wsum = float(vacated[mask].sum())
+                if wsum <= 0.0:
+                    return None, StepReject(REJECT_BACKEND_FAILURE), {}
+                frac = np.where(mask, vacated, 0.0) / wsum
+                for h in np.flatnonzero(parcel_env[c] > 0.0):
+                    demand[h] += parcel_env[c, h] * frac
+            requested_vol = float(demand.sum())
+            backend_bulk_vol = float(parcel_env.sum())
+
+        # total water feasibility (chemical + gel, both signed under snapshot)
         if np.any(chem_mol_c + gel_mol_c > water_mol_c + 1e-30):
             return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
 
-        recon = np.where(labels >= 0, labels, site_cluster)
         outcome = morphology.place(trial.hydrate_fraction, trial.capillary_liquid,
-                                   vacated, demand, recon, site_cluster)
+                                   vacated, demand, recon,
+                                   recon if snapshot else site_cluster)
         if outcome.status != morphology.STATUS_OK:
             return None, StepReject(outcome.status), {}
-        # water flows into leftover vacated space (same connected liquid)
+        # water flows into leftover vacated/freed space (same connected liquid)
         trial.capillary_liquid += vacated
 
         # cluster water reconciliation: excess liquid volume becomes capillary gas.
@@ -292,10 +372,10 @@ class Engine:
         target_vol_c = prev_vol_recon_c - (chem_mol_c + gel_mol_c) * vm_w
         diff_c = cur_vol_c - target_vol_c
         if n_clusters > 0:
-            # negative diff: water returned to solution (e.g. solute water from
-            # the inventory re-emerging as solvent) refills capillary liquid
-            # from the cluster's own gas space; without enough local gas the
-            # returned volume has nowhere to appear
+            # negative diff: water returned to solution (re-dissolution, solute
+            # water re-emerging as solvent) refills capillary liquid from the
+            # cluster's own gas space; without enough local gas the returned
+            # volume has nowhere to appear
             gas_vol_c = np.bincount(recon[recon >= 0],
                                     weights=trial.capillary_gas[recon >= 0],
                                     minlength=n_clusters)
@@ -317,14 +397,27 @@ class Engine:
             trial.capillary_liquid -= removed_liq
             trial.capillary_gas += removed_liq
 
-        # authoritative mol ledger (exact scalar arithmetic)
+        # authoritative mol ledger (exact scalar arithmetic; signed under snapshot:
+        # exactly what was fed to the backend is subtracted, exactly what came out
+        # is added — closure cannot open a gap regardless of share float dust)
         chem_total = float(chem_mol_c.sum())
         gel_total = float(gel_mol_c.sum())
         trial.phase_mol = trial.phase_mol - dis.removed_mol
         trial.unmet_mol = trial.unmet_mol + dis.unmet_mol
-        trial.hydrate_mol = trial.hydrate_mol + parcel_mol_sum
-        trial.hydrate_env_vol_vox = trial.hydrate_env_vol_vox + parcel_env.sum(axis=0)
-        trial.hydrate_elements = trial.hydrate_elements + hydrate_elements_add
+        if snapshot:
+            sv = solved
+            trial.hydrate_mol = trial.hydrate_mol + (
+                parcel_mol[sv].sum(axis=0) - owned_mol[sv].sum(axis=0))
+            trial.hydrate_env_vol_vox = trial.hydrate_env_vol_vox + (
+                parcel_env[sv].sum(axis=0) - own_vol[sv].sum(axis=0))
+            trial.hydrate_elements_ch = trial.hydrate_elements_ch + (
+                parcel_elem[sv].sum(axis=0) - owned_elem[sv].sum(axis=0))
+        else:
+            trial.hydrate_mol = trial.hydrate_mol + parcel_mol.sum(axis=0)
+            trial.hydrate_env_vol_vox = (trial.hydrate_env_vol_vox
+                                         + parcel_env.sum(axis=0))
+            trial.hydrate_elements_ch = (trial.hydrate_elements_ch
+                                         + parcel_elem.sum(axis=0))
         trial.injected_elements = trial.injected_elements + injected_add
         trial.water_free_mol -= chem_total + gel_total
         trial.water_gel_mol += gel_total
@@ -353,7 +446,9 @@ class Engine:
         placement = ledger.PlacementBalance(
             backend_bulk_vol_vox=backend_bulk_vol,
             requested_bulk_vol_vox=requested_vol,
-            placed_bulk_vol_vox=outcome.placed_vol_vox)
+            placed_bulk_vol_vox=outcome.placed_vol_vox,
+            backend_removal_vol_vox=backend_removal_vol,
+            removed_vol_vox=removed_total)
         report = ledger.check_all(trial, reg, placement)
         if not report.ok:
             return None, StepReject(report.violations[0]), report.metrics

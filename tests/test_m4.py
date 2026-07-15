@@ -108,7 +108,8 @@ def test_backend_seed_only_on_fresh_inventory(gems_backend):
     fresh = gems_backend.react(_release(), 6e-10, np.zeros(len(ELEMENT_IDS)))
     assert fresh.injected_elements[o_idx] > 0.0  # O2 redox seed
     again = gems_backend.react(_release(), 6e-10, fresh.residual_inventory)
-    assert again.injected_elements[o_idx] == 0.0  # redox state now in inventory
+    # no second seed: only solver-closure residual dust remains (D4 booking)
+    assert abs(again.injected_elements[o_idx]) < 1e-3 * fresh.injected_elements[o_idx]
     assert again.status == "ok"
 
 

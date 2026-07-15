@@ -25,10 +25,13 @@ PLACEMENT_RTOL = 1e-9
 
 @dataclass
 class PlacementBalance:
-    """Backend volume == requested == placed (PRD §6.1 배치 수지)."""
+    """Backend volume == requested == placed, on BOTH legs: growth and, under
+    full re-equilibration, removal (PRD §6.1 배치 수지, gross accounting)."""
     backend_bulk_vol_vox: float
     requested_bulk_vol_vox: float
     placed_bulk_vol_vox: float
+    backend_removal_vol_vox: float = 0.0
+    removed_vol_vox: float = 0.0
 
 
 @dataclass
@@ -49,7 +52,7 @@ def current_elements(state: SimulationState, registry: Registry) -> np.ndarray:
     e = np.zeros(len(ELEMENT_IDS))
     for i, p in enumerate(KINETIC_PHASE_IDS):
         e += formula_elements(registry.get(p).formula) * state.phase_mol[i]
-    e = e + state.hydrate_elements
+    e = e + state.hydrate_elements_ch.sum(axis=0)
     e += formula_elements(registry.get("H2O").formula) * (
         state.water_free_mol + state.water_gel_mol)
     if state.cluster_inventory.size:
@@ -124,8 +127,10 @@ def check_all(state: SimulationState, registry: Registry,
         scale = 1.0 + abs(placement.requested_bulk_vol_vox)
         e1 = abs(placement.backend_bulk_vol_vox - placement.requested_bulk_vol_vox) / scale
         e2 = abs(placement.requested_bulk_vol_vox - placement.placed_bulk_vol_vox) / scale
-        rep.metrics["placement_rel_err"] = max(e1, e2)
-        if max(e1, e2) > PLACEMENT_RTOL:
+        scale_r = 1.0 + abs(placement.backend_removal_vol_vox)
+        e3 = abs(placement.backend_removal_vol_vox - placement.removed_vol_vox) / scale_r
+        rep.metrics["placement_rel_err"] = max(e1, e2, e3)
+        if max(e1, e2, e3) > PLACEMENT_RTOL:
             rep.violations.append("balance_placement")
 
     return rep

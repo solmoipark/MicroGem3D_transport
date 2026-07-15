@@ -143,6 +143,129 @@ def liquid_percolation(capillary_liquid: np.ndarray) -> Dict[str, bool]:
     return result
 
 
+# ------------------------------------------------- pore structure (PRD v2.2)
+
+# a voxel counts as pore when its capillary (liquid+gas) fraction reaches this
+# majority level — documented mask policy for all pore-structure metrics
+PORE_MASK_LEVEL = 0.5
+
+
+def _edt_sq_1d(f: np.ndarray) -> np.ndarray:
+    """Felzenszwalb–Huttenlocher squared-distance lower envelope along the last
+    axis of a 2-D stack (rows independent). f is the squared-distance seed."""
+    rows, n = f.shape
+    out = np.empty_like(f)
+    v = np.empty(n, dtype=np.int64)
+    z = np.empty(n + 1)
+    for r in range(rows):
+        fr = f[r]
+        k = 0
+        v[0] = 0
+        z[0] = -np.inf
+        z[1] = np.inf
+        for q in range(1, n):
+            while True:
+                p_ = v[k]
+                s_ = ((fr[q] + q * q) - (fr[p_] + p_ * p_)) / (2 * q - 2 * p_)
+                if s_ <= z[k]:
+                    k -= 1
+                else:
+                    break
+            k += 1
+            v[k] = q
+            z[k] = s_
+            z[k + 1] = np.inf
+        k = 0
+        for q in range(n):
+            while z[k + 1] < q:
+                k += 1
+            p_ = v[k]
+            out[r, q] = (q - p_) * (q - p_) + fr[p_]
+    return out
+
+
+def periodic_edt_um(pore_mask: np.ndarray, voxel_um: float) -> np.ndarray:
+    """Exact Euclidean distance (um) from each pore voxel to the nearest solid,
+    on the periodic box: each axis pass triples that axis and keeps the center
+    third (exact for the separable squared EDT)."""
+    big = 1e18
+    d2 = np.where(pore_mask, big, 0.0).astype(np.float64)
+    n = pore_mask.shape[0]
+    for ax in range(3):
+        moved = np.moveaxis(d2, ax, -1)
+        shape = moved.shape
+        flat = moved.reshape(-1, n)
+        tripled = np.concatenate([flat, flat, flat], axis=1)
+        tr = _edt_sq_1d(tripled)
+        flat = tr[:, n:2 * n]
+        d2 = np.moveaxis(flat.reshape(shape), -1, ax)
+    return np.sqrt(np.clip(d2, 0.0, None)) * voxel_um
+
+
+def pore_size_distribution(state: SimulationState) -> Dict:
+    """EDT-based local pore diameters over the capillary pore mask: volume
+    fraction per diameter bin and the volume-weighted mean diameter."""
+    mask = (state.capillary_liquid + state.capillary_gas) >= PORE_MASK_LEVEL
+    n_pore = int(mask.sum())
+    if n_pore == 0:
+        return {"edges_um": [], "volume_fraction_per_bin": [],
+                "mean_diameter_um": 0.0, "pore_voxels": 0}
+    h = state.config.rve.voxel_size_um
+    dist = periodic_edt_um(mask, h)
+    diam = 2.0 * dist[mask]
+    edges = [h * m for m in (1, 2, 4, 8, 16, 32)]
+    hist, _ = np.histogram(diam, bins=[0.0] + edges)
+    return {
+        "edges_um": edges,
+        "volume_fraction_per_bin": (hist / n_pore).tolist(),
+        "mean_diameter_um": float(diam.mean()),
+        "pore_voxels": n_pore,
+    }
+
+
+def porosity_split(state: SimulationState) -> Dict[str, float]:
+    """Capillary porosity split into CONNECTED (in a face-to-face spanning pore
+    cluster) and ISOLATED parts. Sub-mask capillary volume counts as isolated;
+    connected + isolated == porosity_capillary exactly by construction."""
+    cap = state.capillary_liquid + state.capillary_gas
+    n_vox = cap.size
+    mask = cap >= PORE_MASK_LEVEL
+    labels = _label_nonperiodic(mask)
+    spanning = set()
+    for ax in range(3):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax] = 0
+        hi[ax] = -1
+        front = set(np.unique(labels[tuple(lo)]))
+        back = set(np.unique(labels[tuple(hi)]))
+        front.discard(-1)
+        back.discard(-1)
+        spanning |= front & back
+    if spanning:
+        conn_mask = np.isin(labels, sorted(spanning))
+        connected = float(cap[conn_mask].sum()) / n_vox
+    else:
+        connected = 0.0
+    total = float(cap.sum()) / n_vox
+    return {"connected": connected, "isolated": total - connected}
+
+
+def permeability_kozeny_carman(phi_connected: float, d_char_um: float,
+                               kc_constant_m2: Optional[float] = None) -> Dict:
+    """k = C * phi^3 / (1-phi)^2 with C = d_char^2/180 unless overridden.
+    Outside (0,1) the value is NaN + not_available — never fabricated."""
+    formula = "k = C * phi_conn^3 / (1 - phi_conn)^2"
+    if not (0.0 < phi_connected < 1.0) or (kc_constant_m2 is None
+                                           and d_char_um <= 0.0):
+        return {"k_m2": float("nan"), "status": "not_available",
+                "C_m2": float("nan"), "formula": formula}
+    c = kc_constant_m2 if kc_constant_m2 is not None else (d_char_um * 1e-6) ** 2 / 180.0
+    k = c * phi_connected ** 3 / (1.0 - phi_connected) ** 2
+    return {"k_m2": k, "status": "ok", "C_m2": c, "formula": formula,
+            "phi_connected": phi_connected}
+
+
 # ------------------------------------------------------------- §6.3 judgment
 
 def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
@@ -172,8 +295,14 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
         ch_name = ("Portlandite" if any("Portlandite" in r["hydrate_mol"]
                                         for r in rows) else "CH")
         ch = [r["hydrate_mol"].get(ch_name, 0.0) for r in rows]
-        add("CH_mass_monotone_increase",
-            all(b >= a - 1e-30 for a, b in zip(ch, ch[1:])), ch[-1])
+        # re-dissolution is legal physics under full re-equilibration (PRD
+        # v2.2): pozzolanic blends consume CH late. The band only asks that CH
+        # EXISTS from 1 d onward while clinker remains.
+        late = [(r, v) for r, v in zip(rows, ch) if r["time_h"] >= 24.0
+                and any(r["alpha"].get(p2, 0.0) < 1.0 for p2 in ("C3S", "C2S"))]
+        add("CH_present_after_1d",
+            all(v > 0.0 for _, v in late) if late else True,
+            ch[-1])
         por = [r["porosity_capillary"] for r in rows]
         add("capillary_porosity_monotone_decrease",
             all(b <= a + 1e-12 for a, b in zip(por, por[1:])), por[-1])
@@ -243,7 +372,8 @@ def central_slice_rgb(state: SimulationState) -> np.ndarray:
 # -------------------------------------------------------------------- report
 
 def report(run_dir: str, out_dir: Optional[str] = None,
-           registry: Optional[Registry] = None) -> Dict:
+           registry: Optional[Registry] = None,
+           kc_constant_m2: Optional[float] = None) -> Dict:
     """Regenerate the full report from a run directory's checkpoints: per-output
     rows, §6.1 ledger re-checks, percolation, phase fractions, §6.3 band, and a
     central-slice PNG per checkpoint. Writes report.json + PNGs to out_dir
@@ -285,6 +415,13 @@ def report(run_dir: str, out_dir: Optional[str] = None,
             row["ledger_metrics"]["cluster_ph"] = summary_ph[row["time_h"]]
         row["percolation"] = liquid_percolation(state.capillary_liquid)
         row["phase_volume_fractions"] = phase_volume_fractions(state)
+        split = porosity_split(state)
+        row["porosity_connected"] = split["connected"]
+        row["porosity_isolated"] = split["isolated"]
+        psd_row = pore_size_distribution(state)
+        row["pore_size_distribution"] = psd_row
+        row["permeability"] = permeability_kozeny_carman(
+            split["connected"], psd_row["mean_diameter_um"], kc_constant_m2)
         png_name = f"slice_{ck.name}.png"
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name

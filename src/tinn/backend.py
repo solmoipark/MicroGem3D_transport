@@ -57,9 +57,13 @@ class ReactionResult:
 class ReactionBackend(Protocol):
     backend_id: str
     hydrate_ids: tuple  # fixed channel order of every parcel this backend emits
+    # "incremental": parcels are NEW precipitates appended to holdings.
+    # "snapshot": parcels are the cluster's ENTIRE new assemblage (absolute
+    # replacement; water_consumed_mol may be negative on re-dissolution).
+    mode: str
 
     def react(self, released_mol: Dict[str, float], water_available_mol: float,
-              inventory: np.ndarray) -> ReactionResult:
+              inventory: np.ndarray, solid_elements=None) -> ReactionResult:
         ...
 
 
@@ -70,13 +74,18 @@ class StoichiometricBackend:
 
     backend_id = "stoichiometric"
     hydrate_ids = HYDRATE_PHASE_IDS
+    mode = "incremental"
 
     def __init__(self, rules: Dict[str, ReactionRule], registry: Registry):
         self._rules = rules
         self._registry = registry
 
     def react(self, released_mol: Dict[str, float], water_available_mol: float,
-              inventory: np.ndarray) -> ReactionResult:
+              inventory: np.ndarray, solid_elements=None) -> ReactionResult:
+        if solid_elements is not None:
+            raise RuntimeError(
+                "StoichiometricBackend is incremental-only and cannot "
+                "re-equilibrate existing solids (no silent fallback)")
         water_need = 0.0
         totals: Dict[str, float] = {}
         for phase_id, n_mol in released_mol.items():

@@ -116,7 +116,8 @@ class GemsWorker:
     """Spawns one isolated xGEMS process per equilibration request."""
 
     def __init__(self, bundle_lst: str, python_executable: Optional[str] = None,
-                 work_root: Optional[str] = None, timeout_s: float = 300.0):
+                 work_root: Optional[str] = None, timeout_s: float = 300.0,
+                 persistent: Optional[bool] = None):
         self.bundle_lst = str(Path(bundle_lst).resolve())
         self.python_executable = str(python_executable or sys.executable)
         if not Path(self.python_executable).is_file():
@@ -125,7 +126,78 @@ class GemsWorker:
         self.work_root = (Path(work_root) if work_root
                           else Path.cwd() / ".gems_runs").resolve()
         self.timeout_s = timeout_s
+        # persistent server amortizes interpreter+xgems+bundle load (~0.3 s)
+        # across calls; every request still builds a FRESH ChemicalEngine with
+        # cold_start, so outputs are bit-identical to spawn-per-call.
+        # Infrastructure toggle (like the interpreter path), not config.
+        if persistent is None:
+            persistent = os.environ.get("TINN_GEMS_PERSISTENT", "1") != "0"
+        self.persistent = persistent
+        self._proc = None
+        self._serve_dir: Optional[Path] = None
+        self._req_counter = 0
         self.baseline_audit = audit_bundle(self.bundle_lst)
+
+    # ------------------------------------------------------- persistent server
+    def close(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._serve_dir is not None:
+                    (self._serve_dir / "stop").write_text("", encoding="utf-8")
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+
+    def __del__(self):  # best effort
+        self.close()
+
+    def _ensure_server(self) -> Path:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._serve_dir
+        self._serve_dir = self.work_root / f"serve-{uuid.uuid4().hex[:12]}"
+        self._serve_dir.mkdir(parents=True, exist_ok=True)
+        self._req_counter = 0
+        src_root = str(Path(__file__).resolve().parents[1])
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+        self._proc = subprocess.Popen(
+            [self.python_executable, "-m", "tinn.gems", "--serve",
+             str(self._serve_dir)],
+            cwd=self._serve_dir, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        return self._serve_dir
+
+    def _persistent_call(self, request: Dict) -> Dict:
+        import time
+        serve_dir = self._ensure_server()
+        k = self._req_counter
+        self._req_counter += 1
+        req = serve_dir / f"req_{k:06d}.json"
+        resp = serve_dir / f"resp_{k:06d}.json"
+        ready = serve_dir / f"resp_{k:06d}.ready"
+        req.write_text(json.dumps(request), encoding="utf-8")
+        (serve_dir / f"req_{k:06d}.ready").write_text("", encoding="utf-8")
+        deadline = time.monotonic() + self.timeout_s
+        while not ready.is_file():
+            if self._proc.poll() is not None:
+                self._proc = None
+                raise GemsError(
+                    f"persistent xGEMS worker died (see {serve_dir})", kind="crash")
+            if time.monotonic() > deadline:
+                self.close()
+                raise GemsError(
+                    f"persistent xGEMS worker timed out after {self.timeout_s}s "
+                    f"(artifacts in {serve_dir})", kind="timeout")
+            time.sleep(0.005)
+        try:
+            response = json.loads(resp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            self.close()
+            raise GemsError(
+                f"persistent worker response is not valid JSON: {e} "
+                f"(artifacts in {serve_dir})", kind="protocol") from e
+        return response
 
     # ---------------------------------------------------------------- public
     def info(self) -> Dict:
@@ -192,6 +264,20 @@ class GemsWorker:
                              if before.get(k) != self.baseline_audit.get(k))
             raise BundleAuditError(
                 f"bundle changed since worker construction: {changed}")
+        if self.persistent:
+            response = self._persistent_call(request)
+            after = audit_bundle(self.bundle_lst)
+            if after != before:
+                changed = sorted(k for k in set(before) | set(after)
+                                 if before.get(k) != after.get(k))
+                raise BundleAuditError(
+                    f"xGEMS call mutated the source bundle: {changed}")
+            if not response.get("ok"):
+                kind = str(response.get("error_kind", "internal"))
+                raise GemsError(
+                    f"xGEMS worker failed [{kind}]: {response.get('error')}\n"
+                    f"{response.get('traceback', '')}", kind=kind)
+            return response
         run_dir.mkdir(parents=True, exist_ok=False)
         req_path = run_dir / "request.json"
         resp_path = run_dir / "response.json"
@@ -274,10 +360,20 @@ class GemsBackend:
     """
 
     backend_id = "gems3k"
+    # full re-equilibration (PRD v2.2): parcels are the cluster's ENTIRE new
+    # assemblage and water_consumed_mol may be negative (re-dissolution
+    # returning bound water to solution)
+    mode = "snapshot"
 
     def __init__(self, worker: GemsWorker, temperature_k: float):
+        from collections import OrderedDict
         from .registry import (ELEMENT_IDS, KINETIC_PHASE_IDS, default_registry,
                                element_vector)
+        # exact input-hash memoization: a quiescent cluster whose scaled input
+        # dict is bitwise-identical to a previous solve reuses that response
+        # (deterministic, no physics change); bounded LRU
+        self._memo: "OrderedDict[str, Dict]" = OrderedDict()
+        self._memo_cap = 256
         self._element_ids = ELEMENT_IDS
         self._worker = worker
         self.temperature_k = temperature_k
@@ -293,7 +389,8 @@ class GemsBackend:
         self._h2o_vec = element_vector(reg.get("H2O").formula, 1.0)
         self._h2o_index = {el: i for i, el in enumerate(ELEMENT_IDS)}
 
-    def react(self, released_mol, water_available_mol: float, inventory):
+    def react(self, released_mol, water_available_mol: float, inventory,
+              solid_elements=None):
         import numpy as np
         from .backend import (BackendTransientError, Parcel, ReactionResult,
                               STATUS_OK)
@@ -303,6 +400,10 @@ class GemsBackend:
         for phase_id, mol in released_mol.items():
             if mol > 0.0:
                 elements = elements + self._formula_vec[phase_id] * mol
+        if solid_elements is not None:
+            # full re-equilibration: the cluster's owned hydrate elements are
+            # part of the system and may re-dissolve (PRD v2.2)
+            elements = elements + np.asarray(solid_elements, dtype=np.float64)
         elements = elements + self._h2o_vec * water_available_mol
         # tiny negatives are float dust from previous residual splits
         elements = np.where(np.abs(elements) < 1e-30, 0.0, elements)
@@ -323,12 +424,22 @@ class GemsBackend:
             scaled["O"] = scaled.get("O", 0.0) + O2_SEED_MOL_O
             injected[e_ids.index("O")] += O2_SEED_MOL_O / s
 
-        try:
-            r = self._worker.equilibrate_elements(scaled, self.temperature_k)
-        except GemsError as e:
-            if e.kind in ("nonconvergence", "timeout"):
-                raise BackendTransientError(str(e)) from e
-            raise
+        memo_key = json.dumps(
+            {k: scaled[k].hex() if hasattr(scaled[k], "hex") else scaled[k]
+             for k in sorted(scaled)}, sort_keys=True)
+        if memo_key in self._memo:
+            self._memo.move_to_end(memo_key)
+            r = self._memo[memo_key]
+        else:
+            try:
+                r = self._worker.equilibrate_elements(scaled, self.temperature_k)
+            except GemsError as e:
+                if e.kind in ("nonconvergence", "timeout"):
+                    raise BackendTransientError(str(e)) from e
+                raise
+            self._memo[memo_key] = r
+            if len(self._memo) > self._memo_cap:
+                self._memo.popitem(last=False)
 
         for el, adj in r.element_input["floor_adjustments_mol"].items():
             if el in self._h2o_index:
@@ -384,10 +495,16 @@ class GemsBackend:
             e_out = e_out + pc.elements
         e_in = elements + injected
         scale_mol = float(np.abs(e_in).max())
-        closure = float(np.abs(e_out - e_in).max()) / max(scale_mol, 1e-300)
+        resid_vec = e_out - e_in
+        closure = float(np.abs(resid_vec).max()) / max(scale_mol, 1e-300)
         if closure > 1e-9:
             raise BackendTransientError(
                 f"xGEMS per-call element closure {closure:.2e} exceeds 1e-9")
+        # book the signed sub-gate residual as injected/lost solver mass: under
+        # full re-equilibration the WHOLE inventory passes through the solver
+        # every step, so per-call dust would otherwise accumulate against the
+        # blocking element bound (the 1e-6 injected-excess bound guards drift)
+        injected = injected + resid_vec
 
         return ReactionResult(
             status=STATUS_OK,
@@ -605,9 +722,45 @@ def _worker_main(request_path: str, response_path: str) -> int:
     return 0 if response.get("ok") else 1
 
 
+def _serve_main(serve_dir: str) -> int:
+    """Persistent request loop: each request is executed with a FRESH engine
+    (cold start), so results are bit-identical to spawn-per-call."""
+    import time
+    root = Path(serve_dir)
+    k = 0
+    while True:
+        if (root / "stop").is_file():
+            return 0
+        req_ready = root / f"req_{k:06d}.ready"
+        if not req_ready.is_file():
+            time.sleep(0.005)
+            continue
+        req = root / f"req_{k:06d}.json"
+        resp = root / f"resp_{k:06d}.json"
+        try:
+            request = json.loads(req.read_text(encoding="utf-8"))
+            response = _worker_execute(request)
+        except Exception as exc:
+            import traceback
+            if isinstance(exc, RuntimeError):
+                kind = "nonconvergence"
+            elif isinstance(exc, (ValueError, KeyError, FileNotFoundError, TypeError)):
+                kind = "config"
+            else:
+                kind = "internal"
+            response = {"ok": False, "error_kind": kind,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc()}
+        resp.write_text(json.dumps(response), encoding="utf-8")
+        (root / f"resp_{k:06d}.ready").write_text("", encoding="utf-8")
+        k += 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--worker":
         sys.exit(_worker_main(sys.argv[2], sys.argv[3]))
-    print("usage: python -m tinn.gems --worker <request.json> <response.json>",
-          file=sys.stderr)
+    if len(sys.argv) == 3 and sys.argv[1] == "--serve":
+        sys.exit(_serve_main(sys.argv[2]))
+    print("usage: python -m tinn.gems --worker <req.json> <resp.json> | "
+          "--serve <dir>", file=sys.stderr)
     sys.exit(2)

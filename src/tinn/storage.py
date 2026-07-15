@@ -22,10 +22,10 @@ from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
                        Registry, SOLID_PHASE_IDS)
 from .state import SimulationState, _DENSE_FIELDS, code_version
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
-                   "hydrate_env_vol_vox", "hydrate_elements", "injected_elements",
+                   "hydrate_env_vol_vox", "injected_elements",
                    "initial_elements")
 _LEDGER_SCALARS = ("time_h", "dt_h", "water_free_mol", "water_gel_mol",
                    "water_bound_mol", "initial_water_mol", "inert_volume_vox",
@@ -101,6 +101,7 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             header[k] = getattr(state, k)
         for k in _LEDGER_VECTORS:
             header[k] = np.asarray(getattr(state, k)).tolist()
+        header["hydrate_elements_ch"] = np.asarray(state.hydrate_elements_ch).tolist()
         (tmp / "header.json").write_text(json.dumps(header), encoding="utf-8")
 
         tables = {
@@ -144,7 +145,11 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
 
     header = json.loads((root / "header.json").read_text(encoding="utf-8"))
     if header["format_version"] != FORMAT_VERSION:
-        raise StorageError(f"unsupported checkpoint format {header['format_version']}")
+        raise StorageError(
+            f"checkpoint format {header['format_version']} is not supported by "
+            f"this build (current {FORMAT_VERSION}); pre-v2.2 checkpoints "
+            f"predate reversible chemistry — rerun from the config "
+            f"(no migration code, PRD 0.3)")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
                          ("element_ids", ELEMENT_IDS)):
@@ -191,7 +196,8 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         unmet_mol=np.asarray(header["unmet_mol"]),
         hydrate_mol=np.asarray(header["hydrate_mol"]),
         hydrate_env_vol_vox=np.asarray(header["hydrate_env_vol_vox"]),
-        hydrate_elements=np.asarray(header["hydrate_elements"]),
+        hydrate_elements_ch=np.asarray(header["hydrate_elements_ch"]).reshape(
+            len(hydrate_ids), len(ELEMENT_IDS)),
         injected_elements=np.asarray(header["injected_elements"]),
         water_free_mol=header["water_free_mol"],
         water_gel_mol=header["water_gel_mol"],
