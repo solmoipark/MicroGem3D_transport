@@ -1,11 +1,16 @@
-"""Per-phase dissolution allocation over liquid-accessible sites (PRD §4.2).
+"""Per-phase dissolution allocation over water-accessible sites (PRD §4.2).
 
-Weights are the voxel's wetted-face count (own wetness + number of 6-neighbor
-periodic voxels holding cluster liquid) — a geometric surface-area measure,
-relative only, never an absolute rate. Exhausted sites are re-allocated
-iteratively; anything unachievable is returned as unmet mol, never hidden.
-The weight needs no particle attribution, so it is well-defined for all three
-solid tiers including smeared subgrid volume.
+Weights are the voxel's conductive-face count: own/6-neighbor faces holding
+cluster liquid count 1 each, faces holding hydrate count GEL_FACE_WEIGHT each
+(gel pore water is the ion conduit through a coating — P&K's diffusion stage
+already encodes the shell resistance empirically, so a hard geometric gate on
+liquid contact would double-count it; PRD §4.2, v2.2 rev.2). The weight is a
+geometric surface-area measure, relative only, never an absolute rate.
+Exhausted sites are re-allocated iteratively; anything unachievable is
+returned as unmet mol, never hidden. The weight needs no particle
+attribution, so it is well-defined for all three solid tiers including
+smeared subgrid volume. Particle-interior voxels (neither liquid nor hydrate
+anywhere on their faces) stay inaccessible.
 """
 
 from __future__ import annotations
@@ -19,6 +24,10 @@ from .state import SimulationState
 from .transport import LIQ_EPS  # single threshold shared with cluster labeling
 
 _AXES = ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1))
+
+# relative conductivity of a hydrate-bearing face vs a liquid-bearing face:
+# the representative C-S-H gel porosity (the water fraction of the conduit)
+GEL_FACE_WEIGHT = 0.28
 
 
 def neighbor_liquid_sum(liquid: np.ndarray) -> np.ndarray:
@@ -39,10 +48,13 @@ def dissolve(trial: SimulationState, registry: Registry,
              dn_target_mol: np.ndarray) -> DissolutionResult:
     """Remove dn_target_mol per kinetic phase from trial.anhydrous_fraction in place."""
     n = trial.grid_size
-    # wetted-face count from cluster liquid only (same threshold as labeling),
-    # so every site is guaranteed an adjacent labeled cluster
+    # conductive-face count: cluster liquid (same threshold as labeling) plus
+    # hydrate gel faces at GEL_FACE_WEIGHT — a coated site reaches its cluster
+    # through the gel, so attribution may need multi-hop (engine handles it)
     wet = (trial.capillary_liquid > LIQ_EPS).astype(np.float64)
-    weight = wet + neighbor_liquid_sum(wet)
+    gel = (trial.hydrate_fraction.sum(axis=0) > LIQ_EPS).astype(np.float64)
+    weight = (wet + neighbor_liquid_sum(wet)
+              + GEL_FACE_WEIGHT * (gel + neighbor_liquid_sum(gel)))
     removed_vol = np.zeros((len(KINETIC_PHASE_IDS), n, n, n))
     removed_mol = np.zeros(len(KINETIC_PHASE_IDS))
     unmet_mol = np.zeros(len(KINETIC_PHASE_IDS))

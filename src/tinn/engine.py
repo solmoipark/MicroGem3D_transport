@@ -117,6 +117,23 @@ class Engine:
         site_cluster = np.where(labels >= 0, labels,
                                 _neighbor_best_label(labels, prev_liquid))
         site_mask = vacated > 0.0
+        # a coated site (gel-conduit dissolution, PRD §4.2) may sit several
+        # voxels from any liquid: propagate labels ring by ring — a
+        # deterministic BFS through the solid to the nearest cluster. Applied
+        # to SITE cells only so the recon ownership partition of non-site dry
+        # regions is untouched.
+        if np.any(site_mask & (site_cluster < 0)):
+            deep = site_cluster.copy()
+            for _ in range(2 * trial.grid_size):
+                if not (site_mask & (deep < 0)).any():
+                    break
+                nxt = np.where(deep >= 0, deep,
+                               _neighbor_best_label(deep, prev_liquid))
+                if int((nxt >= 0).sum()) == int((deep >= 0).sum()):
+                    deep = nxt  # front stopped growing — rest is unreachable
+                    break
+                deep = nxt
+            site_cluster = np.where(site_mask, deep, site_cluster)
         if np.any(site_mask & (site_cluster < 0)):
             return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
 
