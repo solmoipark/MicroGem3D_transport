@@ -31,10 +31,11 @@ _LEDGER_SCALARS = ("time_h", "dt_h", "water_free_mol", "water_gel_mol",
                    "water_bound_mol", "initial_water_mol", "inert_volume_vox",
                    "accept_count", "config_hash", "backend_id")
 _TABLE_SCHEMAS: Dict[str, Dict[str, str]] = {
-    "particles": {"id": "<i8", "tier": "|i1", "diameter_um": "<f8",
-                  "volume_vox": "<f8", "center_zyx": "<f8", "placed": "|b1"},
-    "subgrid_bins": {"d_lo_um": "<f8", "d_hi_um": "<f8", "volume_vox": "<f8",
-                     "number_est": "<f8"},
+    "particles": {"id": "<i8", "tier": "|i1", "material": "|i1",
+                  "diameter_um": "<f8", "volume_vox": "<f8",
+                  "center_zyx": "<f8", "placed": "|b1"},
+    "subgrid_bins": {"material": "|i1", "d_lo_um": "<f8", "d_hi_um": "<f8",
+                     "volume_vox": "<f8", "number_est": "<f8"},
 }
 
 

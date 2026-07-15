@@ -21,7 +21,8 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import TinnConfig
-from .registry import INERT_PHASE_ID, Registry, SOLID_PHASE_IDS
+from .registry import (INERT_PHASE_ID, Registry, SCM_PHASE_IDS,
+                       SOLID_PHASE_IDS)
 
 RV_SUBGRID_MAX = 0.25  # d < h/2
 RV_FRACTIONAL_MAX = (3.0 / (4.0 * math.pi)) ** (1.0 / 3.0)  # sphere volume <= 1 voxel
@@ -135,41 +136,76 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
     n_vox = n ** 3
     v_solid_target = phi_target * n_vox  # in voxel-volume units
 
-    # --- sample particle sizes per PSD bin (coarse -> fine, carrying residual) ---
-    diameters_rv = []
-    subgrid_rows = []  # (d_lo_um, d_hi_um, volume_vox, number_est)
-    carry = 0.0
-    for b in reversed(config.psd.bins):
-        target = v_solid_target * b.volume_fraction + carry
-        if target <= 0.0:
-            carry = target
-            continue
-        rv_lo, rv_hi = b.d_lo_um / (2 * h), b.d_hi_um / (2 * h)
-        if rv_hi <= RV_SUBGRID_MAX:
-            d_mean = math.sqrt(b.d_lo_um * b.d_hi_um)
-            v_mean = _sphere_volume(d_mean / (2 * h))
-            subgrid_rows.append((b.d_lo_um, b.d_hi_um, target, target / v_mean))
-            carry = 0.0
-            continue
-        acc = 0.0
-        while True:
-            rv = math.exp(rng.uniform(math.log(rv_lo), math.log(rv_hi)))
-            v = _sphere_volume(rv)
-            if acc + v - target > target - acc:  # stopping is closer than overshooting
-                break
-            if rv < RV_SUBGRID_MAX:
-                subgrid_rows.append((2 * rv * h, 2 * rv * h, v, 1.0))
-            else:
-                diameters_rv.append(rv)
-            acc += v
-        carry = target - acc
-    sampling_residual = carry
+    # --- per-material populations (PRD v2.2): "clinker" carries the 4 clinker
+    # phases + the inert residual with uniform composition; each SCM with mass
+    # is its own pure-glass population with its own PSD. A single-material
+    # (SCM-free) config makes byte-identical RNG draws to the legacy path.
+    materials = []  # (name, phase_weights (P,), volume_target_vox, psd)
+    clinker_vol = sum(vol_g[p] for p in SOLID_PHASE_IDS if p not in SCM_PHASE_IDS)
+    clinker_w = np.array([vol_g[p] / clinker_vol if p not in SCM_PHASE_IDS else 0.0
+                          for p in SOLID_PHASE_IDS])
+    psd_map = config.material_psd or {}
+    materials.append(("clinker", clinker_w,
+                      v_solid_target * (clinker_vol / v_solid),
+                      psd_map.get("clinker", config.psd)))
+    for sid in SCM_PHASE_IDS:
+        if vol_g.get(sid, 0.0) > 0.0:
+            w = np.zeros(len(SOLID_PHASE_IDS))
+            w[SOLID_PHASE_IDS.index(sid)] = 1.0
+            materials.append((sid, w, v_solid_target * (vol_g[sid] / v_solid),
+                              psd_map.get(sid, config.psd)))
 
-    order = np.argsort(np.asarray(diameters_rv))[::-1]
-    rvs = np.asarray(diameters_rv)[order] if diameters_rv else np.empty(0)
+    # --- sample particle sizes per material, per PSD bin (coarse -> fine,
+    # carrying residual within the material) ---
+    diameters_rv = []
+    diameter_mat = []
+    subgrid_rows = []  # (material_idx, d_lo_um, d_hi_um, volume_vox, number_est)
+    sampling_residual = 0.0
+    for m_idx, (_, _, v_target_m, psd) in enumerate(materials):
+        carry = 0.0
+        for b in reversed(psd.bins):
+            target = v_target_m * b.volume_fraction + carry
+            if target <= 0.0:
+                carry = target
+                continue
+            rv_lo, rv_hi = b.d_lo_um / (2 * h), b.d_hi_um / (2 * h)
+            if rv_hi <= RV_SUBGRID_MAX:
+                d_mean = math.sqrt(b.d_lo_um * b.d_hi_um)
+                v_mean = _sphere_volume(d_mean / (2 * h))
+                subgrid_rows.append((m_idx, b.d_lo_um, b.d_hi_um, target,
+                                     target / v_mean))
+                carry = 0.0
+                continue
+            acc = 0.0
+            while True:
+                rv = math.exp(rng.uniform(math.log(rv_lo), math.log(rv_hi)))
+                v = _sphere_volume(rv)
+                if acc + v - target > target - acc:  # stopping is closer
+                    break
+                if rv < RV_SUBGRID_MAX:
+                    subgrid_rows.append((m_idx, 2 * rv * h, 2 * rv * h, v, 1.0))
+                else:
+                    diameters_rv.append(rv)
+                    diameter_mat.append(m_idx)
+                acc += v
+            carry = target - acc
+        sampling_residual += carry
+
+    rvs_all = np.asarray(diameters_rv)
+    mats_all = np.asarray(diameter_mat, dtype=np.int8)
+    if len(diameters_rv):
+        # primary: size descending; ties: material order then sampling order
+        order = np.lexsort((np.arange(len(rvs_all)), mats_all, -rvs_all))
+        rvs = rvs_all[order]
+        p_material = mats_all[order]
+    else:
+        rvs = np.empty(0)
+        p_material = np.empty(0, dtype=np.int8)
 
     # --- placement ---
     occ = np.zeros((n, n, n))
+    occ_m = np.zeros((len(materials), n, n, n))
+    occ_m_flat = occ_m.reshape(len(materials), -1)
     particle_id = np.full((n, n, n), -1, dtype=np.int64)
     pid_best = np.zeros((n, n, n))
     occ_flat = occ.ravel()
@@ -204,6 +240,7 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
                     continue
                 k = int(cand[rng.integers(cand.size)])
             occ_flat[k] += v_full
+            occ_m_flat[p_material[i], k] += v_full
             if v_full > best_flat[k]:
                 best_flat[k] = v_full
                 pid_flat[k] = i
@@ -222,6 +259,7 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
                 if not ok:
                     continue
                 occ_flat[widx] += frac
+                occ_m_flat[p_material[i], widx] += frac
                 better = frac > best_flat[widx]
                 best_flat[widx[better]] = frac[better]
                 pid_flat[widx[better]] = i
@@ -233,20 +271,26 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
             else:
                 unplaced_volume += v_full
 
-    # --- subgrid spread proportional to free capacity ---
-    v_subgrid = sum(r[2] for r in subgrid_rows)
-    if v_subgrid > 0.0:
-        avail = 1.0 - occ
-        total_avail = float(avail.sum())
-        if v_subgrid > total_avail:
-            raise GeometryError("subgrid solid volume exceeds available pore capacity")
-        occ += (v_subgrid / total_avail) * avail
+    # --- subgrid spread proportional to free capacity, per material in order ---
+    for m_idx in range(len(materials)):
+        v_subgrid = sum(r[3] for r in subgrid_rows if r[0] == m_idx)
+        if v_subgrid > 0.0:
+            avail = 1.0 - occ
+            total_avail = float(avail.sum())
+            if v_subgrid > total_avail:
+                raise GeometryError(
+                    "subgrid solid volume exceeds available pore capacity")
+            add = (v_subgrid / total_avail) * avail
+            occ += add
+            occ_m[m_idx] += add
 
     if float(occ.max()) > 1.0:
         raise GeometryError(f"voxel occupancy exceeded 1: {occ.max()}")
 
     # --- fields: full initial saturation, capillary_gas fixed residual = 0 ---
-    anhydrous = phase_weights[:, None, None, None] * occ[None, :, :, :]
+    anhydrous = np.zeros((len(SOLID_PHASE_IDS), n, n, n))
+    for m_idx, (_, weights, _, _) in enumerate(materials):
+        anhydrous += weights[:, None, None, None] * occ_m[m_idx][None, :, :, :]
     capillary_liquid = 1.0 - occ
     capillary_gas = np.zeros_like(occ)
 
@@ -273,21 +317,32 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
         "n_particles_resolved": int((p_tier[p_placed] == TIER_RESOLVED).sum()),
         "n_particles_fractional": int((p_tier[p_placed] == TIER_FRACTIONAL).sum()),
         "n_subgrid_bins": len(subgrid_rows),
+        "materials": {
+            name: {
+                "volume_target_vox": v_target_m,
+                "volume_achieved_vox": float(occ_m[m_idx].sum()),
+                "rel_error": (abs(float(occ_m[m_idx].sum()) - v_target_m)
+                              / v_target_m if v_target_m > 0 else 0.0),
+            }
+            for m_idx, (name, _, v_target_m, _) in enumerate(materials)
+        },
     }
 
     particles = {
         "id": np.arange(n_p, dtype=np.int64),
         "tier": p_tier,
+        "material": p_material.copy(),
         "diameter_um": 2.0 * rvs * h,
         "volume_vox": p_volume,
         "center_zyx": p_center,
         "placed": p_placed,
     }
     subgrid_bins = {
-        "d_lo_um": np.array([r[0] for r in subgrid_rows]),
-        "d_hi_um": np.array([r[1] for r in subgrid_rows]),
-        "volume_vox": np.array([r[2] for r in subgrid_rows]),
-        "number_est": np.array([r[3] for r in subgrid_rows]),
+        "material": np.array([r[0] for r in subgrid_rows], dtype=np.int8),
+        "d_lo_um": np.array([r[1] for r in subgrid_rows]),
+        "d_hi_um": np.array([r[2] for r in subgrid_rows]),
+        "volume_vox": np.array([r[3] for r in subgrid_rows]),
+        "number_est": np.array([r[4] for r in subgrid_rows]),
     }
 
     return RVEInit(

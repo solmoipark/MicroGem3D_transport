@@ -266,6 +266,10 @@ class TinnConfig(BaseModel):
     model_config = _STRICT
     binder: BinderRecipe
     psd: PSD = Field(default_factory=PSD.synthetic_default)
+    # per-material particle-size distributions (PRD v2.2): keys are "clinker"
+    # or an SCM id present in the recipe; materials absent from the map use
+    # `psd`. None keeps every legacy config (and its hash) unchanged.
+    material_psd: Optional[Dict[str, PSD]] = None
     w_c: float = Field(gt=0.0, le=2.0)
     temperature_K: float = Field(ge=273.15, le=372.15)
     kinetics: KineticsConfig
@@ -275,13 +279,29 @@ class TinnConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> "TinnConfig":
+        from .registry import SCM_PHASE_IDS
         d_max_allowed_um = (self.rve.grid_size - RASTER_HALO_VOX) * self.rve.voxel_size_um
-        if self.psd.d_max_um > d_max_allowed_um:
-            raise ValueError(
-                f"largest PSD diameter {self.psd.d_max_um} um exceeds the rasterizable "
-                f"maximum {d_max_allowed_um:.3f} um for a {self.rve.grid_size}^3 periodic "
-                f"RVE at {self.rve.voxel_size_um} um/voxel"
-            )
+        for label, psd in (("psd", self.psd),
+                           *((f"material_psd[{k}]", v)
+                             for k, v in (self.material_psd or {}).items())):
+            if psd.d_max_um > d_max_allowed_um:
+                raise ValueError(
+                    f"largest {label} diameter {psd.d_max_um} um exceeds the "
+                    f"rasterizable maximum {d_max_allowed_um:.3f} um for a "
+                    f"{self.rve.grid_size}^3 periodic RVE at "
+                    f"{self.rve.voxel_size_um} um/voxel"
+                )
+        if self.material_psd is not None:
+            allowed = {"clinker", *SCM_PHASE_IDS}
+            unknown = set(self.material_psd) - allowed
+            if unknown:
+                raise ValueError(
+                    f"unknown material_psd keys {sorted(unknown)}; allowed: "
+                    f"{sorted(allowed)}")
+            for key in self.material_psd:
+                if key != "clinker" and self.binder.mass_fractions.get(key, 0.0) <= 0.0:
+                    raise ValueError(
+                        f"material_psd[{key!r}] given but the recipe has no {key} mass")
         active = {p for p, f in self.binder.mass_fractions.items() if f > 0.0}
         if self.kinetics.kind == "tabulated":
             missing = active - set(self.kinetics.table.alpha)
@@ -312,6 +332,10 @@ class TinnConfig(BaseModel):
         # (override at runtime with the TINN_GEMS_PYTHON environment variable)
         if payload.get("chemistry"):
             payload["chemistry"].pop("gems_worker_python", None)
+        # absent material_psd stays out of the payload so every pre-v2.2
+        # config keeps its hash
+        if payload.get("material_psd") is None:
+            payload.pop("material_psd", None)
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
