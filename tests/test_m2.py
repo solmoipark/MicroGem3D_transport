@@ -99,9 +99,11 @@ def test_water_retardation_clips_and_cannot_rebound():
 
 def test_total_clinker_alpha_normalizes_to_pk_phases():
     pk = _pk()
-    total = pk.total_clinker_alpha(np.array([1.0, 1.0, 1.0, 1.0]))
+    full = np.zeros(8); full[:4] = 1.0
+    total = pk.total_clinker_alpha(full)
     assert total == pytest.approx(1.0)  # divided by 0.91, not by 1.0
-    total = pk.total_clinker_alpha(np.array([0.5, 0.0, 0.0, 0.0]))
+    full = np.zeros(8); full[0] = 0.5
+    total = pk.total_clinker_alpha(full)
     assert total == pytest.approx(0.5 * 0.60 / 0.91)
 
 
@@ -109,7 +111,7 @@ def test_trajectory_monotone_bounded_and_ordered():
     for preset in PK_PRESETS:
         pk = _pk(preset)
         times = [6.0, 24.0, 72.0, 168.0]
-        prev = np.zeros(4)
+        prev = np.zeros(len(_pk().alpha_at(0.0)))
         for t in times:
             a = pk.alpha_at(t)
             assert np.all(a >= prev - 1e-15) and np.all(a <= 1.0)
@@ -134,7 +136,7 @@ def test_alpha_24h_regression_snapshot():
                             0.32338514256745915, 0.15004453532690035],
     }
     for preset, vals in expect.items():
-        assert _pk(preset).alpha_at(24.0) == pytest.approx(vals, rel=1e-12)
+        assert _pk(preset).alpha_at(24.0)[:4] == pytest.approx(vals, rel=1e-12)
 
 
 def test_srm114q_1d_within_plausible_band():
@@ -182,9 +184,10 @@ def test_opc_run_per_phase_ledger_closure(opc_run):
     _, state, _ = opc_run
     rep = ledger.check_all(state, default_registry())
     assert rep.ok, rep.violations
-    # all four phases actually dissolved and their dense volumes match the ledger
+    # every phase with initial mass actually dissolved (SCM channels are empty here)
     dissolved = state.initial_phase_mol - state.phase_mol
-    assert np.all(dissolved > 0.0)
+    active = state.initial_phase_mol > 0.0
+    assert active.sum() == 4 and np.all(dissolved[active] > 0.0)
     assert rep.metrics["dense_ledger_max_rel_err"] <= 1e-9
 
 

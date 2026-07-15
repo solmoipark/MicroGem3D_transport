@@ -23,12 +23,30 @@ from typing import Dict, Protocol, Tuple
 import numpy as np
 
 from .config import KineticsConfig, TinnConfig
-from .registry import KINETIC_PHASE_IDS
+from .registry import CLINKER_PHASE_IDS, KINETIC_PHASE_IDS, SCM_PHASE_IDS
 
 GAS_CONSTANT_J_MOL_K = 8.314
 REFERENCE_BLAINE_M2_KG = 385.0
 WATER_RETARDATION_SLOPE = 3.333
 RH_CUTOFF = 0.55
+
+# SCM reaction schedules alpha(t) = D + (A - D) / (1 + (t/C)^B)^G, t in days
+# (PRD v2.1; parameters from InverseGems configs/scm_reaction.yaml)
+SCM_LOGISTIC_PRESETS: Dict[str, Tuple[float, float, float, float, float]] = {
+    #             A     B      C     D     G
+    "slag":        (0.0, 0.75, 20.0, 0.55, 1.0),
+    "fly_ash":     (0.0, 1.05, 35.0, 0.40, 1.0),
+    "metakaolin":  (0.0, 0.95, 5.0, 0.55, 1.0),
+    "silica_fume": (0.0, 0.80, 3.0, 0.85, 1.0),
+}
+
+
+def scm_alpha(t_days: float, params: Tuple[float, float, float, float, float]) -> float:
+    a, b, c, d, g = params
+    if t_days <= 0.0:
+        return max(0.0, min(1.0, a))
+    alpha = d + (a - d) / (1.0 + (t_days / c) ** b) ** g
+    return max(0.0, min(1.0, alpha))
 
 
 class KineticsModel(Protocol):
@@ -125,7 +143,7 @@ class ParrotKilloh:
                 raise ValueError(f"{name} must be finite and positive, got {value}")
         p = PK_PRESETS[preset_name]
         self.preset = p
-        rows = np.asarray(p.params)
+        rows = np.asarray(p.params)  # 4 clinker rows; SCM phases use logistic curves
         self._k1, self._n1, self._k2, self._k3, self._n3, self._h, self._ea = rows.T
         self.w_c = w_c
         self.temperature_k = temperature_k
@@ -137,6 +155,8 @@ class ParrotKilloh:
                                   for pid in KINETIC_PHASE_IDS])
         if self._weights.sum() <= 0.0:
             raise ValueError("P&K needs at least one kinetic phase with mass")
+        self._n_clinker = len(CLINKER_PHASE_IDS)
+        self._scm_params = [SCM_LOGISTIC_PRESETS[pid] for pid in SCM_PHASE_IDS]
 
     # -- correction factors ------------------------------------------------
     def humidity_factor(self) -> float:
@@ -150,15 +170,21 @@ class ParrotKilloh:
                       * (1.0 / t0 - 1.0 / self.temperature_k))
 
     def water_retardation_factors(self, total_alpha: float) -> np.ndarray:
+        """Per-CLINKER-phase factors (length 4; SCM schedules are closed-form)."""
         threshold = self._h * self.w_c
-        factors = np.ones(len(KINETIC_PHASE_IDS))
+        factors = np.ones(len(self._h))
         active = total_alpha > threshold
         bracket = 1.0 + WATER_RETARDATION_SLOPE * (threshold - total_alpha)
         factors[active] = np.clip(bracket[active], 0.0, 1.0) ** 4
         return factors
 
     def total_clinker_alpha(self, alpha: np.ndarray) -> float:
-        return float((alpha * self._weights).sum() / self._weights.sum())
+        """Mass-weighted alpha over the 4 P&K clinker phases only (PRD 4.1)."""
+        n = self._n_clinker
+        w = self._weights[:n]
+        if w.sum() <= 0.0:
+            return 0.0
+        return float((alpha[:n] * w).sum() / w.sum())
 
     # -- rates ---------------------------------------------------------------
     def rate_components(self, alpha: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -191,10 +217,15 @@ class ParrotKilloh:
         rates[np.asarray(alpha) >= 1.0] = 0.0
         return rates
 
-    def _step(self, alpha: np.ndarray, dt_days: float) -> np.ndarray:
-        rates = self.controlling_rates(alpha)
-        water = self.water_retardation_factors(self.total_clinker_alpha(alpha))
-        return np.clip(alpha + dt_days * rates * water, alpha, 1.0)
+    def _step(self, clinker_alpha: np.ndarray, t_days: float,
+              dt_days: float) -> np.ndarray:
+        """One Euler step for the 4 clinker phases (rate machinery is
+        clinker-length; SCM schedules are closed-form and never enter here)."""
+        full = np.zeros(len(KINETIC_PHASE_IDS))
+        full[:self._n_clinker] = clinker_alpha
+        rates = self.controlling_rates(clinker_alpha)
+        water = self.water_retardation_factors(self.total_clinker_alpha(full))
+        return np.clip(clinker_alpha + dt_days * rates * water, clinker_alpha, 1.0)
 
     def alpha_at(self, t_h: float) -> np.ndarray:
         """Pure function of t, integrated on a FIXED absolute grid (full
@@ -208,10 +239,17 @@ class ParrotKilloh:
         h = self.max_substep_days
         n_full = int(math.floor(t_days / h + 1e-9))
         remainder = t_days - n_full * h
+        clinker = np.zeros(self._n_clinker)
+        t = 0.0
         for _ in range(n_full):
-            alpha = self._step(alpha, h)
+            clinker = self._step(clinker, t, h)
+            t += h
         if remainder > 1e-12 * max(1.0, t_days):
-            alpha = self._step(alpha, remainder)
+            clinker = self._step(clinker, t, remainder)
+        alpha[:self._n_clinker] = clinker
+        # SCM schedules are closed-form logistic curves (PRD v2.1)
+        for j, params in enumerate(self._scm_params):
+            alpha[self._n_clinker + j] = scm_alpha(t_days, params)
         # phases with no mass in the recipe have no meaningful alpha target
         return np.where(self._weights > 0.0, alpha, 0.0)
 

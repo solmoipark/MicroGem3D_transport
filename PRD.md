@@ -80,8 +80,19 @@ v1(2026-07 개발분)은 다음을 실제로 동작시켰고, 이 설계들은 v
 ### 1.4 명시적 제외 (v2 범위 밖 — 코드도 만들지 않는다)
 
 TINN/서로게이트 학습, 건조/RH 경계·수분 유출, dry-residue 정책, 기존 수화물 재용해,
-SCM(슬래그·플라이애시 등), XCT/SEM 실험 검증 파이프라인, supervoxel/FVM 수송, 민감도 연구 프레임워크,
+XCT/SEM 실험 검증 파이프라인, supervoxel/FVM 수송, 민감도 연구 프레임워크,
 GUI. 이들을 위한 훅·플래그·빈 인터페이스도 미리 만들지 않는다 (YAGNI).
+
+**v2.1 개정 (2026-07-15): SCM 제외 해제.** 슬래그/플라이애시/메타카올린/실리카퓸 4종을
+kinetic 상으로 승격한다. 조성·밀도·반응도 파라미터는 InverseGems
+(`C:\Users\solmo\InverseGems\configs\materials.yaml`, `scm_reaction.yaml`)에서 가져온다:
+- SCM 유리는 100 g을 화학식 단위로 하는 원소 조성(산화물 wt% 변환)으로 registry에 등록,
+  몰부피 = 100/밀도. 조성 발명 금지 — 측정 산화물 조성 그대로.
+- 반응도는 로지스틱 스케줄 α(t) = D + (A−D)/(1+(t/C)^B)^G (시간 일수). 위치·화학 무관여
+  (KineticsModel 계약 유지). 클링커 P&K와 함께 BlendedKinetics로 결합.
+- SCM 방출 원소는 GemsBackend로만 평형화한다. StoichiometricBackend에는 SCM 규칙이 없으므로
+  SCM 질량 > 0 + stoichiometric 조합은 config 검증에서 거부(침묵 폴백 금지).
+- 미배정 잔여(inert)는 종전대로 유지된다 (석고·알칼리 등 잔여분).
 
 ---
 

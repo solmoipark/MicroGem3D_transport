@@ -188,7 +188,7 @@ def test_geometry_opc_multiphase_matches_recipe():
     frac = mass / mass.sum()
     expect = {"C3S": 0.60, "C2S": 0.14, "C3A": 0.07, "C4AF": 0.10, "inert": 0.09}
     for p, f in zip(rve.phase_ids, frac):
-        assert f == pytest.approx(expect[p], abs=1e-9)
+        assert f == pytest.approx(expect.get(p, 0.0), abs=1e-9)  # SCM channels: 0
     assert rve.particle_id.max() >= 0
     assert rve.particles["placed"].any()
 

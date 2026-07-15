@@ -72,8 +72,8 @@ def _blank_state(n_liquid_voxels=0) -> SimulationState:
         remap_events={"time_h": [], "prev": [], "new": [], "overlap_vox": []},
         cluster_inventory=np.zeros((0, len(ELEMENT_IDS))),
         time_h=0.0, dt_h=1.0,
-        phase_mol=np.zeros(4), initial_phase_mol=np.zeros(4),
-        unmet_mol=np.zeros(4), hydrate_mol=np.zeros(4),
+        phase_mol=np.zeros(len(KINETIC_PHASE_IDS)), initial_phase_mol=np.zeros(len(KINETIC_PHASE_IDS)),
+        unmet_mol=np.zeros(len(KINETIC_PHASE_IDS)), hydrate_mol=np.zeros(4),
         hydrate_env_vol_vox=np.zeros(4),
         hydrate_elements=np.zeros(len(ELEMENT_IDS)),
         injected_elements=np.zeros(len(ELEMENT_IDS)),
@@ -128,6 +128,12 @@ def test_state_alpha_zero_initial():
 
 # ---------------- dissolution ----------------
 
+def _dn(c3s_mol: float) -> np.ndarray:
+    v = np.zeros(len(KINETIC_PHASE_IDS))
+    v[0] = c3s_mol
+    return v
+
+
 def _dissolution_state():
     st = _blank_state()
     # two C3S voxels with different liquid contact, one liquid voxel between
@@ -141,7 +147,7 @@ def _dissolution_state():
 def test_dissolution_proportional_to_wetted_faces():
     st = _dissolution_state()
     vm = st.vm_vox(REG, "C3S")
-    res = dissolution.dissolve(st, REG, np.array([0.3 / vm, 0, 0, 0]))
+    res = dissolution.dissolve(st, REG, _dn(0.3 / vm))
     a = res.removed_vol[0, 5, 5, 4]
     b = res.removed_vol[0, 5, 5, 6]
     assert a + b == pytest.approx(0.3)
@@ -152,7 +158,7 @@ def test_dissolution_proportional_to_wetted_faces():
 def test_dissolution_caps_and_redistributes():
     st = _dissolution_state()
     vm = st.vm_vox(REG, "C3S")
-    res = dissolution.dissolve(st, REG, np.array([0.8 / vm, 0, 0, 0]))
+    res = dissolution.dissolve(st, REG, _dn(0.8 / vm))
     # both sites fully exhausted (total available 1.0 > 0.8)
     assert res.removed_vol[0].sum() == pytest.approx(0.8)
     assert st.anhydrous_fraction[0].sum() == pytest.approx(0.2)
@@ -161,7 +167,7 @@ def test_dissolution_caps_and_redistributes():
 def test_dissolution_unmet_recorded():
     st = _dissolution_state()
     vm = st.vm_vox(REG, "C3S")
-    res = dissolution.dissolve(st, REG, np.array([2.0 / vm, 0, 0, 0]))
+    res = dissolution.dissolve(st, REG, _dn(2.0 / vm))
     assert res.removed_vol[0].sum() == pytest.approx(1.0)   # everything accessible
     assert res.unmet_mol[0] == pytest.approx(1.0 / vm)
 
@@ -170,7 +176,7 @@ def test_dissolution_phase_filter():
     st = _dissolution_state()
     st.anhydrous_fraction[1, 5, 5, 4] = 0.3  # C2S at same site
     vm = st.vm_vox(REG, "C3S")
-    dissolution.dissolve(st, REG, np.array([0.2 / vm, 0, 0, 0]))
+    dissolution.dissolve(st, REG, _dn(0.2 / vm))
     assert st.anhydrous_fraction[1].sum() == pytest.approx(0.3)  # untouched
 
 
@@ -178,7 +184,7 @@ def test_dissolution_no_liquid_all_unmet():
     st = _blank_state()
     st.anhydrous_fraction[0, 5, 5, 5] = 1.0  # fully enclosed, no liquid anywhere
     vm = st.vm_vox(REG, "C3S")
-    res = dissolution.dissolve(st, REG, np.array([0.5 / vm, 0, 0, 0]))
+    res = dissolution.dissolve(st, REG, _dn(0.5 / vm))
     assert res.removed_mol[0] == 0.0
     assert res.unmet_mol[0] == pytest.approx(0.5 / vm)
 

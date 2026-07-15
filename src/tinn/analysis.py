@@ -20,7 +20,8 @@ import numpy as np
 
 from . import ledger
 from .config import TinnConfig
-from .registry import KINETIC_PHASE_IDS, Registry, default_registry
+from .registry import (CLINKER_PHASE_IDS, KINETIC_PHASE_IDS, Registry,
+                       default_registry)
 from .state import SimulationState
 from .storage import load_checkpoint
 from .transport import LIQ_EPS
@@ -152,16 +153,18 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
         checks.append({"check": name, "status": "pass" if ok else "warn",
                        "value": value})
 
-    w = config.binder.mass_fractions
+    # the PRD 6.3 alpha bands are for TOTAL CLINKER alpha (the 4 P&K phases);
+    # SCM reaction degrees follow their own slower schedules and stay out
+    w = {p: config.binder.mass_fractions.get(p, 0.0) for p in CLINKER_PHASE_IDS}
     tot_w = sum(w.values())
     bands = {24.0: (0.25, 0.55), 168.0: (0.50, 0.80), 672.0: (0.65, 0.90)}
     for row in rows:
         t = row["time_h"]
         for band_t, (lo, hi) in bands.items():
             # tolerant match: accumulated step times can land one ulp off
-            if abs(t - band_t) <= 1e-6 * band_t:
-                total = sum(row["alpha"].get(p, 0.0) * w.get(p, 0.0)
-                            for p in KINETIC_PHASE_IDS) / tot_w
+            if tot_w > 0.0 and abs(t - band_t) <= 1e-6 * band_t:
+                total = sum(row["alpha"].get(p, 0.0) * w[p]
+                            for p in CLINKER_PHASE_IDS) / tot_w
                 add(f"total_clinker_alpha@{band_t:g}h", lo <= total <= hi, total)
     if rows:
         add("alpha_order_C3S_ge_C2S",
@@ -191,10 +194,11 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
 # --------------------------------------------------------------- PNG writing
 
 # convex-combination colors per volume channel (fractions sum to 1 per voxel)
-_COL_ANHYDROUS = np.array([90, 90, 90], dtype=np.float64)
-_COL_HYDRATE = np.array([215, 150, 60], dtype=np.float64)
-_COL_LIQUID = np.array([40, 90, 220], dtype=np.float64)
-_COL_GAS = np.array([235, 235, 235], dtype=np.float64)
+_COL_ANHYDROUS = np.array([90, 90, 90], dtype=np.float64)    # clinker: gray
+_COL_INERT = np.array([70, 130, 70], dtype=np.float64)       # unassigned filler: green
+_COL_HYDRATE = np.array([215, 150, 60], dtype=np.float64)    # hydrates: orange
+_COL_LIQUID = np.array([40, 90, 220], dtype=np.float64)      # capillary water: blue
+_COL_GAS = np.array([235, 235, 235], dtype=np.float64)       # shrinkage gas: near-white
 
 
 def write_png(path: str, rgb: np.ndarray) -> None:
@@ -214,14 +218,20 @@ def write_png(path: str, rgb: np.ndarray) -> None:
 
 
 def central_slice_rgb(state: SimulationState) -> np.ndarray:
-    """Central z-slice as an RGB8 image: anhydrous gray, hydrates orange,
-    liquid blue, gas near-white (convex combination of channel colors)."""
+    """Central z-slice as an RGB8 image: clinker gray, unassigned inert filler
+    green, hydrates orange, liquid blue, gas near-white (convex combination)."""
+    from .registry import CLINKER_PHASE_IDS as _CLK
+    from .registry import SOLID_PHASE_IDS
     z = state.grid_size // 2
-    anh = state.anhydrous_fraction[:, z].sum(axis=0)
+    clk = [SOLID_PHASE_IDS.index(p) for p in _CLK]
+    green = [i for i in range(len(SOLID_PHASE_IDS)) if i not in clk]  # SCM + inert
+    anh = state.anhydrous_fraction[clk, z].sum(axis=0)
+    inert = state.anhydrous_fraction[green, z].sum(axis=0)
     hyd = state.hydrate_fraction[:, z].sum(axis=0)
     liq = state.capillary_liquid[z]
     gas = state.capillary_gas[z]
-    img = (anh[..., None] * _COL_ANHYDROUS + hyd[..., None] * _COL_HYDRATE
+    img = (anh[..., None] * _COL_ANHYDROUS + inert[..., None] * _COL_INERT
+           + hyd[..., None] * _COL_HYDRATE
            + liq[..., None] * _COL_LIQUID + gas[..., None] * _COL_GAS)
     return np.clip(np.rint(img), 0, 255).astype(np.uint8)
 

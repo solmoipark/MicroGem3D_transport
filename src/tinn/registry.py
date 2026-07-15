@@ -24,7 +24,11 @@ ATOMIC_MASS_G_MOL: Dict[str, float] = {
     "Fe": 55.845,
 }
 
-KINETIC_PHASE_IDS: Tuple[str, ...] = ("C3S", "C2S", "C3A", "C4AF")
+CLINKER_PHASE_IDS: Tuple[str, ...] = ("C3S", "C2S", "C3A", "C4AF")
+# SCM glasses (PRD v2.1): compositions/densities from InverseGems materials.yaml,
+# reaction schedules are logistic curves (kinetics.SCM_LOGISTIC_PRESETS)
+SCM_PHASE_IDS: Tuple[str, ...] = ("slag", "fly_ash", "metakaolin", "silica_fume")
+KINETIC_PHASE_IDS: Tuple[str, ...] = CLINKER_PHASE_IDS + SCM_PHASE_IDS
 INERT_PHASE_ID = "inert"
 # Order of solid channels in the dense anhydrous_fraction array (fixed).
 SOLID_PHASE_IDS: Tuple[str, ...] = KINETIC_PHASE_IDS + (INERT_PHASE_ID,)
@@ -46,7 +50,37 @@ def element_vector(formula: dict, mol: float = 1.0):
     return v
 
 VALID_BASIS = ("solid_skeleton", "bulk_envelope")
-VALID_KINDS = ("clinker", "hydrate", "liquid", "inert")
+VALID_KINDS = ("clinker", "scm", "hydrate", "liquid", "inert")
+
+# oxide -> element counts for SCM glass composition conversion
+_OXIDES = {
+    "SiO2": {"Si": 1, "O": 2}, "Al2O3": {"Al": 2, "O": 3},
+    "Fe2O3": {"Fe": 2, "O": 3}, "CaO": {"Ca": 1, "O": 1},
+    "MgO": {"Mg": 1, "O": 1}, "SO3": {"S": 1, "O": 3},
+    "Na2O": {"Na": 2, "O": 1}, "K2O": {"K": 2, "O": 1},
+}
+
+
+def _oxide_molar_mass(oxide: str) -> float:
+    return sum(ATOMIC_MASS_G_MOL[el] * n for el, n in _OXIDES[oxide].items())
+
+
+def scm_entry(phase_id: str, oxide_mass_percent: dict, density_g_cm3: float,
+              gel_porosity: float = 0.0) -> "PhaseEntry":
+    """SCM glass as a registry phase: the formula unit is the LISTED oxides per
+    100 g of material (measured composition, never invented; unlisted residue
+    like LOI is simply absent). Molar volume follows from the material density,
+    so density_g_cm3 round-trips exactly."""
+    formula: dict = {}
+    for oxide, wt in oxide_mass_percent.items():
+        if oxide not in _OXIDES:
+            raise RegistryError(f"{phase_id}: unknown oxide {oxide!r}")
+        mol = wt / _oxide_molar_mass(oxide)  # mol oxide per 100 g material
+        for el, n in _OXIDES[oxide].items():
+            formula[el] = formula.get(el, 0.0) + mol * n
+    molar_mass = sum(ATOMIC_MASS_G_MOL[el] * n for el, n in formula.items())
+    return PhaseEntry(phase_id, "scm", formula, molar_mass / density_g_cm3,
+                      "solid_skeleton", gel_porosity=gel_porosity)
 
 
 class RegistryError(ValueError):
@@ -102,7 +136,7 @@ class Registry:
                 raise RegistryError(f"duplicate phase id: {e.phase_id!r}")
             if e.kind not in VALID_KINDS:
                 raise RegistryError(f"{e.phase_id}: unknown kind {e.kind!r}")
-            if e.kind in ("clinker", "hydrate"):
+            if e.kind in ("clinker", "scm", "hydrate"):
                 if e.basis not in VALID_BASIS:
                     raise RegistryError(
                         f"{e.phase_id}: solid phase requires basis in {VALID_BASIS}, "
@@ -145,6 +179,18 @@ def default_registry() -> Registry:
         PhaseEntry("C3A", "clinker", {"Ca": 3, "Al": 2, "O": 6}, 89.1, "solid_skeleton"),
         PhaseEntry("C4AF", "clinker", {"Ca": 4, "Al": 2, "Fe": 2, "O": 10}, 130.3,
                    "solid_skeleton"),
+        # -- SCM glasses (PRD v2.1; oxide wt% + densities from InverseGems
+        #    configs/materials.yaml — measured compositions, nothing invented) --
+        scm_entry("slag", {"SiO2": 36.49, "Al2O3": 12.26, "CaO": 41.79,
+                           "MgO": 7.48, "SO3": 1.98}, 2.90),
+        scm_entry("fly_ash", {"SiO2": 51.8, "Al2O3": 23.4, "Fe2O3": 7.2,
+                              "CaO": 10.8, "MgO": 2.7, "SO3": 1.1,
+                              "Na2O": 1.3, "K2O": 1.6}, 2.20),
+        scm_entry("metakaolin", {"SiO2": 54.1, "Al2O3": 43.6, "Fe2O3": 1.1,
+                                 "CaO": 0.2, "MgO": 0.2, "SO3": 0.1,
+                                 "Na2O": 0.1, "K2O": 0.5}, 2.50),
+        scm_entry("silica_fume", {"SiO2": 99.3, "Al2O3": 0.1, "CaO": 0.1,
+                                  "MgO": 0.1, "Na2O": 0.1, "K2O": 0.2}, 2.20),
         # Unassigned clinker residual: placement-only inert solid, no chemistry invented.
         PhaseEntry(INERT_PHASE_ID, "inert", density_override_g_cm3=3.15),
         # -- liquid --
