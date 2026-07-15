@@ -45,6 +45,10 @@ def remove(hydrate_fraction: np.ndarray, channel: int, request_vol: float,
         raise ValueError(
             f"removal request {request_vol!r} exceeds available {available!r} "
             f"on channel {channel}")
+    # dust-sized over-request (bincount vs pairwise summation) clamps to the
+    # available volume — otherwise the proportional ratio exceeds 1 and the
+    # residual pass would take negative amounts / drive voxels negative
+    request_vol = min(request_vol, available)
     if request_vol <= 0.0 or available <= 0.0:
         return np.zeros_like(field), 0.0
     removal = local * (request_vol / available)

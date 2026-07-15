@@ -280,6 +280,17 @@ def test_geometry_per_material_targets_and_purity():
             < rve.particles["diameter_um"][m == 0].mean())
 
 
+def test_geometry_all_scm_binder_initializes():
+    # {"slag": 1.0} has no clinker population at all — must not divide by zero
+    from tinn.geometry import initialize_rve
+    raw = _blend_raw()
+    raw["binder"] = {"mass_fractions": {"slag": 1.0}}
+    rve = initialize_rve(TinnConfig.model_validate(raw), REG)
+    assert set(rve.report["materials"]) == {"slag"}
+    total = rve.anhydrous_fraction.sum(axis=0) + rve.capillary_liquid + rve.capillary_gas
+    assert np.max(np.abs(total - 1.0)) <= 1e-12
+
+
 def test_geometry_per_material_determinism_and_conservation():
     a = _blend_rve({"fly_ash": SLAG_PSD})
     b = _blend_rve({"fly_ash": SLAG_PSD})

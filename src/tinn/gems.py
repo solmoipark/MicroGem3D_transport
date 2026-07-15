@@ -145,9 +145,13 @@ class GemsWorker:
                 if self._serve_dir is not None:
                     (self._serve_dir / "stop").write_text("", encoding="utf-8")
                 self._proc.terminate()
+                self._proc.wait(timeout=2.0)
             except Exception:
                 pass
             self._proc = None
+        if self._serve_dir is not None:
+            shutil.rmtree(self._serve_dir, ignore_errors=True)
+            self._serve_dir = None
 
     def __del__(self):  # best effort
         self.close()
@@ -197,6 +201,12 @@ class GemsWorker:
             raise GemsError(
                 f"persistent worker response is not valid JSON: {e} "
                 f"(artifacts in {serve_dir})", kind="protocol") from e
+        # bound on-disk growth: a long run makes tens of thousands of calls
+        for f in (req, serve_dir / f"req_{k:06d}.ready", resp, ready):
+            try:
+                f.unlink()
+            except OSError:
+                pass
         return response
 
     # ---------------------------------------------------------------- public

@@ -54,6 +54,13 @@ py -3 -m pytest -q
 - [x] **M5** — 분석과 리포트: `tinn report RUN_DIR`가 체크포인트에서 §6.1
       원장 재검증, 공극률 시계열, 액체 percolation, 상 분율, 중앙 슬라이스
       PNG(의존성 없는 자체 PNG writer), §6.3 자동 판정을 일괄 생성.
+- [x] **v2.1** — SCM 4종(slag/fly_ash/metakaolin/silica_fume)을 kinetic 상으로:
+      InverseGems의 조성·밀도·로지스틱 반응도·CH 가용성 보정 이식
+      (교차검증: OPC70/FA30 α_FA(360d)=0.5522 정확 일치).
+- [x] **v2.2** — 전평형 재용해(gems3k snapshot 모드: CH 소모·상 재배열이
+      평형에서 발생 — FA30 28일에서 CH 47.5→11.7 pmol 감소 재현), 재료별
+      입자군+개별 PSD(`material_psd`), 구조 기반 공극 분석(주기 EDT 크기분포,
+      연결/고립 분리, Kozeny-Carman 투수성), 지속 GEMS 워커(28일 블렌드 2.2분).
 
 ## 예제 config
 
