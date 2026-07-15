@@ -256,6 +256,26 @@ class Engine:
                     residual[c] = inv_in[c]
                     continue
                 return None, StepReject(failure_reason), {}
+            if snapshot:
+                # space-filling limit: a pocket whose equilibrium assemblage
+                # wants more envelope growth than the pocket's entire pore
+                # space (liquid + this step's vacated + its own re-dissolved
+                # volume) can never place it — the snapshot delta is not
+                # dt-scaled, so rejecting would abort the run. Freeze the
+                # cluster exactly like a trace-water pocket: release returns
+                # to the solid as unmet, assemblage and inventory stay.
+                env_new = np.zeros(n_h)
+                for pc in result.parcels:
+                    env_new[h_index[pc.phase_id]] += _envelope_vox(pc)
+                delta_c = env_new - own_vol[c]
+                member_c = recon == c
+                cap_c = (float(np.where(member_c, trial.capillary_liquid, 0.0).sum())
+                         + s * float(np.where(member_c, vacated, 0.0).sum())
+                         + float(np.clip(-delta_c, 0.0, None).sum()))
+                if float(np.clip(delta_c, 0.0, None).sum()) > cap_c:
+                    scale_c[c] = 0.0
+                    residual[c] = inv_in[c]
+                    continue
             solved[c] = True
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol

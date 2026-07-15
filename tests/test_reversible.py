@@ -129,6 +129,19 @@ def test_snapshot_step_replaces_ledgers_and_closes():
     assert t2.hydrate_mol[ch_i] < t1.hydrate_mol[ch_i]
     rep = ledger.check_all(t2, REG)
     assert rep.ok, rep.violations
+    # space-filling limit: an assemblage wanting MORE envelope than the
+    # cluster's entire pore space is dt-independent — the step must accept
+    # with the cluster frozen (release back as unmet), never abort the run
+    state = Engine(cfg, reaction_backend=FakeSnapshotBackend(1e-30)).initial_state()
+    liquid_cm3 = float(state.capillary_liquid.sum()) * state.vox_cm3
+    big = 1.10 * liquid_cm3 / REG.get("CH").skeleton_molar_volume_cm3
+    t3, rej3, _ = Engine(cfg, reaction_backend=FakeSnapshotBackend(big)
+                         ).try_step(state, 2.0)
+    assert rej3 is None
+    assert float(t3.hydrate_fraction.sum()) == 0.0   # nothing was placed
+    assert float(t3.unmet_mol.sum()) > 0.0           # release returned as unmet
+    rep3 = ledger.check_all(t3, REG)
+    assert rep3.ok, rep3.violations
 
 
 def test_ch_redissolution_frees_volume():
