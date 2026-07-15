@@ -195,7 +195,8 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
 
 # convex-combination colors per volume channel (fractions sum to 1 per voxel)
 _COL_ANHYDROUS = np.array([90, 90, 90], dtype=np.float64)    # clinker: gray
-_COL_INERT = np.array([70, 130, 70], dtype=np.float64)       # unassigned filler: green
+_COL_SCM = np.array([30, 110, 130], dtype=np.float64)        # reactive SCM: teal
+_COL_INERT = np.array([70, 150, 70], dtype=np.float64)       # unassigned filler: green
 _COL_HYDRATE = np.array([215, 150, 60], dtype=np.float64)    # hydrates: orange
 _COL_LIQUID = np.array([40, 90, 220], dtype=np.float64)      # capillary water: blue
 _COL_GAS = np.array([235, 235, 235], dtype=np.float64)       # shrinkage gas: near-white
@@ -221,17 +222,20 @@ def central_slice_rgb(state: SimulationState) -> np.ndarray:
     """Central z-slice as an RGB8 image: clinker gray, unassigned inert filler
     green, hydrates orange, liquid blue, gas near-white (convex combination)."""
     from .registry import CLINKER_PHASE_IDS as _CLK
+    from .registry import SCM_PHASE_IDS as _SCM
     from .registry import SOLID_PHASE_IDS
     z = state.grid_size // 2
     clk = [SOLID_PHASE_IDS.index(p) for p in _CLK]
-    green = [i for i in range(len(SOLID_PHASE_IDS)) if i not in clk]  # SCM + inert
+    scm = [SOLID_PHASE_IDS.index(p) for p in _SCM]
+    other = [i for i in range(len(SOLID_PHASE_IDS)) if i not in clk + scm]
     anh = state.anhydrous_fraction[clk, z].sum(axis=0)
-    inert = state.anhydrous_fraction[green, z].sum(axis=0)
+    scm_f = state.anhydrous_fraction[scm, z].sum(axis=0)
+    inert = state.anhydrous_fraction[other, z].sum(axis=0)
     hyd = state.hydrate_fraction[:, z].sum(axis=0)
     liq = state.capillary_liquid[z]
     gas = state.capillary_gas[z]
-    img = (anh[..., None] * _COL_ANHYDROUS + inert[..., None] * _COL_INERT
-           + hyd[..., None] * _COL_HYDRATE
+    img = (anh[..., None] * _COL_ANHYDROUS + scm_f[..., None] * _COL_SCM
+           + inert[..., None] * _COL_INERT + hyd[..., None] * _COL_HYDRATE
            + liq[..., None] * _COL_LIQUID + gas[..., None] * _COL_GAS)
     return np.clip(np.rint(img), 0, 255).astype(np.uint8)
 

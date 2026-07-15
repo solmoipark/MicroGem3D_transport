@@ -31,7 +31,8 @@ WATER_RETARDATION_SLOPE = 3.333
 RH_CUTOFF = 0.55
 
 # SCM reaction schedules alpha(t) = D + (A - D) / (1 + (t/C)^B)^G, t in days
-# (PRD v2.1; parameters from InverseGems configs/scm_reaction.yaml)
+# (PRD v2.1; parameters from InverseGems configs/scm_reaction.yaml — the D here
+# is the REFERENCE-blend value, rescaled per recipe by the availability modifier)
 SCM_LOGISTIC_PRESETS: Dict[str, Tuple[float, float, float, float, float]] = {
     #             A     B      C     D     G
     "slag":        (0.0, 0.75, 20.0, 0.55, 1.0),
@@ -39,6 +40,43 @@ SCM_LOGISTIC_PRESETS: Dict[str, Tuple[float, float, float, float, float]] = {
     "metakaolin":  (0.0, 0.95, 5.0, 0.55, 1.0),
     "silica_fume": (0.0, 0.80, 3.0, 0.85, 1.0),
 }
+
+# CH-availability modifier (InverseGems configs/c3s_c2s_availability.yaml,
+# availability_modifier.py — ON by default in the source pipeline):
+# D_eff = clamp(min(absolute_max_D, D_ref * R^eta), 0, 1) with
+# R = availability(mix)/availability(reference), availability = supply/demand,
+# supply = C3S mass + 0.30 * C2S mass, demand = sum SCM mass * demand_coeff.
+SCM_C2S_WEIGHT = 0.30
+SCM_DEMAND_COEFF = {"slag": 0.35, "fly_ash": 0.75, "metakaolin": 1.00,
+                    "silica_fume": 1.20}
+SCM_ETA = {"slag": 0.35, "fly_ash": 0.60, "metakaolin": 0.90, "silica_fume": 1.00}
+SCM_ABSOLUTE_MAX_D = {"slag": 0.75, "fly_ash": 0.60, "metakaolin": 0.95,
+                      "silica_fume": 0.95}
+# reference system: OPC 60 / SCM 40 with InverseGems' default OPC Bogue
+# (C3S 66.219 %, C2S 8.3097 % of OPC): 60*(0.66219 + 0.3*0.083097)/40
+SCM_REFERENCE_AVAILABILITY = 60.0 * (0.66219 + SCM_C2S_WEIGHT * 0.083097) / 40.0
+
+
+def scm_effective_params(phase_mass_fractions: Dict[str, float]
+                         ) -> Dict[str, Tuple[float, float, float, float, float]]:
+    """Per-recipe SCM logistic parameters with the CH-availability-scaled D."""
+    from .registry import SCM_PHASE_IDS
+    present = {p: phase_mass_fractions.get(p, 0.0) for p in SCM_PHASE_IDS
+               if phase_mass_fractions.get(p, 0.0) > 0.0}
+    effective = dict(SCM_LOGISTIC_PRESETS)
+    if not present:
+        return effective
+    supply = (phase_mass_fractions.get("C3S", 0.0)
+              + SCM_C2S_WEIGHT * phase_mass_fractions.get("C2S", 0.0))
+    demand = sum(m * SCM_DEMAND_COEFF[p] for p, m in present.items())
+    r = 0.0
+    if demand > 0.0:
+        r = max(0.0, (supply / demand) / SCM_REFERENCE_AVAILABILITY)
+    for p in present:
+        a, b, c, d_ref, g = SCM_LOGISTIC_PRESETS[p]
+        d_eff = min(SCM_ABSOLUTE_MAX_D[p], d_ref * r ** SCM_ETA[p])
+        effective[p] = (a, b, c, max(0.0, min(1.0, d_eff)), g)
+    return effective
 
 
 def scm_alpha(t_days: float, params: Tuple[float, float, float, float, float]) -> float:
@@ -156,7 +194,10 @@ class ParrotKilloh:
         if self._weights.sum() <= 0.0:
             raise ValueError("P&K needs at least one kinetic phase with mass")
         self._n_clinker = len(CLINKER_PHASE_IDS)
-        self._scm_params = [SCM_LOGISTIC_PRESETS[pid] for pid in SCM_PHASE_IDS]
+        # availability-scaled D per SCM (recipe-dependent, InverseGems default)
+        effective = scm_effective_params(phase_mass_fractions)
+        self._scm_params = [effective[pid] for pid in SCM_PHASE_IDS]
+        self.scm_effective_d = {pid: effective[pid][3] for pid in SCM_PHASE_IDS}
 
     # -- correction factors ------------------------------------------------
     def humidity_factor(self) -> float:

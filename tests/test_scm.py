@@ -15,7 +15,8 @@ from pydantic import ValidationError
 from tinn import ledger
 from tinn.config import TinnConfig
 from tinn.engine import Engine
-from tinn.kinetics import SCM_LOGISTIC_PRESETS, ParrotKilloh, scm_alpha
+from tinn.kinetics import (SCM_LOGISTIC_PRESETS, ParrotKilloh,
+                           scm_alpha, scm_effective_params)
 from tinn.registry import (ATOMIC_MASS_G_MOL, CLINKER_PHASE_IDS, ELEMENT_IDS,
                            KINETIC_PHASE_IDS, RegistryError, SCM_PHASE_IDS,
                            default_registry, scm_entry)
@@ -82,6 +83,21 @@ def test_scm_alpha_anchors_match_inversegems():
     assert scm_alpha(1e6, fa) == pytest.approx(0.40, abs=1e-3)
 
 
+def test_availability_modifier_matches_inversegems_forward_run():
+    # OPC70/FA30: R = (0.46353 + 0.3*0.05817)/(0.30*0.75) / ref -> D_eff caps
+    # at the absolute max 0.60, and alpha(360 d) must reproduce the actual
+    # InverseGems forward run value 0.5522 (run_20260715_063106_3245d9c4)
+    eff = scm_effective_params(FA30)
+    assert eff["fly_ash"][3] == pytest.approx(0.60, rel=1e-12)
+    assert scm_alpha(360.0, eff["fly_ash"]) == pytest.approx(0.5522, abs=5e-4)
+    # a clinker-poor blend gets its ultimate degree scaled DOWN
+    lean = {"C3S": 0.13244, "C2S": 0.01662, "fly_ash": 0.80}
+    eff_lean = scm_effective_params(lean)
+    assert eff_lean["fly_ash"][3] < 0.20
+    # no SCM -> reference parameters untouched
+    assert scm_effective_params({"C3S": 1.0}) == SCM_LOGISTIC_PRESETS
+
+
 def test_blended_kinetics_clinker_unchanged_and_scm_filled():
     opc = {"C3S": 0.60, "C2S": 0.14, "C3A": 0.07, "C4AF": 0.10}
     pk_pure = ParrotKilloh("pk_elakneswaran_2018", 0.5, 293.15, 381.8, opc)
@@ -91,8 +107,8 @@ def test_blended_kinetics_clinker_unchanged_and_scm_filled():
     # clinker trajectories are identical (retardation uses clinker-only alpha)
     assert a_blend[:4] == pytest.approx(a_pure[:4], rel=1e-12)
     fa_i = KINETIC_PHASE_IDS.index("fly_ash")
-    assert a_blend[fa_i] == pytest.approx(scm_alpha(7.0, SCM_LOGISTIC_PRESETS["fly_ash"]),
-                                          rel=1e-12)
+    eff = scm_effective_params(FA30)["fly_ash"]
+    assert a_blend[fa_i] == pytest.approx(scm_alpha(7.0, eff), rel=1e-12)
     # phases with no mass have no target
     assert a_pure[fa_i] == 0.0
     assert a_blend[KINETIC_PHASE_IDS.index("slag")] == 0.0

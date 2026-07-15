@@ -82,7 +82,11 @@ class StoichiometricBackend:
         for phase_id, n_mol in released_mol.items():
             if n_mol <= 0.0:
                 continue
-            rule = self._rules[phase_id]
+            rule = self._rules.get(phase_id)
+            if rule is None:
+                raise RuntimeError(
+                    f"stoichiometric backend has no reaction rule for released "
+                    f"phase {phase_id!r} (SCM glasses require the gems3k backend)")
             water_need += n_mol * rule.water_mol
             for hid, coeff in rule.products.items():
                 totals[hid] = totals.get(hid, 0.0) + n_mol * coeff
