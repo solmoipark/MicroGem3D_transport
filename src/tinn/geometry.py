@@ -118,6 +118,74 @@ def _rasterize_sphere(center: np.ndarray, rv: float, n: int
     return wrapped, frac, deficit
 
 
+def _random_rotation(rng: np.random.Generator) -> np.ndarray:
+    """Uniform SO(3) rotation from a normalized random quaternion (seeded,
+    deterministic). Drawn ONLY for shaped materials so shape-free configs make
+    byte-identical RNG draws to the legacy path."""
+    q = rng.normal(size=4)
+    q /= np.linalg.norm(q)
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _rasterize_ellipsoid(center: np.ndarray, rv: float, ratios: np.ndarray,
+                         rot: np.ndarray, n: int
+                         ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Periodic rotated-ellipsoid rasterization (PRD 1.2 rev.2). `ratios` are
+    volume-normalized semi-axis ratios (product 1), so the ellipsoid volume
+    equals the volume-equivalent sphere's; same exact-boundary bookkeeping as
+    _rasterize_sphere. Interior/exterior classification uses the conservative
+    level-set bound |grad v| <= 1/s_min: anything uncertain goes through the
+    subsampled boundary path, which is exact in expectation."""
+    s = rv * ratios
+    r_max = float(s.max())
+    s_min = float(s.min())
+    lo = np.floor(center - r_max - _HALF_DIAG).astype(np.int64)
+    hi = np.floor(center + r_max + _HALF_DIAG).astype(np.int64) + 1
+    if np.any(hi - lo > n):
+        raise GeometryError(
+            f"particle with major semi-axis {r_max} voxels does not fit the "
+            f"periodic RVE")
+    axes = [np.arange(lo[a], hi[a]) for a in range(3)]
+    zz, yy, xx = np.meshgrid(*axes, indexing="ij")
+    idx = np.stack([zz, yy, xx], axis=-1).reshape(-1, 3)
+    # particle-frame coordinates y = R^T x, written as a broadcast product —
+    # np.matmul dispatches to delay-loaded BLAS, which faults in some conda
+    # numpy builds on Windows (0xc06d007f); a 3x3 rotation never needs BLAS
+    x = idx + 0.5 - center
+    y = (x[:, :, None] * rot[None, :, :]).sum(axis=1)
+    v = np.sqrt(((y / s) ** 2).sum(axis=1))
+
+    frac = np.zeros(len(idx))
+    margin = _HALF_DIAG / s_min
+    frac[v <= 1.0 - margin] = 1.0
+    bmask = (v > 1.0 - margin) & (v < 1.0 + margin)
+    if bmask.any():
+        off = (np.arange(_SUBSAMPLES) + 0.5) / _SUBSAMPLES
+        oz, oy, ox = np.meshgrid(off, off, off, indexing="ij")
+        offs = np.stack([oz, oy, ox], axis=-1).reshape(-1, 3)
+        pts = idx[bmask][:, None, :] + offs[None, :, :]
+        xb = pts - center
+        yb = (xb[:, :, :, None] * rot[None, None, :, :]).sum(axis=2)
+        inside = ((yb / s) ** 2).sum(axis=2) <= 1.0
+        raw = inside.mean(axis=1)
+        boundary_target = _sphere_volume(rv) - float((frac == 1.0).sum())
+        filled = _waterfill(raw, boundary_target, cap=1.0 - _CAPACITY_MARGIN)
+        frac[bmask] = filled
+        deficit = boundary_target - float(filled.sum())
+    else:
+        deficit = _sphere_volume(rv) - float(frac.sum())
+
+    keep = frac > 0.0
+    idx, frac = idx[keep], frac[keep]
+    wrapped = ((idx[:, 0] % n) * n + (idx[:, 1] % n)) * n + (idx[:, 2] % n)
+    return wrapped, frac, deficit
+
+
 def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
     n = config.rve.grid_size
     h = config.rve.voxel_size_um
@@ -155,6 +223,12 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
             w[SOLID_PHASE_IDS.index(sid)] = 1.0
             materials.append((sid, w, v_solid_target * (vol_g[sid] / v_solid),
                               psd_map.get(sid, config.psd)))
+    # per-material shape (PRD 1.2 rev.2): normalized semi-axis ratios, or None
+    # for spheres — shape-free materials draw no extra RNG numbers
+    shape_map = config.material_shape or {}
+    mat_shape = [np.asarray(shape_map[name].normalized_axes())
+                 if name in shape_map else None
+                 for name, _, _, _ in materials]
 
     # --- sample particle sizes per material, per PSD bin (coarse -> fine,
     # carrying residual within the material) ---
@@ -250,9 +324,15 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
             p_placed[i] = True
         else:
             p_tier[i] = TIER_RESOLVED
+            shape = mat_shape[p_material[i]]
             for _ in range(_MAX_PLACEMENT_TRIES):
                 center = rng.uniform(0.0, n, 3)
-                widx, frac, deficit = _rasterize_sphere(center, rv, n)
+                if shape is None:
+                    widx, frac, deficit = _rasterize_sphere(center, rv, n)
+                else:
+                    rot = _random_rotation(rng)
+                    widx, frac, deficit = _rasterize_ellipsoid(
+                        center, rv, shape, rot, n)
                 cur = occ_flat[widx]
                 interior = frac == 1.0
                 ok = np.all(cur[interior] == 0.0) and np.all(

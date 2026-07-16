@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -273,6 +273,29 @@ class ScheduleConfig(BaseModel):
         return self
 
 
+class ParticleShape(BaseModel):
+    """Per-material particle shape (PRD 1.2 rev.2). Semi-axis ratios a:b:c on
+    any positive scale — rasterization volume-normalizes them (abc -> 1) so
+    the PSD keeps its volume-equivalent-diameter meaning. Orientation is
+    sampled uniformly per particle from the seeded RNG."""
+    model_config = _STRICT
+    kind: Literal["ellipsoid"] = "ellipsoid"
+    aspects: Tuple[float, float, float]
+
+    @model_validator(mode="after")
+    def _check(self) -> "ParticleShape":
+        if any(a <= 0.0 for a in self.aspects):
+            raise ValueError("shape aspects must all be positive")
+        return self
+
+    def normalized_axes(self) -> Tuple[float, float, float]:
+        g = (self.aspects[0] * self.aspects[1] * self.aspects[2]) ** (1.0 / 3.0)
+        return (self.aspects[0] / g, self.aspects[1] / g, self.aspects[2] / g)
+
+    def elongation(self) -> float:
+        return max(self.normalized_axes())
+
+
 class TinnConfig(BaseModel):
     model_config = _STRICT
     binder: BinderRecipe
@@ -281,6 +304,10 @@ class TinnConfig(BaseModel):
     # or an SCM id present in the recipe; materials absent from the map use
     # `psd`. None keeps every legacy config (and its hash) unchanged.
     material_psd: Optional[Dict[str, PSD]] = None
+    # per-material particle shapes (PRD 1.2 rev.2): same keys as material_psd;
+    # materials absent from the map stay spherical. None keeps every earlier
+    # config (and its hash, and its RNG stream) unchanged.
+    material_shape: Optional[Dict[str, ParticleShape]] = None
     w_c: float = Field(gt=0.0, le=2.0)
     temperature_K: float = Field(ge=273.15, le=372.15)
     kinetics: KineticsConfig
@@ -313,6 +340,26 @@ class TinnConfig(BaseModel):
                 if key != "clinker" and self.binder.mass_fractions.get(key, 0.0) <= 0.0:
                     raise ValueError(
                         f"material_psd[{key!r}] given but the recipe has no {key} mass")
+        if self.material_shape is not None:
+            allowed = {"clinker", *SCM_PHASE_IDS}
+            unknown = set(self.material_shape) - allowed
+            if unknown:
+                raise ValueError(
+                    f"unknown material_shape keys {sorted(unknown)}; allowed: "
+                    f"{sorted(allowed)}")
+            for key, shape in self.material_shape.items():
+                if key != "clinker" and self.binder.mass_fractions.get(key, 0.0) <= 0.0:
+                    raise ValueError(
+                        f"material_shape[{key!r}] given but the recipe has no "
+                        f"{key} mass")
+                # the LONGEST semi-axis is what must fit the periodic RVE
+                psd_eff = (self.material_psd or {}).get(key, self.psd)
+                d_eff = psd_eff.d_max_um * shape.elongation()
+                if d_eff > d_max_allowed_um:
+                    raise ValueError(
+                        f"material_shape[{key!r}] stretches the largest particle "
+                        f"to {d_eff:.3f} um along its major axis, exceeding the "
+                        f"rasterizable maximum {d_max_allowed_um:.3f} um")
         active = {p for p, f in self.binder.mass_fractions.items() if f > 0.0}
         if self.kinetics.kind == "tabulated":
             missing = active - set(self.kinetics.table.alpha)
@@ -353,6 +400,9 @@ class TinnConfig(BaseModel):
         # config keeps its hash
         if payload.get("material_psd") is None:
             payload.pop("material_psd", None)
+        # same contract for material_shape (rev.2)
+        if payload.get("material_shape") is None:
+            payload.pop("material_shape", None)
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

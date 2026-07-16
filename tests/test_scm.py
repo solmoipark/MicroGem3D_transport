@@ -234,6 +234,20 @@ def test_material_psd_schema_validation():
     raw["material_psd"] = {"fly_ash": big}
     with pytest.raises(ValidationError, match="rasterizable"):
         TinnConfig.model_validate(raw)
+    # material_shape (PRD 1.2 rev.2): same key discipline + fit checks
+    raw = _blend_raw()
+    raw["material_shape"] = {"bogus": {"aspects": [1.5, 1.0, 0.7]}}
+    with pytest.raises(ValidationError, match="material_shape"):
+        TinnConfig.model_validate(raw)
+    raw = _blend_raw()
+    raw["material_shape"] = {"clinker": {"aspects": [1.5, 1.0, -0.7]}}
+    with pytest.raises(ValidationError, match="positive"):
+        TinnConfig.model_validate(raw)
+    raw = _blend_raw()
+    # elongation stretches the largest grain past the periodic RVE
+    raw["material_shape"] = {"clinker": {"aspects": [40.0, 1.0, 1.0]}}
+    with pytest.raises(ValidationError, match="major axis"):
+        TinnConfig.model_validate(raw)
 
 
 def test_config_hash_stable_without_material_psd():
@@ -245,6 +259,13 @@ def test_config_hash_stable_without_material_psd():
     raw3 = dict(raw)
     raw3["material_psd"] = {"fly_ash": SLAG_PSD}
     assert TinnConfig.model_validate(raw3).config_hash() != h0
+    # material_shape follows the same hash contract (rev.2)
+    raw4 = dict(raw)
+    raw4["material_shape"] = None
+    assert TinnConfig.model_validate(raw4).config_hash() == h0
+    raw5 = dict(raw)
+    raw5["material_shape"] = {"clinker": {"aspects": [1.5, 1.0, 0.7]}}
+    assert TinnConfig.model_validate(raw5).config_hash() != h0
 
 
 def test_geometry_legacy_bitwise_unchanged():
@@ -298,3 +319,26 @@ def test_geometry_per_material_determinism_and_conservation():
     # voxel identity with two populations
     total = a.anhydrous_fraction.sum(axis=0) + a.capillary_liquid + a.capillary_gas
     assert np.max(np.abs(total - 1.0)) <= 1e-12
+    # ellipsoid rasterizer (PRD 1.2 rev.2): volume-exact bookkeeping and the
+    # requested anisotropy, axis-aligned reference case
+    from tinn.geometry import _rasterize_ellipsoid, _sphere_volume
+    rv = 4.0
+    ratios = np.array([2.0, 1.0, 0.5])   # product 1 -> volume preserved
+    widx, frac, deficit = _rasterize_ellipsoid(
+        np.array([16.0, 16.0, 16.0]), rv, ratios, np.eye(3), 32)
+    assert float(frac.sum()) + deficit == pytest.approx(_sphere_volume(rv), rel=1e-9)
+    zz, yy, xx = np.unravel_index(widx, (32, 32, 32))
+    assert (zz.max() - zz.min() + 1) >= 2 * (xx.max() - xx.min() + 1) - 2
+    # shaped blend RVE: deterministic, conserving, and clinker grains are
+    # actually elongated while spherical fly ash stays untouched
+    raw = _blend_raw()
+    raw["material_shape"] = {"clinker": {"aspects": [1.6, 1.0, 0.7]}}
+    from tinn.geometry import initialize_rve
+    s1 = initialize_rve(TinnConfig.model_validate(raw), REG)
+    s2 = initialize_rve(TinnConfig.model_validate(raw), REG)
+    assert s1.dense_hash() == s2.dense_hash()
+    total = s1.anhydrous_fraction.sum(axis=0) + s1.capillary_liquid + s1.capillary_gas
+    assert np.max(np.abs(total - 1.0)) <= 1e-12
+    for row in s1.report["materials"].values():
+        assert row["rel_error"] <= 0.02, row
+    assert s1.dense_hash() != a.dense_hash()  # shape actually changes structure
