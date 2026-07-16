@@ -168,11 +168,15 @@ def test_0d_probe_opc_four_phase(worker):
 
 # ---------------- config / scope ----------------
 
-def test_config_gems3k_requires_bundle():
+def test_config_gems3k_default_bundle_and_field_scoping():
+    from tinn.config import DEFAULT_GEMS_BUNDLE_LST
     raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(encoding="utf-8"))
+    # omitted bundle -> vendored CNASH default (PRD 1.2 rev.2), still overridable
     raw["chemistry"] = {"backend": "gems3k"}
-    with pytest.raises(ValidationError):
-        TinnConfig.model_validate(raw)
+    cfg = TinnConfig.model_validate(raw)
+    assert cfg.chemistry.gems_bundle_lst == DEFAULT_GEMS_BUNDLE_LST
+    raw["chemistry"] = {"backend": "gems3k", "gems_bundle_lst": str(BUNDLE)}
+    assert TinnConfig.model_validate(raw).chemistry.gems_bundle_lst == str(BUNDLE)
     raw["chemistry"] = {"backend": "stoichiometric",
                         "gems_bundle_lst": str(BUNDLE)}
     with pytest.raises(ValidationError):

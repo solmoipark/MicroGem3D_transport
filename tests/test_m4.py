@@ -63,10 +63,27 @@ def gems_run(tmp_path_factory):
 # ---------------- GemsBackend unit ----------------
 
 @needs_gems
-def test_backend_channels_exclude_clinker_and_fluids(gems_backend):
+def test_backend_channels_exclude_clinker_and_fluids(gems_backend, tmp_path):
     ids = set(gems_backend.hydrate_ids)
     assert {"CSHQ", "Portlandite", "C3AH6", "ettringite"} <= ids
     assert not ids & {"Alite", "Belite", "Aluminate", "Ferrite", "aq_gen", "gas_gen"}
+    # default CNASH bundle (hydrates-only, no clinker phases): channels adapt,
+    # suppression list collapses to the bundle's actual phases (here: none),
+    # and a react still closes
+    from tinn.config import DEFAULT_GEMS_BUNDLE_LST
+    from tinn.gems import GemsBackend, GemsWorker
+    w = GemsWorker(str(REPO / DEFAULT_GEMS_BUNDLE_LST),
+                   python_executable=str(GEMS_PYTHON), work_root=str(tmp_path))
+    b = GemsBackend(w, 293.15)
+    ids2 = set(b.hydrate_ids)
+    assert {"CNASH", "Portlandite", "C4AH19", "ettringite"} <= ids2
+    assert "CSHQ" not in ids2 and not ids2 & {"aq_gen", "gas_gen"}
+    assert b._suppressed == ()
+    inv = np.zeros(len(ELEMENT_IDS))
+    r = b.react(_release(), 6e-10, inv)
+    assert r.status == "ok"
+    assert any(p.phase_id == "CNASH" for p in r.parcels)
+    w.close()
 
 
 def _release():
@@ -214,9 +231,16 @@ def test_gems_run_restart_bitwise(gems_run):
 # ---------------- config (runs everywhere) ----------------
 
 def test_config_gems_gel_porosity_defaults_and_validation():
+    from tinn.config import DEFAULT_GEMS_GEL_POROSITY
     raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(encoding="utf-8"))
     cfg = TinnConfig.model_validate(raw)
-    assert cfg.chemistry.gems_gel_porosity == {"CSHQ": 0.28}
+    assert cfg.chemistry.gems_gel_porosity == DEFAULT_GEMS_GEL_POROSITY
+    # legacy hash compatibility: the filled default hashes as the pre-CNASH
+    # form, so a config that omitted the map keeps its pre-rev.2 config_hash
+    # (old checkpoints stay restartable)
+    raw_leg = json.loads(json.dumps(raw))
+    raw_leg["chemistry"]["gems_gel_porosity"] = {"CSHQ": 0.28}
+    assert TinnConfig.model_validate(raw_leg).config_hash() == cfg.config_hash()
     raw["chemistry"]["gems_gel_porosity"] = {"CSHQ": 1.5}
     with pytest.raises(ValidationError):
         TinnConfig.model_validate(raw)

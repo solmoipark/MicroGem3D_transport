@@ -199,12 +199,20 @@ def _check_rule_element_balance(phase_id: str, rule: ReactionRule) -> None:
             )
 
 
+DEFAULT_GEMS_BUNDLE_LST = "gems_bundles/CNASH/Test-dat.lst"
+# declared gel porosity of the C-S-H solid solutions (both models treated
+# alike); legacy configs that omitted the map hashed the pre-CNASH form, so
+# config_hash canonicalizes this exact map back to it (see config_hash)
+DEFAULT_GEMS_GEL_POROSITY = {"CSHQ": 0.28, "CNASH": 0.28}
+_LEGACY_GEL_POROSITY_HASH_FORM = {"CSHQ": 0.28}
+
+
 class ChemistryConfig(BaseModel):
     model_config = _STRICT
     backend: Literal["stoichiometric", "gems3k"]
     # None for gems3k (kept out of config_hash); defaults filled for stoichiometric.
     stoichiometric_rules: Optional[Dict[str, ReactionRule]] = None
-    gems_bundle_lst: Optional[str] = None      # path to PC-dat.lst
+    gems_bundle_lst: Optional[str] = None      # default: CNASH Test bundle
     gems_worker_python: Optional[str] = None   # interpreter with xgems installed
     # declared gel porosity per GEMS solid phase; phases absent from the map are
     # crystalline (0.0). GEMS volumes are solid skeletons; envelope = skel/(1-eps).
@@ -216,9 +224,9 @@ class ChemistryConfig(BaseModel):
             if self.stoichiometric_rules is not None:
                 raise ValueError("gems3k backend does not take stoichiometric_rules")
             if not self.gems_bundle_lst:
-                raise ValueError("gems3k backend requires gems_bundle_lst")
+                self.gems_bundle_lst = DEFAULT_GEMS_BUNDLE_LST
             if self.gems_gel_porosity is None:
-                self.gems_gel_porosity = {"CSHQ": 0.28}
+                self.gems_gel_porosity = dict(DEFAULT_GEMS_GEL_POROSITY)
             for phase, eps in self.gems_gel_porosity.items():
                 if not (0.0 <= eps < 1.0):
                     raise ValueError(f"gel porosity of {phase} must be in [0, 1)")
@@ -332,6 +340,12 @@ class TinnConfig(BaseModel):
         # (override at runtime with the TINN_GEMS_PYTHON environment variable)
         if payload.get("chemistry"):
             payload["chemistry"].pop("gems_worker_python", None)
+            # legacy hash compatibility: configs that omit the gel-porosity map
+            # hashed the pre-CNASH default, and the CNASH entry is inert for
+            # bundles without that phase — canonicalize the built-in default
+            # back to the legacy form so every old checkpoint stays restartable
+            if payload["chemistry"].get("gems_gel_porosity") == DEFAULT_GEMS_GEL_POROSITY:
+                payload["chemistry"]["gems_gel_porosity"] = dict(_LEGACY_GEL_POROSITY_HASH_FORM)
         # absent material_psd stays out of the payload so every pre-v2.2
         # config keeps its hash
         if payload.get("material_psd") is None:

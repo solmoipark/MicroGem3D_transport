@@ -393,6 +393,11 @@ class GemsBackend:
             raise GemsError(f"bundle lacks ledger elements: {missing}", kind="config")
         excluded = set(SUPPRESSED_CLINKER_PHASES) | {AQUEOUS_PHASE, GAS_PHASE}
         self.hydrate_ids = tuple(p for p in info["phase_names"] if p not in excluded)
+        # suppress only the clinker phases this bundle actually declares — a
+        # hydrates-only bundle (e.g. CNASH Test) has none, and the worker
+        # hard-errors on unknown suppression names by design (typo guard)
+        self._suppressed = tuple(p for p in SUPPRESSED_CLINKER_PHASES
+                                 if p in set(info["phase_names"]))
         reg = default_registry()
         self._formula_vec = {p: element_vector(reg.get(p).formula, 1.0)
                              for p in KINETIC_PHASE_IDS}
@@ -442,7 +447,8 @@ class GemsBackend:
             r = self._memo[memo_key]
         else:
             try:
-                r = self._worker.equilibrate_elements(scaled, self.temperature_k)
+                r = self._worker.equilibrate_elements(
+                    scaled, self.temperature_k, suppressed_phases=self._suppressed)
             except GemsError as e:
                 if e.kind in ("nonconvergence", "timeout"):
                     raise BackendTransientError(str(e)) from e
@@ -539,6 +545,8 @@ def run_0d_probe(config, worker: GemsWorker,
 
     reg = default_registry()
     kin = make_kinetics(config)
+    present = set(worker.info()["phase_names"])
+    suppressed = tuple(p for p in SUPPRESSED_CLINKER_PHASES if p in present)
     times = list(times_h if times_h is not None else config.schedule.output_times_h)
     n0 = {p: config.binder.mass_fractions.get(p, 0.0) / reg.get(p).molar_mass_g_mol
           for p in KINETIC_PHASE_IDS}  # mol per g binder
@@ -557,7 +565,8 @@ def run_0d_probe(config, worker: GemsWorker,
         for el, count in reg.get("H2O").formula.items():
             elements[el] = elements.get(el, 0.0) + water_mol * count
 
-        result = worker.equilibrate_elements(elements, config.temperature_K)
+        result = worker.equilibrate_elements(elements, config.temperature_K,
+                                             suppressed_phases=suppressed)
         rows.append({
             "time_h": t,
             "alpha": {p: float(alpha[k]) for k, p in enumerate(KINETIC_PHASE_IDS)},
