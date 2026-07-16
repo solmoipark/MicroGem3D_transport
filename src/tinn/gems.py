@@ -705,6 +705,22 @@ def _worker_execute(request: Mapping) -> Dict:
             if aqueous_h2o is None:
                 raise ValueError("aqueous phase lacks the H2O@ solvent species")
 
+    # some bundles report zero phase volume for phases holding a positive
+    # amount (observed: single-DC solids in the CNASH Test bundle; InverseGems
+    # works around the same defect as "reconstructed_from_phase_species").
+    # Rebuild those volumes from species amounts x standard molar volumes —
+    # both from the same engine, so no external constants enter the ledger.
+    phase_volumes = _mapping("phase_volumes")
+    species_mv = {str(k): float(v)
+                  for k, v in engine.species_molar_volumes.items()}
+    for phase_name, total in phase_amounts.items():
+        if phase_name in (AQUEOUS_PHASE, GAS_PHASE):
+            continue
+        if total > 0.0 and phase_volumes.get(phase_name, 0.0) == 0.0:
+            sp = engine.phase_species_amounts(phase_name)
+            phase_volumes[phase_name] = float(
+                sum(float(n) * species_mv[str(dc)] for dc, n in sp.items()))
+
     result = {
         "ok": True,
         "status": status,
@@ -712,7 +728,7 @@ def _worker_execute(request: Mapping) -> Dict:
         "ionic_strength": _nullable(engine.IS),
         "phase_amounts_mol": phase_amounts,
         "phase_masses_kg": _mapping("phase_masses"),
-        "phase_volumes_m3": _mapping("phase_volumes"),
+        "phase_volumes_m3": phase_volumes,
         "phase_elements_mol": phase_elements,
         "aqueous_h2o_mol": aqueous_h2o,
         "element_input": element_input,

@@ -5,3 +5,5 @@ model_outputs/
 runs/
 *.egg-info/
 .gems_runs/
+ipmlog.txt
+xGEMS.log
