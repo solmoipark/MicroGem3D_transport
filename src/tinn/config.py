@@ -246,8 +246,11 @@ class ChemistryConfig(BaseModel):
 
 class RVEConfig(BaseModel):
     model_config = _STRICT
-    grid_size: Literal[32, 64]
-    voxel_size_um: float = Field(ge=0.5, le=1.0)
+    # 128^3 @ 0.25 um serves the resolution-convergence track (PRD 1.2 rev.2);
+    # below ~0.1 um voxels the capillary/gel-pore split would double-count
+    # C-S-H gel porosity, so finer grids are out of scope by design
+    grid_size: Literal[32, 64, 128]
+    voxel_size_um: float = Field(ge=0.25, le=1.0)
     seed: int = Field(ge=0)
 
 
