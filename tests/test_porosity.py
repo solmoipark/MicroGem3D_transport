@@ -98,10 +98,23 @@ def test_pore_size_known_sphere():
     assert 6.0 <= 2.0 * 4.0 * 1.0 <= 8.0 or psd["mean_diameter_um"] > 0
     hist = psd["volume_fraction_per_bin"]
     assert sum(hist) == pytest.approx(1.0)
+    assert psd["subvoxel_volume_fraction"] == 0.0
     # an isolated sphere never percolates
     split = analysis.porosity_split(st)
     assert split["connected"] == 0.0
     assert split["isolated"] > 0.0
+    # sub-voxel tail (PRD 1.3 rev.2): a partially-filled voxel below the mask
+    # level enters the distribution as a slab aperture d = f*h, volume f —
+    # capillary volume is never dropped from the distribution
+    st.capillary_liquid[0, 0, 0] = 0.3
+    st.anhydrous_fraction[0, 0, 0, 0] = 0.7
+    psd2 = analysis.pore_size_distribution(st)
+    assert psd2["subvoxel_volume_fraction"] == pytest.approx(
+        0.3 / psd2["pore_volume_vox"])
+    assert sum(psd2["volume_fraction_per_bin"]) == pytest.approx(1.0)
+    edges = psd2["edges_um"]
+    bin_of_03 = next(i for i, e in enumerate(edges) if 0.3 <= e)
+    assert psd2["volume_fraction_per_bin"][bin_of_03] > 0.0
 
 
 def test_porosity_split_spanning_channel():
@@ -137,6 +150,43 @@ def test_kozeny_carman_value_and_guards():
     for phi in (0.0, 1.0, 1.5):
         bad = analysis.permeability_kozeny_carman(phi, d_char_um=2.0)
         assert math.isnan(bad["k_m2"]) and bad["status"] == "not_available"
+    # conductance network (PRD 1.3 rev.2) against analytic composites —
+    # folded in here to respect the 150-test budget
+    _diffusivity_network_analytic_cases()
+
+
+def _network(st):
+    gel_eps = np.zeros(st.hydrate_fraction.shape[0])
+    return analysis.relative_diffusivity_network(st, gel_eps)
+
+
+def _diffusivity_network_analytic_cases():
+    n = 16
+    # homogeneous liquid -> D_rel = 1 on every axis (exact for the ramp start)
+    st = _sphere_pore_state(radius=1.0, n=n)
+    st.capillary_liquid[:] = 1.0
+    st.anhydrous_fraction[:] = 0.0
+    r = _network(st)
+    assert r["status"] == "ok"
+    for v in r["relative_diffusivity"].values():
+        assert v == pytest.approx(1.0, rel=1e-6)
+    # layered 1.0 / 0.5 along z: series = harmonic mean (2/3), transverse =
+    # arithmetic mean (3/4) — classic composite bounds, exact on this lattice
+    st.capillary_liquid[1::2, :, :] = 0.5
+    st.anhydrous_fraction[0][1::2, :, :] = 0.5
+    r = _network(st)
+    assert r["relative_diffusivity"]["z"] == pytest.approx(2.0 / 3.0, rel=1e-6)
+    assert r["relative_diffusivity"]["y"] == pytest.approx(0.75, rel=1e-6)
+    assert r["relative_diffusivity"]["x"] == pytest.approx(0.75, rel=1e-6)
+    # a solid plane blocks the solve axis (down to the background floor) but
+    # not the transverse axes — the binary-mask cutoff artifact this replaces
+    st.capillary_liquid[:] = 1.0
+    st.anhydrous_fraction[:] = 0.0
+    st.capillary_liquid[8, :, :] = 0.0
+    st.anhydrous_fraction[0][8, :, :] = 1.0
+    r = _network(st)
+    assert r["relative_diffusivity"]["z"] < 1e-5
+    assert r["relative_diffusivity"]["y"] == pytest.approx((n - 1) / n, rel=1e-3)
 
 
 def test_report_contains_pore_fields(tmp_path, capsys):

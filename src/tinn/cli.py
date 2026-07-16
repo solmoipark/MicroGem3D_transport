@@ -107,11 +107,15 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
 
 
 def _report(run_dir: str, out_dir: Optional[str],
-            kc_constant_m2: Optional[float] = None) -> int:
-    from .analysis import report
+            kc_constant_m2: Optional[float] = None,
+            gel_rel_diffusivity: Optional[float] = None) -> int:
+    from .analysis import GEL_REL_DIFFUSIVITY, report
     from .storage import StorageError
     try:
-        result = report(run_dir, out_dir, kc_constant_m2=kc_constant_m2)
+        result = report(run_dir, out_dir, kc_constant_m2=kc_constant_m2,
+                        gel_rel_diffusivity=(GEL_REL_DIFFUSIVITY
+                                             if gel_rel_diffusivity is None
+                                             else gel_rel_diffusivity))
     except (FileNotFoundError, StorageError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -120,8 +124,10 @@ def _report(run_dir: str, out_dir: Optional[str],
     for row in result["outputs"]:
         perc = "percolating" if row["percolation"]["any"] else "isolated"
         viol = f" VIOLATIONS: {row['ledger_violations']}" if row["ledger_violations"] else ""
+        dn = row.get("diffusivity_network", {})
+        drel = (f"  D_rel={dn['mean']:.3e}" if dn.get("status") == "ok" else "")
         print(f"  t={row['time_h']:9.3f} h  cap.por={row['porosity_capillary']:.4f}  "
-              f"tot.por={row['porosity_total']:.4f}  liquid {perc}  "
+              f"tot.por={row['porosity_total']:.4f}  liquid {perc}{drel}  "
               f"[{row['slice_png']}]{viol}")
     band = result["sanity_band"]
     n_warn = sum(1 for c in band["checks"] if c["status"] == "warn")
@@ -149,6 +155,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_rep.add_argument("--out", default=None, help="output directory (default: the run directory)")
     p_rep.add_argument("--kc-constant-m2", type=float, default=None,
                        help="Kozeny-Carman C override (default: d_mean^2/180)")
+    p_rep.add_argument("--gel-rel-diffusivity", type=float, default=None,
+                       help="C-S-H relative diffusivity for the conductance "
+                            "network (default 0.0025, Garboczi-Bentz)")
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
@@ -157,7 +166,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run(args.config_path, args.out)
     if args.command == "restart":
         return _restart(args.checkpoint_path, args.out)
-    return _report(args.run_dir, args.out, args.kc_constant_m2)
+    return _report(args.run_dir, args.out, args.kc_constant_m2,
+                   args.gel_rel_diffusivity)
 
 
 if __name__ == "__main__":

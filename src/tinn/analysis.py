@@ -203,23 +203,43 @@ def periodic_edt_um(pore_mask: np.ndarray, voxel_um: float) -> np.ndarray:
 
 
 def pore_size_distribution(state: SimulationState) -> Dict:
-    """EDT-based local pore diameters over the capillary pore mask: volume
-    fraction per diameter bin and the volume-weighted mean diameter."""
-    mask = (state.capillary_liquid + state.capillary_gas) >= PORE_MASK_LEVEL
+    """Local pore diameters, VOLUME-weighted (PRD 1.3 rev.2): voxels in the
+    resolved pore mask carry their EDT diameter and their actual capillary
+    volume; partially-filled voxels below the mask level — invisible to a
+    binary analysis — enter as a sub-voxel tail with the slab-aperture
+    approximation d = f*h (pore volume fraction f flattened against the local
+    solid interface). Nothing of the capillary volume is dropped from the
+    distribution any more."""
+    cap = state.capillary_liquid + state.capillary_gas
+    mask = cap >= PORE_MASK_LEVEL
     n_pore = int(mask.sum())
-    if n_pore == 0:
+    total_vol = float(cap.sum())
+    if total_vol <= 0.0:
         return {"edges_um": [], "volume_fraction_per_bin": [],
-                "mean_diameter_um": 0.0, "pore_voxels": 0}
+                "mean_diameter_um": 0.0, "pore_voxels": 0,
+                "pore_volume_vox": 0.0, "subvoxel_volume_fraction": 0.0}
     h = state.config.rve.voxel_size_um
-    dist = periodic_edt_um(mask, h)
-    diam = 2.0 * dist[mask]
-    edges = [h * m for m in (1, 2, 4, 8, 16, 32)]
-    hist, _ = np.histogram(diam, bins=[0.0] + edges)
+    if n_pore > 0:
+        dist = periodic_edt_um(mask, h)
+        diam_res = 2.0 * dist[mask]
+        w_res = cap[mask]
+    else:
+        diam_res = np.zeros(0)
+        w_res = np.zeros(0)
+    sub = (~mask) & (cap > 0.0)
+    diam_sub = cap[sub] * h          # slab aperture, always < h/2
+    w_sub = cap[sub]
+    diam = np.concatenate([diam_res, diam_sub])
+    w = np.concatenate([w_res, w_sub])
+    edges = [h * m for m in (0.25, 0.5, 1, 2, 4, 8, 16, 32)]
+    hist, _ = np.histogram(diam, bins=[0.0] + edges, weights=w)
     return {
         "edges_um": edges,
-        "volume_fraction_per_bin": (hist / n_pore).tolist(),
-        "mean_diameter_um": float(diam.mean()),
+        "volume_fraction_per_bin": (hist / total_vol).tolist(),
+        "mean_diameter_um": float((diam * w).sum() / total_vol),
         "pore_voxels": n_pore,
+        "pore_volume_vox": total_vol,
+        "subvoxel_volume_fraction": float(w_sub.sum() / total_vol),
     }
 
 
@@ -264,6 +284,102 @@ def permeability_kozeny_carman(phi_connected: float, d_char_um: float,
     k = c * phi_connected ** 3 / (1.0 - phi_connected) ** 2
     return {"k_m2": k, "status": "ok", "C_m2": c, "formula": formula,
             "phi_connected": phi_connected}
+
+
+# C-S-H (incl. its gel water) relative ion diffusivity vs bulk solution —
+# Garboczi & Bentz calibration against steady-state chloride diffusion;
+# report-time override via `tinn report --gel-rel-diffusivity`
+GEL_REL_DIFFUSIVITY = 0.0025
+# uniform background conductance: keeps the CG system nonsingular and bounds
+# its contrast; also the resolution floor of the reported D_rel values
+NETWORK_FLOOR = 1e-8
+
+
+def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
+                                 gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY,
+                                 tol: float = 1e-10, max_iter: int = 50000) -> Dict:
+    """Effective relative diffusivity D_eff/D0 per axis from a face-conductance
+    network over the FRACTIONAL fields (PRD 1.3 rev.2) — the two-scale
+    composite view: capillary liquid conducts at 1, gel-bearing hydrate volume
+    at gel_rel_diffusivity, everything else at the background floor. Unlike the
+    binary 0.5-mask percolation, sub-mask liquid slivers and gel water keep
+    conducting, so late-age transport does not artificially cut off at the
+    voxel resolution. Harmonic-mean face conductances; Dirichlet inlet/outlet
+    on the solve axis, periodic transverse; Jacobi-preconditioned CG
+    (deterministic: fixed operation order, fixed tolerance)."""
+    g = state.capillary_liquid.astype(np.float64).copy()
+    for i in range(state.hydrate_fraction.shape[0]):
+        if gel_eps[i] > 0.0:
+            g += gel_rel_diffusivity * state.hydrate_fraction[i]
+    g = np.maximum(np.clip(g, 0.0, None), NETWORK_FLOOR)
+    n = g.shape[0]
+
+    def harm(a, b):
+        return 2.0 * a * b / (a + b)
+
+    axes: Dict[str, float] = {}
+    iters: Dict[str, int] = {}
+    status = "ok"
+    for ax, name in enumerate(("z", "y", "x")):
+        ga = np.ascontiguousarray(np.moveaxis(g, ax, 0))
+        gz = harm(ga[:-1], ga[1:])
+        gy = harm(ga, np.roll(ga, -1, axis=1))
+        gx = harm(ga, np.roll(ga, -1, axis=2))
+        gin = 2.0 * ga[0]
+        gout = 2.0 * ga[-1]
+        diag = np.zeros_like(ga)
+        diag[:-1] += gz
+        diag[1:] += gz
+        diag += gy + np.roll(gy, 1, axis=1)
+        diag += gx + np.roll(gx, 1, axis=2)
+        diag[0] += gin
+        diag[-1] += gout
+
+        def apply_a(phi):
+            out = diag * phi
+            out[:-1] -= gz * phi[1:]
+            out[1:] -= gz * phi[:-1]
+            out -= gy * np.roll(phi, -1, axis=1)
+            out -= np.roll(gy, 1, axis=1) * np.roll(phi, 1, axis=1)
+            out -= gx * np.roll(phi, -1, axis=2)
+            out -= np.roll(gx, 1, axis=2) * np.roll(phi, 1, axis=2)
+            return out
+
+        b = np.zeros_like(ga)
+        b[0] = gin  # Dirichlet phi=1 upstream, phi=0 downstream
+        # linear-ramp start: exact for a homogeneous medium
+        phi = np.broadcast_to(((n - 0.5 - np.arange(n)) / n)[:, None, None],
+                              ga.shape).copy()
+        r = b - apply_a(phi)
+        z = r / diag
+        p = z.copy()
+        rz = float((r * z).sum())
+        b_norm = float(np.sqrt((b * b).sum()))
+        it = 0
+        converged = float(np.sqrt((r * r).sum())) <= tol * b_norm
+        while not converged and it < max_iter:
+            it += 1
+            ap = apply_a(p)
+            alpha = rz / float((p * ap).sum())
+            phi += alpha * p
+            r -= alpha * ap
+            if float(np.sqrt((r * r).sum())) <= tol * b_norm:
+                converged = True
+                break
+            z = r / diag
+            rz_new = float((r * z).sum())
+            p = z + (rz_new / rz) * p
+            rz = rz_new
+        if not converged:
+            status = "not_converged"
+        flux = float((gin * (1.0 - phi[0])).sum())
+        axes[name] = flux / n
+        iters[name] = it
+    return {"relative_diffusivity": axes,
+            "mean": float(np.mean(list(axes.values()))),
+            "gel_rel_diffusivity": gel_rel_diffusivity,
+            "background_floor": NETWORK_FLOOR,
+            "cg_iterations": iters, "status": status}
 
 
 # ------------------------------------------------------------- §6.3 judgment
@@ -314,7 +430,7 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
             add("cluster_ph_band_12.4_13.9",
                 all(12.4 <= p <= 13.9 for p in phs), [min(phs), max(phs)])
     return {
-        "note": ("physical plausibility bands (PRD 6.3), pass/warn only — "
+        "note": ("physical plausibility bands (PRD 6.3), pass/warn only - "
                  "this is not scientific validation"),
         "checks": checks,
     }
@@ -373,7 +489,8 @@ def central_slice_rgb(state: SimulationState) -> np.ndarray:
 
 def report(run_dir: str, out_dir: Optional[str] = None,
            registry: Optional[Registry] = None,
-           kc_constant_m2: Optional[float] = None) -> Dict:
+           kc_constant_m2: Optional[float] = None,
+           gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY) -> Dict:
     """Regenerate the full report from a run directory's checkpoints: per-output
     rows, §6.1 ledger re-checks, percolation, phase fractions, §6.3 band, and a
     central-slice PNG per checkpoint. Writes report.json + PNGs to out_dir
@@ -422,6 +539,8 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         row["pore_size_distribution"] = psd_row
         row["permeability"] = permeability_kozeny_carman(
             split["connected"], psd_row["mean_diameter_um"], kc_constant_m2)
+        row["diffusivity_network"] = relative_diffusivity_network(
+            state, gel_eps, gel_rel_diffusivity)
         png_name = f"slice_{ck.name}.png"
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name
