@@ -178,6 +178,14 @@ def _diffusivity_network_analytic_cases():
     assert r["relative_diffusivity"]["z"] == pytest.approx(2.0 / 3.0, rel=1e-6)
     assert r["relative_diffusivity"]["y"] == pytest.approx(0.75, rel=1e-6)
     assert r["relative_diffusivity"]["x"] == pytest.approx(0.75, rel=1e-6)
+    # throat-correction knob: partial-cell faces move from the harmonic
+    # toward the arithmetic Wiener bound; faces between EQUAL cells (the
+    # transverse direction here) have H == A and stay exact
+    gel_eps = np.zeros(st.hydrate_fraction.shape[0])
+    rb = analysis.relative_diffusivity_network(st, gel_eps, face_mixing_beta=0.6)
+    assert 2.0 / 3.0 < rb["relative_diffusivity"]["z"] < 0.75
+    assert rb["relative_diffusivity"]["y"] == pytest.approx(0.75, rel=1e-6)
+    assert rb["face_mixing_beta"] == 0.6
     # a solid plane blocks the solve axis (down to the background floor) but
     # not the transverse axes — the binary-mask cutoff artifact this replaces
     st.capillary_liquid[:] = 1.0

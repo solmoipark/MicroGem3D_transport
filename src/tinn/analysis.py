@@ -295,8 +295,22 @@ GEL_REL_DIFFUSIVITY = 0.0025
 NETWORK_FLOOR = 1e-8
 
 
+# throat-correction knob (PRD 1.3 rev.2): face conductance interpolates
+# between the Wiener bounds G = H^(1-beta*w) * A^(beta*w), applied only where
+# a cell is genuinely partial (sub-voxel throat) so the resolved-continuum
+# limit stays exactly harmonic. LADDER CALIBRATION RESULT (FA30, 32/64/128^3):
+# beta=0.6 flattens the 1d ladder (6.0% -> 1.2% spread) but NOT 28d
+# (35% -> 25%) — the late-age grid dependence is topological (throat paths
+# absent from the coarse 6-neighbor graph), out of reach for any face rule
+# within the Wiener bounds. Default therefore stays 0 (classical harmonic);
+# the knob remains for sensitivity studies, and grid refinement remains the
+# honest route to transport accuracy.
+FACE_MIXING_BETA = 0.0
+
+
 def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
                                  gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY,
+                                 face_mixing_beta: Optional[float] = None,
                                  tol: float = 1e-10, max_iter: int = 50000) -> Dict:
     """Effective relative diffusivity D_eff/D0 per axis from a face-conductance
     network over the FRACTIONAL fields (PRD 1.3 rev.2) — the two-scale
@@ -307,24 +321,39 @@ def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
     voxel resolution. Harmonic-mean face conductances; Dirichlet inlet/outlet
     on the solve axis, periodic transverse; Jacobi-preconditioned CG
     (deterministic: fixed operation order, fixed tolerance)."""
+    if face_mixing_beta is None:
+        face_mixing_beta = FACE_MIXING_BETA
     g = state.capillary_liquid.astype(np.float64).copy()
     for i in range(state.hydrate_fraction.shape[0]):
         if gel_eps[i] > 0.0:
             g += gel_rel_diffusivity * state.hydrate_fraction[i]
     g = np.maximum(np.clip(g, 0.0, None), NETWORK_FLOOR)
+    # partiality of the capillary filling: 1 wherever the voxel is genuinely
+    # partial (a sub-voxel throat), 0 for resolved full/empty voxels — the
+    # smooth 4f(1-f) variant was tested on the ladder and under-corrects the
+    # asymmetric chokes (full pore vs nearly-closed neighbor) that matter
+    f = np.clip(state.capillary_liquid, 0.0, 1.0)
+    part = ((f > 1e-6) & (f < 1.0 - 1e-6)).astype(np.float64)
     n = g.shape[0]
+    beta = float(face_mixing_beta)
 
-    def harm(a, b):
-        return 2.0 * a * b / (a + b)
+    def face(a, b, pa_, pb_):
+        h = 2.0 * a * b / (a + b)
+        if beta == 0.0:
+            return h
+        w = beta * np.maximum(pa_, pb_)
+        arith = 0.5 * (a + b)
+        return h ** (1.0 - w) * arith ** w
 
     axes: Dict[str, float] = {}
     iters: Dict[str, int] = {}
     status = "ok"
     for ax, name in enumerate(("z", "y", "x")):
         ga = np.ascontiguousarray(np.moveaxis(g, ax, 0))
-        gz = harm(ga[:-1], ga[1:])
-        gy = harm(ga, np.roll(ga, -1, axis=1))
-        gx = harm(ga, np.roll(ga, -1, axis=2))
+        pa = np.ascontiguousarray(np.moveaxis(part, ax, 0))
+        gz = face(ga[:-1], ga[1:], pa[:-1], pa[1:])
+        gy = face(ga, np.roll(ga, -1, axis=1), pa, np.roll(pa, -1, axis=1))
+        gx = face(ga, np.roll(ga, -1, axis=2), pa, np.roll(pa, -1, axis=2))
         gin = 2.0 * ga[0]
         gout = 2.0 * ga[-1]
         diag = np.zeros_like(ga)
@@ -378,6 +407,7 @@ def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
     return {"relative_diffusivity": axes,
             "mean": float(np.mean(list(axes.values()))),
             "gel_rel_diffusivity": gel_rel_diffusivity,
+            "face_mixing_beta": beta,
             "background_floor": NETWORK_FLOOR,
             "cg_iterations": iters, "status": status}
 
@@ -490,7 +520,8 @@ def central_slice_rgb(state: SimulationState) -> np.ndarray:
 def report(run_dir: str, out_dir: Optional[str] = None,
            registry: Optional[Registry] = None,
            kc_constant_m2: Optional[float] = None,
-           gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY) -> Dict:
+           gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY,
+           face_mixing_beta: Optional[float] = None) -> Dict:
     """Regenerate the full report from a run directory's checkpoints: per-output
     rows, §6.1 ledger re-checks, percolation, phase fractions, §6.3 band, and a
     central-slice PNG per checkpoint. Writes report.json + PNGs to out_dir
@@ -540,7 +571,8 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         row["permeability"] = permeability_kozeny_carman(
             split["connected"], psd_row["mean_diameter_um"], kc_constant_m2)
         row["diffusivity_network"] = relative_diffusivity_network(
-            state, gel_eps, gel_rel_diffusivity)
+            state, gel_eps, gel_rel_diffusivity,
+            face_mixing_beta=face_mixing_beta)
         png_name = f"slice_{ck.name}.png"
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name

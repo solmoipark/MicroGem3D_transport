@@ -108,14 +108,16 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
 
 def _report(run_dir: str, out_dir: Optional[str],
             kc_constant_m2: Optional[float] = None,
-            gel_rel_diffusivity: Optional[float] = None) -> int:
+            gel_rel_diffusivity: Optional[float] = None,
+            face_mixing_beta: Optional[float] = None) -> int:
     from .analysis import GEL_REL_DIFFUSIVITY, report
     from .storage import StorageError
     try:
         result = report(run_dir, out_dir, kc_constant_m2=kc_constant_m2,
                         gel_rel_diffusivity=(GEL_REL_DIFFUSIVITY
                                              if gel_rel_diffusivity is None
-                                             else gel_rel_diffusivity))
+                                             else gel_rel_diffusivity),
+                        face_mixing_beta=face_mixing_beta)
     except (FileNotFoundError, StorageError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -158,6 +160,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_rep.add_argument("--gel-rel-diffusivity", type=float, default=None,
                        help="C-S-H relative diffusivity for the conductance "
                             "network (default 0.0025, Garboczi-Bentz)")
+    p_rep.add_argument("--face-mixing-beta", type=float, default=None,
+                       help="throat-correction knob: 0=harmonic faces "
+                            "(default) .. 1=arithmetic at sub-voxel throats")
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
@@ -167,7 +172,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "restart":
         return _restart(args.checkpoint_path, args.out)
     return _report(args.run_dir, args.out, args.kc_constant_m2,
-                   args.gel_rel_diffusivity)
+                   args.gel_rel_diffusivity, args.face_mixing_beta)
 
 
 if __name__ == "__main__":
