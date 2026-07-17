@@ -131,13 +131,18 @@ def _report(run_dir: str, out_dir: Optional[str],
         print(f"  t={row['time_h']:9.3f} h  cap.por={row['porosity_capillary']:.4f}  "
               f"tot.por={row['porosity_total']:.4f}  liquid {perc}{drel}  "
               f"[{row['slice_png']}]{viol}")
+    for note in result.get("notes", []):
+        print(f"  note: {note}")
     band = result["sanity_band"]
     n_warn = sum(1 for c in band["checks"] if c["status"] == "warn")
-    print(f"  sanity band: {len(band['checks']) - n_warn} pass, {n_warn} warn "
+    n_info = sum(1 for c in band["checks"] if c["status"] == "info")
+    n_pass = len(band["checks"]) - n_warn - n_info
+    info_txt = f", {n_info} info" if n_info else ""
+    print(f"  sanity band: {n_pass} pass, {n_warn} warn{info_txt} "
           f"({band['note']})")
     for c in band["checks"]:
-        if c["status"] == "warn":
-            print(f"    [warn] {c['check']}: {c['value']}")
+        if c["status"] in ("warn", "info"):
+            print(f"    [{c['status']}] {c['check']}: {c['value']}")
     return 0
 
 

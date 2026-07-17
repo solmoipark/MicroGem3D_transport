@@ -21,7 +21,7 @@ import numpy as np
 from . import ledger
 from .config import TinnConfig
 from .registry import (CLINKER_PHASE_IDS, KINETIC_PHASE_IDS, Registry,
-                       default_registry)
+                       SCM_PHASE_IDS, default_registry)
 from .state import SimulationState
 from .storage import load_checkpoint
 from .transport import LIQ_EPS
@@ -231,7 +231,10 @@ def pore_size_distribution(state: SimulationState) -> Dict:
     w_sub = cap[sub]
     diam = np.concatenate([diam_res, diam_sub])
     w = np.concatenate([w_res, w_sub])
-    edges = [h * m for m in (0.25, 0.5, 1, 2, 4, 8, 16, 32)]
+    # ABSOLUTE micrometer bin edges (rev.2): resolution-independent, so PSD
+    # tables from different voxel sizes are directly comparable; bins finer
+    # than the current resolution simply stay empty
+    edges = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
     hist, _ = np.histogram(diam, bins=[0.0] + edges, weights=w)
     return {
         "edges_um": edges,
@@ -415,11 +418,14 @@ def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
 # ------------------------------------------------------------- §6.3 judgment
 
 def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
-    """PRD §6.3: non-blocking physical-plausibility bands, pass/warn only."""
+    """PRD §6.3: non-blocking physical-plausibility bands. Statuses: pass /
+    warn / info ("info" = the band's premise does not apply to this mix, the
+    value is shown but not judged — rev.2)."""
     checks: List[dict] = []
 
-    def add(name: str, ok: bool, value) -> None:
-        checks.append({"check": name, "status": "pass" if ok else "warn",
+    def add(name: str, ok: bool, value, status: Optional[str] = None) -> None:
+        checks.append({"check": name,
+                       "status": status or ("pass" if ok else "warn"),
                        "value": value})
 
     # the PRD 6.3 alpha bands are for TOTAL CLINKER alpha (the 4 P&K phases);
@@ -453,14 +459,46 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
         add("capillary_porosity_monotone_decrease",
             all(b <= a + 1e-12 for a, b in zip(por, por[1:])), por[-1])
         sh = rows[-1]["chem_shrinkage_ml_per_g_reacted"]
-        add("chem_shrinkage_ml_per_g", 0.03 <= sh <= 0.08, sh)
-        phs = [v for r in rows
-               for v in r.get("ledger_metrics", {}).get("cluster_ph", {}).values()]
-        if phs:
+        # the 0.03-0.08 band is an OPC anchor; pozzolanic reactions carry a
+        # legitimately higher shrinkage and no citable per-SCM bounds exist,
+        # so for blends the check reports "info" instead of judging (rev.2)
+        last_a = rows[-1]["alpha"]
+        mf = config.binder.mass_fractions
+        reacted = {p: mf.get(p, 0.0) * last_a.get(p, 0.0) for p in mf}
+        tot_reacted = sum(reacted.values())
+        scm_share = (sum(v for p, v in reacted.items() if p in SCM_PHASE_IDS)
+                     / tot_reacted if tot_reacted > 0 else 0.0)
+        if scm_share > 0.10:
+            add("chem_shrinkage_ml_per_g", True,
+                {"value": sh, "scm_reacted_mass_share": scm_share,
+                 "note": "OPC band not applicable to blends (PRD 6.3)"},
+                status="info")
+        else:
+            add("chem_shrinkage_ml_per_g", 0.03 <= sh <= 0.08, sh)
+        # main-solution pH band: clusters holding >= 1 % of the liquid are
+        # judged; nearly-dry pockets are known noisy diagnostics (documented)
+        # and are counted, not judged (rev.2)
+        main_ph: List[float] = []
+        pocket_out: List[float] = []
+        for r in rows:
+            lm = r.get("ledger_metrics", {})
+            fr = {str(k): v for k, v in lm.get("cluster_liq_frac", {}).items()}
+            for k, p in lm.get("cluster_ph", {}).items():
+                if fr and fr.get(str(k), 0.0) < 0.01:
+                    if not (12.4 <= p <= 13.9):
+                        pocket_out.append(p)
+                else:
+                    main_ph.append(p)
+        if main_ph or pocket_out:
+            val = {"main_range": ([min(main_ph), max(main_ph)]
+                                  if main_ph else None),
+                   "pocket_outliers": len(pocket_out)}
+            if pocket_out:
+                val["pocket_outlier_range"] = [min(pocket_out), max(pocket_out)]
             add("cluster_ph_band_12.4_13.9",
-                all(12.4 <= p <= 13.9 for p in phs), [min(phs), max(phs)])
+                all(12.4 <= p <= 13.9 for p in main_ph), val)
     return {
-        "note": ("physical plausibility bands (PRD 6.3), pass/warn only - "
+        "note": ("physical plausibility bands (PRD 6.3), pass/warn/info - "
                  "this is not scientific validation"),
         "checks": checks,
     }
@@ -536,16 +574,24 @@ def report(run_dir: str, out_dir: Optional[str] = None,
 
     # per-cluster pH lives only in run summaries (a solver diagnostic, not
     # checkpointed state) — merge it in when the run wrote one
+    notes: List[str] = []
     summary_ph: Dict[float, dict] = {}
     summary_path = run / "summary.json"
     if summary_path.is_file():
         try:
             for row in json.loads(summary_path.read_text(encoding="utf-8"))["outputs"]:
-                ph = row.get("ledger_metrics", {}).get("cluster_ph")
-                if ph:
-                    summary_ph[float(row["time_h"])] = ph
+                lm = row.get("ledger_metrics", {})
+                if lm.get("cluster_ph"):
+                    merged = {"cluster_ph": lm["cluster_ph"]}
+                    if lm.get("cluster_liq_frac"):
+                        merged["cluster_liq_frac"] = lm["cluster_liq_frac"]
+                    summary_ph[float(row["time_h"])] = merged
         except Exception:
-            pass  # a foreign/corrupt summary never blocks a checkpoint report
+            notes.append("summary.json unreadable - per-cluster pH omitted "
+                         "from the report and the pH band")
+    else:
+        notes.append("summary.json absent (interrupted run?) - per-cluster "
+                     "pH omitted from the report and the pH band")
 
     rows: List[dict] = []
     config = None
@@ -560,7 +606,7 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         row["ledger_metrics"] = dict(check.metrics)
         row["ledger_violations"] = list(check.violations)
         if row["time_h"] in summary_ph:
-            row["ledger_metrics"]["cluster_ph"] = summary_ph[row["time_h"]]
+            row["ledger_metrics"].update(summary_ph[row["time_h"]])
         row["percolation"] = liquid_percolation(state.capillary_liquid)
         row["phase_volume_fractions"] = phase_volume_fractions(state)
         split = porosity_split(state)
@@ -587,6 +633,7 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         "backend": backend_id,
         "outputs": rows,
         "sanity_band": sanity_band(rows, config),
+        "notes": notes,
     }
     (out / "report.json").write_text(json.dumps(result, indent=1),
                                      encoding="utf-8")

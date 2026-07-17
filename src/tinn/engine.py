@@ -544,6 +544,13 @@ class Engine:
         metrics = dict(report.metrics)
         if cluster_ph:
             metrics["cluster_ph"] = {int(k): float(v) for k, v in cluster_ph.items()}
+            # liquid share per pH-carrying cluster: lets the sanity band judge
+            # the MAIN solution and merely count nearly-dry pocket outliers
+            total_liq = float(liq_vol_c.sum())
+            metrics["cluster_liq_frac"] = {
+                int(k): (float(liq_vol_c[int(k)]) / total_liq
+                         if total_liq > 0.0 else 0.0)
+                for k in cluster_ph}
         return trial, None, metrics
 
     # -------------------------------------------------------------------- run

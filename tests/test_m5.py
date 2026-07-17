@@ -133,6 +133,54 @@ def test_sanity_band_pass_and_warn():
     assert "not scientific validation" in band2["note"]
 
 
+def test_sanity_band_blend_shrinkage_info_and_ph_pockets():
+    # blend: SCM reacted-mass share > 10 % -> shrinkage reports info, not warn
+    raw = json.loads((EXAMPLES / "opc_srm114q_32.json").read_text(encoding="utf-8"))
+    raw["binder"] = {"mass_fractions": {"C3S": 0.46, "C2S": 0.06, "C3A": 0.08,
+                                        "C4AF": 0.05, "fly_ash": 0.30}}
+    raw["kinetics"] = {"kind": "tabulated",
+                       "table": {"times_h": [0.0, 48.0],
+                                 "alpha": {"C3S": [0.0, 0.5], "C2S": [0.0, 0.4],
+                                           "C3A": [0.0, 0.5], "C4AF": [0.0, 0.4],
+                                           "fly_ash": [0.0, 0.3]}}}
+    raw["schedule"] = {"output_times_h": [24.0, 48.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.01}
+    raw["chemistry"] = {"backend": "gems3k"}  # stoich has no fly_ash rule
+    cfg = TinnConfig.model_validate(raw)
+    row = {"time_h": 24.0,
+           "alpha": {"C3S": 0.5, "C2S": 0.4, "C3A": 0.5, "C4AF": 0.4,
+                     "fly_ash": 0.3},
+           "hydrate_mol": {"CH": 1.0}, "porosity_capillary": 0.4,
+           "chem_shrinkage_ml_per_g_reacted": 0.13,
+           "ledger_metrics": {
+               # main solution (95 % of liquid) in band; tiny pocket far out
+               "cluster_ph": {"0": 13.2, "1": 14.1},
+               "cluster_liq_frac": {"0": 0.95, "1": 0.002}}}
+    band = analysis.sanity_band([row], cfg)
+    by = {c["check"]: c for c in band["checks"]}
+    sh = by["chem_shrinkage_ml_per_g"]
+    assert sh["status"] == "info"
+    assert sh["value"]["scm_reacted_mass_share"] > 0.10
+    ph = by["cluster_ph_band_12.4_13.9"]
+    assert ph["status"] == "pass"                      # main solution judged
+    assert ph["value"]["pocket_outliers"] == 1         # pocket counted, not judged
+    # the same pH data WITHOUT volume shares falls back to judging everything
+    row2 = json.loads(json.dumps(row))
+    del row2["ledger_metrics"]["cluster_liq_frac"]
+    band2 = analysis.sanity_band([row2], cfg)
+    ph2 = {c["check"]: c for c in band2["checks"]}["cluster_ph_band_12.4_13.9"]
+    assert ph2["status"] == "warn"
+
+
+def test_report_notes_missing_summary(stoich_run, tmp_path):
+    import shutil
+    run2 = tmp_path / "no_summary"
+    shutil.copytree(stoich_run, run2)
+    (run2 / "summary.json").unlink(missing_ok=True)
+    result = analysis.report(str(run2), str(tmp_path / "rep"))
+    assert any("summary.json absent" in n for n in result["notes"])
+
+
 # ---------------- report (M5 DoD) ----------------
 
 def test_report_from_run_dir(stoich_run, tmp_path):
