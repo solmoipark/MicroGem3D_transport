@@ -234,7 +234,10 @@ def test_material_psd_schema_validation():
     raw["material_psd"] = {"fly_ash": big}
     with pytest.raises(ValidationError, match="rasterizable"):
         TinnConfig.model_validate(raw)
-    # material_shape (PRD 1.2 rev.2): same key discipline + fit checks
+
+
+def test_material_shape_schema_validation():
+    """material_shape (PRD 1.2 rev.2): same key discipline + fit checks."""
     raw = _blend_raw()
     raw["material_shape"] = {"bogus": {"aspects": [1.5, 1.0, 0.7]}}
     with pytest.raises(ValidationError, match="material_shape"):
@@ -259,7 +262,12 @@ def test_config_hash_stable_without_material_psd():
     raw3 = dict(raw)
     raw3["material_psd"] = {"fly_ash": SLAG_PSD}
     assert TinnConfig.model_validate(raw3).config_hash() != h0
-    # material_shape follows the same hash contract (rev.2)
+
+
+def test_config_hash_stable_without_material_shape():
+    """material_shape follows the same None-pops-from-hash contract (rev.2)."""
+    raw = _blend_raw()
+    h0 = TinnConfig.model_validate(raw).config_hash()
     raw4 = dict(raw)
     raw4["material_shape"] = None
     assert TinnConfig.model_validate(raw4).config_hash() == h0
@@ -319,8 +327,13 @@ def test_geometry_per_material_determinism_and_conservation():
     # voxel identity with two populations
     total = a.anhydrous_fraction.sum(axis=0) + a.capillary_liquid + a.capillary_gas
     assert np.max(np.abs(total - 1.0)) <= 1e-12
-    # ellipsoid rasterizer (PRD 1.2 rev.2): volume-exact bookkeeping and the
-    # requested anisotropy, axis-aligned reference case
+
+
+def test_geometry_ellipsoid_shapes():
+    """Ellipsoid rasterizer (PRD 1.2 rev.2): volume-exact bookkeeping, the
+    requested anisotropy (axis-aligned reference), and a shaped blend RVE that
+    is deterministic, conserving, and structurally distinct from spheres."""
+    a = _blend_rve({"fly_ash": SLAG_PSD})
     from tinn.geometry import _rasterize_ellipsoid, _sphere_volume
     rv = 4.0
     ratios = np.array([2.0, 1.0, 0.5])   # product 1 -> volume preserved

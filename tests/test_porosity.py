@@ -103,9 +103,13 @@ def test_pore_size_known_sphere():
     split = analysis.porosity_split(st)
     assert split["connected"] == 0.0
     assert split["isolated"] > 0.0
-    # sub-voxel tail (PRD 1.3 rev.2): a partially-filled voxel below the mask
-    # level enters the distribution as a slab aperture d = f*h, volume f —
-    # capillary volume is never dropped from the distribution
+
+
+def test_pore_size_subvoxel_tail():
+    """PRD 1.3 rev.2: a partially-filled voxel below the mask level enters the
+    distribution as a slab aperture d = f*h, volume f — capillary volume is
+    never dropped from the distribution."""
+    st = _sphere_pore_state(radius=4.0)
     st.capillary_liquid[0, 0, 0] = 0.3
     st.anhydrous_fraction[0, 0, 0, 0] = 0.7
     psd2 = analysis.pore_size_distribution(st)
@@ -150,9 +154,6 @@ def test_kozeny_carman_value_and_guards():
     for phi in (0.0, 1.0, 1.5):
         bad = analysis.permeability_kozeny_carman(phi, d_char_um=2.0)
         assert math.isnan(bad["k_m2"]) and bad["status"] == "not_available"
-    # conductance network (PRD 1.3 rev.2) against analytic composites —
-    # folded in here to respect the 150-test budget
-    _diffusivity_network_analytic_cases()
 
 
 def _network(st):
@@ -160,7 +161,8 @@ def _network(st):
     return analysis.relative_diffusivity_network(st, gel_eps)
 
 
-def _diffusivity_network_analytic_cases():
+def test_diffusivity_network_analytic_cases():
+    """Conductance network (PRD 1.3 rev.2) against analytic composites."""
     n = 16
     # homogeneous liquid -> D_rel = 1 on every axis (exact for the ramp start)
     st = _sphere_pore_state(radius=1.0, n=n)

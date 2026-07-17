@@ -105,8 +105,12 @@ def test_morphology_remove_exact_and_overrequest():
     assert hyd[0].min() >= 0.0
     with pytest.raises(ValueError, match="exceeds available"):
         morphology.remove(hyd, 0, 5.0, member)
-    # place() overflow pass: all capacity sits FAR outside the 3-shell radius
-    # of the source — the remainder must precipitate cluster-wide, not reject
+
+
+def test_place_overflow_beyond_shell_radius():
+    """Overflow pass (PRD 2.2 rev.2): all capacity sits FAR outside the
+    3-shell radius of the source — the remainder must precipitate
+    cluster-wide, not reject."""
     hyd2 = np.zeros((4, 8, 8, 8))
     liq = np.zeros((8, 8, 8))
     liq[4, 4, 4] = 1.0                      # Manhattan distance 12 from source
@@ -148,9 +152,13 @@ def test_snapshot_step_replaces_ledgers_and_closes():
     assert t2.hydrate_mol[ch_i] < t1.hydrate_mol[ch_i]
     rep = ledger.check_all(t2, REG)
     assert rep.ok, rep.violations
-    # space-filling limit: an assemblage wanting MORE envelope than the
-    # cluster's entire pore space is dt-independent — the step must accept
-    # with the cluster frozen (release back as unmet), never abort the run
+
+
+def test_space_filling_limit_freezes_cluster():
+    """Space-filling limit (PRD 4.5): an assemblage wanting MORE envelope than
+    the cluster's entire pore space is dt-independent — the step must accept
+    with the cluster frozen (release back as unmet), never abort the run."""
+    cfg = _short_cfg()
     state = Engine(cfg, reaction_backend=FakeSnapshotBackend(1e-30)).initial_state()
     liquid_cm3 = float(state.capillary_liquid.sum()) * state.vox_cm3
     big = 1.10 * liquid_cm3 / REG.get("CH").skeleton_molar_volume_cm3

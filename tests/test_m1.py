@@ -186,9 +186,14 @@ def test_dissolution_no_liquid_all_unmet():
     vm = st.vm_vox(REG, "C3S")
     res = dissolution.dissolve(st, REG, _dn(0.5 / vm))
     assert res.removed_mol[0] == 0.0
-    # gel conduit (PRD 4.2 v2.2 rev.2): a hydrate-coated site dissolves through
-    # gel pore water at GEL_FACE_WEIGHT — but a particle-interior voxel with
-    # neither liquid nor hydrate on any face stays inaccessible (above)
+    assert res.unmet_mol[0] == pytest.approx(0.5 / vm)
+
+
+def test_dissolution_gel_conduit_coated_site():
+    """Gel conduit (PRD 4.2 rev.2): a hydrate-coated site dissolves through
+    gel pore water at GEL_FACE_WEIGHT — but a particle-interior voxel with
+    neither liquid nor hydrate on any face stays inaccessible."""
+    vm = _blank_state().vm_vox(REG, "C3S")
     st2 = _blank_state()
     st2.anhydrous_fraction[0, 5, 5, 5] = 0.6
     st2.hydrate_fraction[0, 5, 5, 4] = 0.4    # the coating
@@ -197,7 +202,6 @@ def test_dissolution_no_liquid_all_unmet():
     assert res2.removed_mol[0] == pytest.approx(0.1 / vm)
     assert res2.unmet_mol[0] == 0.0
     assert res2.removed_vol[0, 5, 5, 5] == pytest.approx(0.1)
-    assert res.unmet_mol[0] == pytest.approx(0.5 / vm)
 
 
 # ---------------- transport ----------------

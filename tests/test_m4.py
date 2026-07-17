@@ -67,9 +67,13 @@ def test_backend_channels_exclude_clinker_and_fluids(gems_backend, tmp_path):
     ids = set(gems_backend.hydrate_ids)
     assert {"CSHQ", "Portlandite", "C3AH6", "ettringite"} <= ids
     assert not ids & {"Alite", "Belite", "Aluminate", "Ferrite", "aq_gen", "gas_gen"}
-    # default CNASH bundle (hydrates-only, no clinker phases): channels adapt,
-    # suppression list collapses to the bundle's actual phases (here: none),
-    # and a react still closes
+
+
+@needs_gems
+def test_backend_cnash_bundle_channels_and_react(tmp_path):
+    """Default CNASH bundle (hydrates-only, no clinker phases): channels
+    adapt, the suppression list collapses to the bundle's actual phases
+    (here: none), and a react still closes."""
     from tinn.config import DEFAULT_GEMS_BUNDLE_LST
     from tinn.gems import GemsBackend, GemsWorker
     w = GemsWorker(str(REPO / DEFAULT_GEMS_BUNDLE_LST),
