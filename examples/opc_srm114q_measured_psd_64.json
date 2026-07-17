@@ -1,0 +1,20 @@
+{
+  "binder": {"mass_fractions": {"C3S": 0.60, "C2S": 0.14, "C3A": 0.07, "C4AF": 0.10}},
+  "psd": {
+    "cumulative": [
+      [1.0, 0.051], [1.5, 0.080], [2.0, 0.112], [3.0, 0.163], [4.0, 0.210],
+      [6.0, 0.296], [8.0, 0.376], [12.0, 0.510], [16.0, 0.628], [24.0, 0.808],
+      [32.0, 0.912], [48.0, 0.984], [64.0, 0.997], [96.0, 0.999], [128.0, 0.999]
+    ],
+    "truncate_to_grid": true
+  },
+  "w_c": 0.5,
+  "temperature_K": 293.15,
+  "kinetics": {"kind": "pk", "preset": "pk_elakneswaran_2018", "blaine_m2_kg": 381.8},
+  "rve": {"grid_size": 64, "voxel_size_um": 1.0, "seed": 20260714},
+  "chemistry": {
+    "backend": "gems3k",
+    "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe"
+  },
+  "schedule": {"output_times_h": [24.0, 672.0], "dt_initial_h": 2.0, "dt_min_h": 0.001}
+}

@@ -94,6 +94,11 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
 
 - `examples/c3s_32.json` — 순수 C3S, tabulated alpha (§6.2 C3S 픽스처).
 - `examples/opc_srm114q_32.json` — NIST SRM 114q 4상, P&K `pk_elakneswaran_2018`.
+- `examples/opc_srm114q_measured_psd_64.json` — **실측 PSD**: SRM 114q의 레이저 회절
+  누적곡선(NIST SP 260-166 Table 8) 원표 입력 + 격자 절단(`truncate_to_grid`).
+  측정창 밖 5.2%·절단 1.6%가 geometry 리포트에 명시되고 구 가정 비표면(`ssa_est_m2_kg`)으로
+  실측 Blaine(381.8)과 교차확인 가능. `cumulative` 대신 `rosin_rammler`
+  {d_prime_um, n, d_min_um, d_max_um} 입력도 지원.
 - `examples/opc_cnash_32.json` — OPC 4상 + **기본 CNASH 번들**(gems_bundle_lst 생략).
 - `examples/opc_gems_32.json` — OPC 4상 + PC(CSHQ) 번들 명시.
 - `examples/opc_slag_populations_32.json` — 슬래그 블렌드 + 재료별 PSD.

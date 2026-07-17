@@ -11,7 +11,7 @@ import json
 import math
 from typing import Dict, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .registry import KINETIC_PHASE_IDS, default_registry
 
@@ -60,12 +60,98 @@ class PSDBin(BaseModel):
     volume_fraction: float = Field(ge=0.0, le=1.0)
 
 
-class PSD(BaseModel):
+class RosinRammler(BaseModel):
+    """Rosin-Rammler(Weibull) fit of a measured PSD: F(d) = 1 - exp(-(d/d')^n),
+    discretized over [d_min, d_max] and renormalized to the window mass (the
+    excluded tail fraction is reported by geometry, never hidden)."""
     model_config = _STRICT
-    bins: List[PSDBin] = Field(min_length=1)
+    d_prime_um: float = Field(gt=0.0)
+    n: float = Field(gt=0.0)
+    d_min_um: float = Field(gt=0.0)
+    d_max_um: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "RosinRammler":
+        if self.d_max_um <= self.d_min_um:
+            raise ValueError("rosin_rammler needs d_max_um > d_min_um")
+        return self
+
+    def cdf(self, d_um: float) -> float:
+        return 1.0 - math.exp(-((d_um / self.d_prime_um) ** self.n))
+
+
+# Rosin-Rammler discretization density: fixed (deterministic), log-spaced
+_RR_BINS_PER_DECADE = 8
+
+
+class PSD(BaseModel):
+    """Particle-size distribution (PRD 1.2 rev.2): exactly ONE of
+    - `bins`            — log-interval volume fractions (the canonical form),
+    - `cumulative`      — measured cumulative volume curve [(d_um, F)] as it
+                          comes off a laser-diffraction report; consecutive
+                          points become bins (F must be non-decreasing, start
+                          at 0 and end at 1 — nothing is invented),
+    - `rosin_rammler`   — measured RR fit parameters (CEMHYD3D convention).
+    Whichever is given is converted to `bins` at validation; geometry only
+    ever sees bins. `truncate_to_grid` opts into CEMHYD3D-style truncation of
+    the coarse tail that cannot be rasterized (default: hard reject)."""
+    model_config = _STRICT
+    bins: Optional[List[PSDBin]] = Field(default=None, min_length=1)
+    cumulative: Optional[List[Tuple[float, float]]] = Field(default=None,
+                                                            min_length=2)
+    rosin_rammler: Optional[RosinRammler] = None
+    truncate_to_grid: bool = False
 
     @model_validator(mode="after")
     def _check(self) -> "PSD":
+        # `bins` is the CANONICAL DERIVED form: when a measured input is
+        # present, bins are (re)computed from it — this makes serialized
+        # configs (which carry both the measured input and the converted
+        # bins) revalidate cleanly on checkpoint load, and grid truncation
+        # re-applies idempotently in the cross-validator
+        if self.cumulative is not None and self.rosin_rammler is not None:
+            raise ValueError(
+                "PSD takes cumulative or rosin_rammler, not both")
+        if self.cumulative is None and self.rosin_rammler is None \
+                and self.bins is None:
+            raise ValueError(
+                "PSD needs one of bins / cumulative / rosin_rammler")
+        if self.cumulative is not None:
+            pts = self.cumulative
+            ds = [p[0] for p in pts]
+            fs = [p[1] for p in pts]
+            if any(d <= 0.0 for d in ds):
+                raise ValueError("cumulative PSD diameters must be positive")
+            if any(b <= a for a, b in zip(ds, ds[1:])):
+                raise ValueError("cumulative PSD diameters must be strictly ascending")
+            if any(b < a for a, b in zip(fs, fs[1:])):
+                raise ValueError("cumulative PSD fractions must be non-decreasing")
+            if any(f < 0.0 or f > 1.0 + 1e-9 for f in fs):
+                raise ValueError("cumulative PSD fractions must be in [0, 1]")
+            # real laser-diffraction curves rarely start at exactly F=0 or end
+            # at exactly F=1 (e.g. SRM 114q: 5.1 % below the first reported
+            # size) — the measured window is renormalized and the excluded
+            # mass is REPORTED (geometry report), exactly like the RR window;
+            # nothing is invented outside the measured curve
+            window = fs[-1] - fs[0]
+            if window <= 0.0:
+                raise ValueError("cumulative PSD window carries no mass")
+            self.bins = [PSDBin(d_lo_um=ds[i], d_hi_um=ds[i + 1],
+                                volume_fraction=(fs[i + 1] - fs[i]) / window)
+                         for i in range(len(pts) - 1)]
+        if self.rosin_rammler is not None:
+            rr = self.rosin_rammler
+            n_bins = max(1, math.ceil(
+                _RR_BINS_PER_DECADE * math.log10(rr.d_max_um / rr.d_min_um)))
+            ratio = (rr.d_max_um / rr.d_min_um) ** (1.0 / n_bins)
+            edges = [rr.d_min_um * ratio ** i for i in range(n_bins + 1)]
+            edges[-1] = rr.d_max_um  # exact endpoint, no float drift
+            window = rr.cdf(rr.d_max_um) - rr.cdf(rr.d_min_um)
+            if window <= 0.0:
+                raise ValueError("rosin_rammler window carries no mass")
+            self.bins = [PSDBin(d_lo_um=lo, d_hi_um=hi,
+                                volume_fraction=(rr.cdf(hi) - rr.cdf(lo)) / window)
+                         for lo, hi in zip(edges, edges[1:])]
         for b in self.bins:
             if b.d_hi_um <= b.d_lo_um:
                 raise ValueError(f"PSD bin needs d_hi > d_lo, got [{b.d_lo_um}, {b.d_hi_um}]")
@@ -80,6 +166,17 @@ class PSD(BaseModel):
     @property
     def d_max_um(self) -> float:
         return self.bins[-1].d_hi_um
+
+    def measured_window_excluded(self) -> float:
+        """Mass fraction of the measured input outside the represented window
+        (below the first / above the last cumulative point, or outside the RR
+        [d_min, d_max]); 0 for direct bins."""
+        if self.rosin_rammler is not None:
+            rr = self.rosin_rammler
+            return 1.0 - (rr.cdf(rr.d_max_um) - rr.cdf(rr.d_min_um))
+        if self.cumulative is not None:
+            return 1.0 - (self.cumulative[-1][1] - self.cumulative[0][1])
+        return 0.0
 
     @classmethod
     def synthetic_default(cls) -> "PSD":
@@ -314,21 +411,46 @@ class TinnConfig(BaseModel):
     rve: RVEConfig
     chemistry: ChemistryConfig
     schedule: ScheduleConfig
+    # coarse-tail volume fraction removed per PSD by truncate_to_grid, keyed
+    # "__shared__" (the top-level psd) or the material_psd key — diagnostics
+    # for the geometry report, never part of the hash/serialized payload
+    _psd_truncation: Dict[str, float] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def _check(self) -> "TinnConfig":
         from .registry import SCM_PHASE_IDS
         d_max_allowed_um = (self.rve.grid_size - RASTER_HALO_VOX) * self.rve.voxel_size_um
-        for label, psd in (("psd", self.psd),
-                           *((f"material_psd[{k}]", v)
+        for label, psd in (("__shared__", self.psd),
+                           *((k, v)
                              for k, v in (self.material_psd or {}).items())):
-            if psd.d_max_um > d_max_allowed_um:
+            if psd.d_max_um <= d_max_allowed_um:
+                continue
+            if not psd.truncate_to_grid:
                 raise ValueError(
-                    f"largest {label} diameter {psd.d_max_um} um exceeds the "
-                    f"rasterizable maximum {d_max_allowed_um:.3f} um for a "
+                    f"largest {label} PSD diameter {psd.d_max_um} um exceeds "
+                    f"the rasterizable maximum {d_max_allowed_um:.3f} um for a "
                     f"{self.rve.grid_size}^3 periodic RVE at "
-                    f"{self.rve.voxel_size_um} um/voxel"
+                    f"{self.rve.voxel_size_um} um/voxel (set the PSD's "
+                    f"truncate_to_grid to opt into CEMHYD3D-style truncation)"
                 )
+            # CEMHYD3D-style coarse-tail truncation: drop whole bins that
+            # cannot be rasterized, renormalize the rest, and RECORD the
+            # removed fraction (surfaced in the geometry report — PRD 1.2)
+            kept = [b for b in psd.bins if b.d_hi_um <= d_max_allowed_um]
+            if not kept:
+                raise ValueError(
+                    f"{label} PSD lies entirely above the rasterizable "
+                    f"maximum {d_max_allowed_um:.3f} um — truncation would "
+                    f"leave no particles")
+            kept_vf = sum(b.volume_fraction for b in kept)
+            if kept_vf <= 0.0:
+                raise ValueError(
+                    f"{label} PSD has no volume below the rasterizable "
+                    f"maximum — truncation would leave no particles")
+            self._psd_truncation[label] = 1.0 - kept_vf
+            psd.bins = [PSDBin(d_lo_um=b.d_lo_um, d_hi_um=b.d_hi_um,
+                               volume_fraction=b.volume_fraction / kept_vf)
+                        for b in kept]
         if self.material_psd is not None:
             allowed = {"clinker", *SCM_PHASE_IDS}
             unknown = set(self.material_psd) - allowed
@@ -403,6 +525,21 @@ class TinnConfig(BaseModel):
         # same contract for material_shape (rev.2)
         if payload.get("material_shape") is None:
             payload.pop("material_shape", None)
+        # PSD measured-input fields (rev.2): default-valued keys pop so every
+        # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
+        # TRUNCATED bins plus the original measured input — physics-faithful
+
+        def _canon_psd(d):
+            if not isinstance(d, dict):
+                return
+            for key, default in (("cumulative", None), ("rosin_rammler", None),
+                                 ("truncate_to_grid", False)):
+                if d.get(key) == default:
+                    d.pop(key, None)
+
+        _canon_psd(payload.get("psd"))
+        for v in (payload.get("material_psd") or {}).values():
+            _canon_psd(v)
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

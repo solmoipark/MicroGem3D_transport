@@ -382,6 +382,38 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
     mass_water = float(capillary_liquid.sum()) * rho_w
     w_c_achieved = mass_water / mass_solid
 
+    mat_report = {}
+    for m_idx, (name, weights, v_target_m, psd) in enumerate(materials):
+        row = {
+            "volume_target_vox": v_target_m,
+            "volume_achieved_vox": float(occ_m[m_idx].sum()),
+            "rel_error": (abs(float(occ_m[m_idx].sum()) - v_target_m)
+                          / v_target_m if v_target_m > 0 else 0.0),
+        }
+        # sphere-based specific-surface estimate from the PSD (diagnostic
+        # only, PRD 1.2 rev.2): lets a measured PSD be cross-checked against
+        # the measured Blaine fed to kinetics
+        vol_m = sum(vol_g[p] for i, p in enumerate(SOLID_PHASE_IDS)
+                    if weights[i] > 0.0)
+        mass_m = sum(masses.get(p, 0.0) for i, p in enumerate(SOLID_PHASE_IDS)
+                     if weights[i] > 0.0)
+        if vol_m > 0.0 and mass_m > 0.0:
+            rho_kg_m3 = (mass_m / vol_m) * 1000.0
+            row["ssa_est_m2_kg"] = sum(
+                b.volume_fraction * 6.0
+                / (rho_kg_m3 * math.sqrt(b.d_lo_um * b.d_hi_um) * 1e-6)
+                for b in psd.bins)
+        # measured-PSD exclusions (never hidden): grid truncation + the mass
+        # the measured input carries outside its represented window
+        trunc_key = name if name in psd_map else "__shared__"
+        trunc = config._psd_truncation.get(trunc_key, 0.0)
+        if trunc > 0.0:
+            row["psd_truncated_volume_fraction"] = trunc
+        excl = psd.measured_window_excluded()
+        if excl > 0.0:
+            row["psd_window_excluded"] = excl
+        mat_report[name] = row
+
     report = {
         "grid_size": n,
         "voxel_size_um": h,
@@ -398,15 +430,7 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
         "n_particles_resolved": int((p_tier[p_placed] == TIER_RESOLVED).sum()),
         "n_particles_fractional": int((p_tier[p_placed] == TIER_FRACTIONAL).sum()),
         "n_subgrid_bins": len(subgrid_rows),
-        "materials": {
-            name: {
-                "volume_target_vox": v_target_m,
-                "volume_achieved_vox": float(occ_m[m_idx].sum()),
-                "rel_error": (abs(float(occ_m[m_idx].sum()) - v_target_m)
-                              / v_target_m if v_target_m > 0 else 0.0),
-            }
-            for m_idx, (name, _, v_target_m, _) in enumerate(materials)
-        },
+        "materials": mat_report,
     }
 
     particles = {

@@ -199,3 +199,104 @@ def test_cli_validate_config(capsys):
     assert cli.main(["validate-config", str(EXAMPLES / "c3s_32.json")]) == 0
     assert "config OK" in capsys.readouterr().out
     assert cli.main(["validate-config", str(EXAMPLES / "does_not_exist.json")]) == 2
+
+
+# ---------- measured PSD input (PRD 1.2 rev.2) ----------
+
+def test_psd_cumulative_conversion_and_window():
+    # full-window curve: consecutive points become bins, exact fractions
+    psd = PSD.model_validate({"cumulative": [[1.0, 0.0], [2.0, 0.25], [4.0, 1.0]]})
+    assert [(b.d_lo_um, b.d_hi_um) for b in psd.bins] == [(1.0, 2.0), (2.0, 4.0)]
+    assert psd.bins[0].volume_fraction == pytest.approx(0.25)
+    assert psd.bins[1].volume_fraction == pytest.approx(0.75)
+    assert psd.measured_window_excluded() == 0.0
+    # real lab curve (SRM 114q style): window renormalized, exclusion reported
+    psd2 = PSD.model_validate({"cumulative": [[1.0, 0.05], [4.0, 0.55], [8.0, 0.95]]})
+    assert psd2.measured_window_excluded() == pytest.approx(0.10)
+    assert sum(b.volume_fraction for b in psd2.bins) == pytest.approx(1.0)
+    assert psd2.bins[0].volume_fraction == pytest.approx(0.5 / 0.9)
+
+
+def test_psd_cumulative_rejections():
+    for bad in ([[1.0, 0.5]],                    # fewer than 2 points
+                [[2.0, 0.0], [1.0, 1.0]],        # descending diameters
+                [[1.0, 0.5], [2.0, 0.4]],        # decreasing fractions
+                [[-1.0, 0.0], [2.0, 1.0]],       # non-positive diameter
+                [[1.0, 0.3], [2.0, 0.3]]):       # zero-mass window
+        with pytest.raises(ValidationError):
+            PSD.model_validate({"cumulative": bad})
+
+
+def test_psd_rosin_rammler_discretization():
+    import math
+    rr = {"d_prime_um": 15.0, "n": 1.1, "d_min_um": 0.5, "d_max_um": 40.0}
+    psd = PSD.model_validate({"rosin_rammler": rr})
+    assert psd.bins[0].d_lo_um == 0.5 and psd.bins[-1].d_hi_um == 40.0
+    assert sum(b.volume_fraction for b in psd.bins) == pytest.approx(1.0)
+    cdf = lambda d: 1.0 - math.exp(-((d / 15.0) ** 1.1))
+    window = cdf(40.0) - cdf(0.5)
+    assert psd.measured_window_excluded() == pytest.approx(1.0 - window)
+    # each bin carries exactly its window-normalized CDF mass
+    b = psd.bins[3]
+    assert b.volume_fraction == pytest.approx(
+        (cdf(b.d_hi_um) - cdf(b.d_lo_um)) / window, rel=1e-12)
+
+
+def test_psd_input_form_rules():
+    with pytest.raises(ValidationError, match="not both"):
+        PSD.model_validate({"cumulative": [[1.0, 0.0], [2.0, 1.0]],
+                            "rosin_rammler": {"d_prime_um": 15.0, "n": 1.1,
+                                              "d_min_um": 0.5, "d_max_um": 40.0}})
+    with pytest.raises(ValidationError, match="needs one of"):
+        PSD.model_validate({})
+    # bins are the DERIVED canonical form: with a measured input present they
+    # are rebuilt from it (what makes serialized configs revalidate cleanly)
+    stale = [{"d_lo_um": 1.0, "d_hi_um": 2.0, "volume_fraction": 1.0}]
+    psd = PSD.model_validate({"bins": stale,
+                              "cumulative": [[1.0, 0.0], [2.0, 0.5], [4.0, 1.0]]})
+    assert len(psd.bins) == 2 and psd.bins[1].d_hi_um == 4.0
+
+
+def test_psd_truncation_to_grid():
+    coarse = {"cumulative": [[1.0, 0.0], [8.0, 0.5], [64.0, 1.0]]}
+    raw = _base_config(psd=dict(coarse))
+    with pytest.raises(ValidationError, match="rasterizable"):
+        TinnConfig.model_validate(raw)   # 64 um cannot fit a 32^3 RVE
+    raw = _base_config(psd={**coarse, "truncate_to_grid": True})
+    cfg = TinnConfig.model_validate(raw)
+    allowed = (32 - 2.0 - 3.0 ** 0.5) * 1.0
+    assert cfg.psd.d_max_um <= allowed
+    assert cfg._psd_truncation["__shared__"] == pytest.approx(0.5)
+    assert sum(b.volume_fraction for b in cfg.psd.bins) == pytest.approx(1.0)
+    # idempotent: revalidating the truncated dump reproduces the same hash
+    again = TinnConfig.model_validate(
+        json.loads(json.dumps(cfg.model_dump(mode="json"))))
+    assert again.config_hash() == cfg.config_hash()
+
+
+def test_psd_hash_contract_for_new_fields():
+    raw = _base_config()
+    h0 = TinnConfig.model_validate(raw).config_hash()
+    # explicit default-valued new fields hash identically to a legacy config
+    raw2 = _base_config()
+    raw2["psd"] = {"bins": [b.model_dump() for b in PSD.synthetic_default().bins],
+                   "truncate_to_grid": False, "cumulative": None,
+                   "rosin_rammler": None}
+    assert TinnConfig.model_validate(raw2).config_hash() == h0
+    # a measured input is a DIFFERENT physics input -> different hash
+    raw3 = _base_config()
+    raw3["psd"] = {"cumulative": [[0.5, 0.0], [8.0, 0.7], [16.0, 1.0]]}
+    assert TinnConfig.model_validate(raw3).config_hash() != h0
+
+
+def test_geometry_measured_psd_example_initializes():
+    cfg = TinnConfig.from_json_file(str(EXAMPLES / "opc_srm114q_measured_psd_64.json"))
+    rve = initialize_rve(cfg, default_registry())
+    row = rve.report["materials"]["clinker"]
+    assert row["rel_error"] <= 0.02
+    # NIST SP 260-166 Table 8 exclusions, both surfaced
+    assert row["psd_window_excluded"] == pytest.approx(0.052, abs=1e-12)
+    assert 0.01 < row["psd_truncated_volume_fraction"] < 0.02
+    # sphere-based SSA sits in a physical range and BELOW the measured Blaine
+    # (381.8 m2/kg) since the sub-um fines lie outside the measured window
+    assert 150.0 < row["ssa_est_m2_kg"] < 400.0
