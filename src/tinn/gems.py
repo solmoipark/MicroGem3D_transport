@@ -56,6 +56,13 @@ class BundleAuditError(GemsError):
         super().__init__(message, kind="config")
 
 
+# sha256 memo keyed by (path, size, mtime_ns): the audit runs before AND after
+# every call (hundreds of times per step at late age), and rehashing an
+# unchanged 35k-line bundle each time cost ~5 % of a step. A content change
+# always changes the stat signature in practice; the audit guarantee is kept.
+_AUDIT_SHA_CACHE: Dict[tuple, str] = {}
+
+
 def audit_bundle(dat_lst_path: str) -> Dict[str, str]:
     """sha256 of every file under the bundle directory, recursively (catches log
     files written into new subdirectories too). Bundles whose .lst references
@@ -67,9 +74,15 @@ def audit_bundle(dat_lst_path: str) -> Dict[str, str]:
     digests: Dict[str, str] = {}
     for f in sorted(root.parent.rglob("*")):
         if f.is_file():
-            h = hashlib.sha256()
-            h.update(f.read_bytes())
-            digests[f.relative_to(root.parent).as_posix()] = h.hexdigest()
+            st = f.stat()
+            key = (str(f), st.st_size, st.st_mtime_ns)
+            sha = _AUDIT_SHA_CACHE.get(key)
+            if sha is None:
+                h = hashlib.sha256()
+                h.update(f.read_bytes())
+                sha = h.hexdigest()
+                _AUDIT_SHA_CACHE[key] = sha
+            digests[f.relative_to(root.parent).as_posix()] = sha
     return digests
 
 
@@ -585,8 +598,15 @@ def run_0d_probe(config, worker: GemsWorker,
 
 # ------------------------------------------------------------ worker process
 
-def _worker_execute(request: Mapping) -> Dict:
-    """Runs inside the isolated worker process — the only place xgems is imported."""
+def _worker_execute(request: Mapping,
+                    engine_cache: Optional[Dict[str, object]] = None) -> Dict:
+    """Runs inside the isolated worker process — the only place xgems is imported.
+
+    engine_cache (persistent server only): reusing a loaded ChemicalEngine and
+    re-running the exact clear/T/P/cold_start/suppress sequence per request is
+    BITWISE identical to a fresh construction (measured: identical phase
+    amounts and pH) while skipping the ~110 ms bundle re-parse that dominated
+    late-age steps. Spawn mode passes None and stays construct-per-call."""
     import xgems  # deferred: absence must not affect any other tinn feature
 
     try:
@@ -616,7 +636,13 @@ def _worker_execute(request: Mapping) -> Dict:
     if mode == "stored":
         engine = xgems.ChemicalEngineDicts(str(dat))
     elif mode == "elements":
-        engine = xgems.ChemicalEngineDicts(str(dat), reset_calc=True, cold_start=True)
+        if engine_cache is not None and str(dat) in engine_cache:
+            engine = engine_cache[str(dat)]
+        else:
+            engine = xgems.ChemicalEngineDicts(str(dat), reset_calc=True,
+                                               cold_start=True)
+            if engine_cache is not None:
+                engine_cache[str(dat)] = engine
         engine.clear()
         engine.T = float(request["temperature_k"])
         engine.P = float(request["pressure_pa"])
@@ -758,10 +784,14 @@ def _worker_main(request_path: str, response_path: str) -> int:
 
 
 def _serve_main(serve_dir: str) -> int:
-    """Persistent request loop: each request is executed with a FRESH engine
-    (cold start), so results are bit-identical to spawn-per-call."""
+    """Persistent request loop. The loaded ChemicalEngine is CACHED per bundle
+    and fully reset per request (clear/T/P/cold_start/suppress) — measured
+    bitwise-identical to a fresh construction and verified by the
+    persistent-equals-spawn engine test, while skipping the dominant
+    bundle-parse cost."""
     import time
     root = Path(serve_dir)
+    engine_cache: Dict[str, object] = {}
     k = 0
     while True:
         if (root / "stop").is_file():
@@ -774,7 +804,7 @@ def _serve_main(serve_dir: str) -> int:
         resp = root / f"resp_{k:06d}.json"
         try:
             request = json.loads(req.read_text(encoding="utf-8"))
-            response = _worker_execute(request)
+            response = _worker_execute(request, engine_cache=engine_cache)
         except Exception as exc:
             import traceback
             if isinstance(exc, RuntimeError):

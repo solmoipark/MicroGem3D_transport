@@ -198,6 +198,8 @@ class ParrotKilloh:
         effective = scm_effective_params(phase_mass_fractions)
         self._scm_params = [effective[pid] for pid in SCM_PHASE_IDS]
         self.scm_effective_d = {pid: effective[pid][3] for pid in SCM_PHASE_IDS}
+        # fixed-grid prefix memo for alpha_at: {n_full: (clinker_state, t)}
+        self._prefix_cache: Dict[int, tuple] = {}
 
     # -- correction factors ------------------------------------------------
     def humidity_factor(self) -> float:
@@ -280,11 +282,30 @@ class ParrotKilloh:
         h = self.max_substep_days
         n_full = int(math.floor(t_days / h + 1e-9))
         remainder = t_days - n_full * h
-        clinker = np.zeros(self._n_clinker)
-        t = 0.0
-        for _ in range(n_full):
+        # fixed-grid prefix memo: the SAME _step chain (identical float ops in
+        # identical order, including the accumulated t), just not recomputed
+        # from zero on every query — late-age queries were integrating tens of
+        # thousands of substeps per call. Bitwise-neutral by construction;
+        # restarts rebuild the cache and land on the same values.
+        cache = self._prefix_cache
+        best = -1
+        for n in cache:
+            if best < n <= n_full:
+                best = n
+        if best >= 0:
+            clinker, t = cache[best]
+            clinker = clinker.copy()
+        else:
+            clinker = np.zeros(self._n_clinker)
+            t = 0.0
+            best = 0
+        for _ in range(best, n_full):
             clinker = self._step(clinker, t, h)
             t += h
+        if n_full not in cache:
+            cache[n_full] = (clinker.copy(), t)
+            if len(cache) > 16:
+                cache.pop(min(cache))
         if remainder > 1e-12 * max(1.0, t_days):
             clinker = self._step(clinker, t, remainder)
         alpha[:self._n_clinker] = clinker
