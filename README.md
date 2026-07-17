@@ -1,12 +1,15 @@
 # TINN 시멘트 수화 4D 플랫폼 v2
 
-배합(C3S 또는 OPC 4상), PSD, w/c, 온도, 시간 스케줄을 입력받아 질량 보존되는
-시간 의존 3D 미세구조를 결정론적·재시작 가능하게 출력하는 시뮬레이션 플랫폼.
-설계와 범위는 [PRD.md](PRD.md)가 유일한 기준 문서다.
+배합(C3S, OPC 4상, SCM 블렌드), PSD, w/c, 온도, 시간 스케줄을 입력받아 질량 보존되는
+시간 의존 3D 미세구조(상 분포·물 분배·공극·수송 지표)를 결정론적·재시작 가능하게
+출력하는 시뮬레이션 플랫폼. 설계와 범위는 [PRD.md](PRD.md)가 유일한 기준 문서다.
 
 ## 요구 사항
 
 - Python ≥ 3.11, `numpy`, `pydantic` (테스트는 `pytest`)
+- GEMS 백엔드(`gems3k`)는 xgems(pybind11)가 설치된 별도 인터프리터가 필요
+  (config `gems_worker_python` 또는 환경변수 `TINN_GEMS_PYTHON`; 예:
+  `miniforge3/envs/py313-xgems`). 미설치 시 합성 백엔드의 전 기능은 정상 동작.
 
 ## 빠른 시작
 
@@ -23,59 +26,86 @@ py -3 -m tinn.cli run examples\c3s_32.json --out runs\c3s
 # 체크포인트에서 재시작 (무중단 실행과 비트단위 동일)
 py -3 -m tinn.cli restart runs\c3s\ckpt_001 --out runs\c3s_restart
 
-# 리포트 (요약 JSON + 슬라이스 PNG + §6.3 판정)
+# 리포트 (요약 JSON + 슬라이스 PNG + 공극/수송 분석 + §6.3 판정)
 py -3 -m tinn.cli report runs\c3s
 
-# GEMS 백엔드 런 (xgems 환경 + PC 번들 필요; 인터프리터는 config 또는 TINN_GEMS_PYTHON)
+# GEMS 백엔드 런 — 기본 열역학 번들은 CNASH(gems_bundles/CNASH/Test-dat.lst,
+# InverseGems Test 번들 벤더링). config에서 gems_bundle_lst 생략 시 자동 사용.
+py -3 -m tinn.cli run examples\opc_cnash_32.json --out runs\opc_cnash
+
+# CSHQ(PC/Cemdata) 번들로 교체하려면 config에 명시:
+#   "gems_bundle_lst": "gems_bundles/PC/PC-dat.lst"
 py -3 -m tinn.cli run examples\opc_gems_32.json --out runs\opc_gems
 
 # 테스트
 py -3 -m pytest -q
 ```
 
+## 리포트 옵션
+
+```powershell
+py -3 -m tinn.cli report RUN_DIR `
+  --kc-constant-m2 1e-12 `        # Kozeny-Carman C 오버라이드 (기본 d_mean²/180)
+  --gel-rel-diffusivity 0.0025 `  # 전도도 네트워크의 C-S-H 상대확산계수 (Garboczi–Bentz)
+  --face-mixing-beta 0.0          # 목 보정 노브 (0=조화[기본]…1=부분 복셀 면에서 산술)
+```
+
+리포트 산출: 연결/고립 모세관 공극률, 부피 가중 공극 크기분포(서브복셀 슬래브 꼬리
+포함), 3축 유효 상대확산계수 D_eff/D₀(전도도 네트워크, Jacobi-CG), KC 투수성,
+percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
+
+## 해상도 지침 (FA30 28d 사다리 실측, PRD §1.3)
+
+| 목적 | 권장 해상도 | 28일 런타임 |
+|---|---|---|
+| 공극률·반응도·상 조성 | 1.0 µm / 32³ | ~15분 (GEMS) |
+| 연결성·크기분포·KC | 0.5 µm / 64³ | ~20분 |
+| D_rel 정밀·수렴 확인 | 0.25 µm / 128³ | ~5시간 |
+
+부피·화학 지표는 해상도 무관(<1%), 크기·수송 지표는 격자 세분으로 수렴
+(D_rel의 후기 재령 격자 의존은 위상 결손 — PRD §1.3 실측 기록 참조).
+
+## 주요 config 필드 (전체는 PRD §1.2)
+
+- `binder.mass_fractions` — C3S/C2S/C3A/C4AF + SCM(slag/fly_ash/metakaolin/silica_fume)
+- `material_psd` — 재료별 PSD 맵(키: "clinker"/SCM id; 생략 시 공용 `psd`)
+- `material_shape` — 재료별 타원체 형상(반축비, 부피 정규화; 생략 시 구형)
+- `rve` — grid_size 32/64/128, voxel_size_um 0.25–1.0, seed
+- `chemistry` — backend `stoichiometric`|`gems3k`; `gems_bundle_lst`(기본 CNASH),
+  `gems_gel_porosity`(기본 CSHQ/CNASH 0.28), `gems_worker_python`
+- 지속 GEMS 워커는 기본 활성(`TINN_GEMS_PERSISTENT=0`로 비활성) + 입력해시 메모이제이션
+
 ## 진행 상태 (PRD §3 마일스톤)
 
-- [x] **M0** — 골격과 초기화: config/registry/geometry/cli, 32³ 다상 RVE 초기화,
-      동일 시드 → 동일 해시, 고체분율·w/c 오차 리포트 (~1e-5 수준).
-- [x] **M1** — 보존 코어: 트랜잭션 스테핑(trial→검사→commit/rollback), 원소 수지
-      ~4e-25 mol, 물 수지 0, 복셀 항등식 ≤1e-12, Zarr-v2 체크포인트/재시작
-      비트단위 동등, 32³ C3S 런 40초.
-- [x] **M2** — P&K 동역학: 2 프리셋(Elakneswaran 2018 / CemGEMS 2021) 발표 표
-      그대로, SRM 114q(Blaine 381.8) 4상 alpha 스케줄, OPC 32³ 3D 런 32초에
-      상별 원장 폐쇄. 수화물 외피 코팅으로 후기 unmet이 정직하게 기록됨.
-- [x] **M3** — GEMS 0D 프로브: 격리 워커(xgems는 워커 프로세스에서만 import),
-      번들 sha256 전후 감사, §6.2 앵커 2건 재현(pH 13.596951 / 12.6619),
-      0D 누적 프로브 원소·물 폐쇄 ≤3e-14. 워커 인터프리터:
-      `miniforge3/envs/py313-xgems` (환경변수 `TINN_GEMS_PYTHON`로 재지정).
-- [x] **M4** — GEMS→3D 결합: product-parcel 원장(파슬이 자체 원소 벡터·골격
-      부피 보유, CSHQ 고정 화학식 재해석 없음), 클러스터별 정준 스케일 평형,
-      OPC 32³ GEMS 런 1/3/7일 완주(12분, 거부 0), §6.1 폐쇄(원소 ≤2.8e-22)
-      + §6.3 sanity band 전부 pass. 예제: `examples/opc_gems_32.json`.
-- [x] **M5** — 분석과 리포트: `tinn report RUN_DIR`가 체크포인트에서 §6.1
-      원장 재검증, 공극률 시계열, 액체 percolation, 상 분율, 중앙 슬라이스
-      PNG(의존성 없는 자체 PNG writer), §6.3 자동 판정을 일괄 생성.
-- [x] **v2.1** — SCM 4종(slag/fly_ash/metakaolin/silica_fume)을 kinetic 상으로:
-      InverseGems의 조성·밀도·로지스틱 반응도·CH 가용성 보정 이식
-      (교차검증: OPC70/FA30 α_FA(360d)=0.5522 정확 일치).
-- [x] **v2.2** — 전평형 재용해(gems3k snapshot 모드: CH 소모·상 재배열이
-      평형에서 발생 — FA30 28일에서 CH 47.5→11.7 pmol 감소 재현), 재료별
-      입자군+개별 PSD(`material_psd`), 구조 기반 공극 분석(주기 EDT 크기분포,
-      연결/고립 분리, Kozeny-Carman 투수성), 지속 GEMS 워커(28일 블렌드 2.2분).
+- [x] **M0–M5** — 골격/보존 코어/P&K 동역학/GEMS 0D/GEMS→3D 결합/분석 리포트
+      (원소 수지 ~1e-24 mol, 복셀 항등식 ≤1e-12, 체크포인트 재시작 비트동일).
+- [x] **v2.1** — SCM 4종을 kinetic 상으로: InverseGems의 조성·밀도·로지스틱
+      반응도·CH 가용성 보정 이식 (α_FA(360d)=0.5522 정확 일치).
+- [x] **v2.2** — 전평형 재용해(gems3k snapshot: CH 소모·상 재배열이 평형에서
+      발생), 재료별 입자군+개별 PSD, 구조 기반 공극 분석, 지속 GEMS 워커.
+- [x] **rev.2 (2026-07-16~17)** — 겔 전도 용해(클링커 α 정체 해소: 실현 α가 P&K
+      목표의 93~96%), 공간 충전 동결·오버플로 배치(장기 런 안정화, FA30 360일 완주),
+      기본 번들 CNASH 채택(InverseGems와 28d 상 조성 0.5~14% 일치 교차검증),
+      2-스케일 공극 분석(네트워크 D_eff + 서브복셀 크기분포), 해상도 수렴 사다리
+      (32/64/128³), 재료별 타원체 형상(효과 실측: D_rel −4.4% — 구형 유지 판정),
+      목 보정 노브(1d 사다리 평탄화, 28d는 위상 한계 — 기본 조화 유지).
 
 ## 예제 config
 
-- `examples/c3s_32.json` — 순수 C3S, w/C3S 0.50, 293.15 K, tabulated alpha (§6.2 C3S 픽스처).
-- `examples/opc_srm114q_32.json` — NIST SRM 114q 4상 레시피(60/14/7/10, 미배정 9%),
-  P&K 프리셋 `pk_elakneswaran_2018` (동역학 구현은 M2).
+- `examples/c3s_32.json` — 순수 C3S, tabulated alpha (§6.2 C3S 픽스처).
+- `examples/opc_srm114q_32.json` — NIST SRM 114q 4상, P&K `pk_elakneswaran_2018`.
+- `examples/opc_cnash_32.json` — OPC 4상 + **기본 CNASH 번들**(gems_bundle_lst 생략).
+- `examples/opc_gems_32.json` — OPC 4상 + PC(CSHQ) 번들 명시.
+- `examples/opc_slag_populations_32.json` — 슬래그 블렌드 + 재료별 PSD.
 
 ## 모듈 (상한 16, 현재 16 — 상한 도달, 추가 시 통합·삭제 선행)
 
 `src/tinn/`: `config.py`(스키마+해시), `registry.py`(상/성분 데이터),
-`geometry.py`(주기 RVE 초기화, 3계층 입자), `kinetics.py`(Tabulated+ParrotKilloh),
-`state.py`(SimulationState, mol 권위 원장), `ledger.py`(§6.1 불변식),
-`dissolution.py`(액체 접촉 가중 배분), `transport.py`(클러스터 라벨링+리매핑),
-`backend.py`(ReactionBackend+합성), `morphology.py`(내부/외부 배치),
-`engine.py`(트랜잭션 오케스트레이터), `storage.py`(Zarr-v2 체크포인트),
-`gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브+GemsBackend),
-`analysis.py`(읽기 전용 분석+리포트+§6.3 판정+PNG),
+`geometry.py`(주기 RVE 초기화, 3계층 입자, 타원체 형상), `kinetics.py`(Tabulated+
+ParrotKilloh+SCM 로지스틱), `state.py`(SimulationState, mol 권위 원장),
+`ledger.py`(§6.1 불변식), `dissolution.py`(전도 면수 가중 배분 — 겔 전도 포함),
+`transport.py`(클러스터 라벨링+리매핑), `backend.py`(ReactionBackend+합성),
+`morphology.py`(배치+제거+오버플로), `engine.py`(트랜잭션 오케스트레이터),
+`storage.py`(Zarr-v2 체크포인트), `gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브+
+GemsBackend snapshot), `analysis.py`(공극/수송 분석+리포트+§6.3 판정+PNG),
 `cli.py`(validate-config/run/restart/report), `__init__.py`.
