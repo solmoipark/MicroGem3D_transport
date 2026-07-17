@@ -152,23 +152,26 @@ def place(hydrate_fraction: np.ndarray, capillary_liquid: np.ndarray,
         remaining = leftovers[c_src]
         rem_sum = float(remaining.sum())
         member = cell_cluster == c_src
-        cap_field = np.where(member, vacated + capillary_liquid, 0.0)
+        # placement float dust can leave ~-1e-16 liquid in a voxel — clipping
+        # keeps such voxels out of the capacity pool so the proportional take
+        # never goes negative there (rev.2 review finding)
+        cap_field = np.where(member,
+                             np.clip(vacated + capillary_liquid, 0.0, None), 0.0)
         total_cap = float(cap_field.sum())
-        if total_cap < rem_sum:
+        # dust tolerance mirrors remove(): a near-exact fit (engine freeze
+        # gate and this gate disagree only at ulp level) proceeds with a
+        # sanctioned dust overdraw instead of aborting the run
+        if total_cap <= 0.0 or rem_sum > total_cap * (1.0 + 1e-12) + 1e-30:
             unplaced += rem_sum  # genuine shortfall — volume is never dropped
             continue
         take_field = cap_field * (rem_sum / total_cap)
         residual = rem_sum - float(take_field.sum())
         if residual != 0.0:
+            # dust-scale by construction (float summation error of the ratio
+            # multiply): book it at the largest-capacity voxel, deterministic,
+            # same sanctioned-overdraw rule as the main loop's final cell
             flat_t = take_field.ravel()
-            flat_c = cap_field.ravel()
-            for j in np.flatnonzero(flat_c > 0.0):
-                room = flat_c[j] - flat_t[j]
-                t = min(residual, room) if residual > 0.0 else max(residual, -flat_t[j])
-                flat_t[j] += t
-                residual -= t
-                if residual == 0.0:
-                    break
+            flat_t[int(np.argmax(cap_field.ravel()))] += residual
         frac_h = remaining / rem_sum
         for h in range(n_h):
             hydrate_fraction[h] += frac_h[h] * take_field

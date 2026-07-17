@@ -185,6 +185,59 @@ def test_bound_water_returns_on_shrink():
     assert t2.water_bound_mol < t1.water_bound_mol  # bound water RETURNED
 
 
+def test_total_dryout_degrades_to_unmet():
+    """rev.2 review finding: with gel-conduit dissolution, a fully dried RVE
+    (no liquid cluster anywhere) used to reject cluster_dryout forever — the
+    shortfall is dt-independent, so the run aborted. Unreachable sites must
+    give their target back as honest unmet and the step must ACCEPT."""
+    cfg = _short_cfg()
+    eng = Engine(cfg, reaction_backend=FakeSnapshotBackend(3e-12))
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    # surgical gasification: every drop of capillary liquid becomes gas, the
+    # water and element ledgers are re-anchored consistently
+    t1.capillary_gas += t1.capillary_liquid
+    t1.capillary_liquid[:] = 0.0
+    t1.initial_water_mol -= t1.water_free_mol
+    t1.initial_elements = (t1.initial_elements
+                           - t1.cluster_inventory.sum(axis=0)
+                           - element_vector(REG.get("H2O").formula,
+                                            t1.water_free_mol))
+    t1.water_free_mol = 0.0
+    t1.cluster_inventory = np.zeros((0, len(ELEMENT_IDS)))
+    t2, rej2, _ = eng.try_step(t1, 2.0)   # kinetics still demand dn > 0
+    assert rej2 is None, rej2 and rej2.reason
+    assert float(t2.unmet_mol.sum()) > float(t1.unmet_mol.sum())
+    # frozen everything: assemblage untouched, no phantom dissolution
+    assert np.array_equal(t2.hydrate_fraction, t1.hydrate_fraction)
+    rep = ledger.check_all(t2, REG)
+    assert rep.ok, rep.violations
+
+
+def test_place_overflow_dust_and_negative_liquid():
+    """rev.2 review findings on the overflow pass: negative-dust liquid must
+    not enter the capacity pool (no negative hydrate takes), and a near-exact
+    fit within the dust tolerance places instead of rejecting."""
+    n = 8
+    hyd = np.zeros((4, n, n, n))
+    liq = np.zeros((n, n, n))
+    vac = np.zeros((n, n, n))
+    clu = np.zeros((n, n, n), dtype=np.int64)
+    liq[4, 4, 4] = 0.5                 # the only real capacity, far from source
+    liq[0, 0, 1] = -1e-16              # placement dust from an earlier source
+    dem = np.zeros((4, n, n, n))
+    dem[1, 0, 0, 0] = 0.5 * (1.0 + 5e-13)   # within the 1e-12 fit tolerance
+    out = morphology.place(hyd, liq, vac, dem, clu, clu)
+    assert out.status == morphology.STATUS_OK
+    assert hyd.min() >= 0.0                          # no negative takes
+    assert hyd[1, 0, 0, 1] == 0.0                    # dust voxel excluded
+    assert out.placed_vol_vox == pytest.approx(0.5, rel=1e-11)
+    # beyond the tolerance: still an honest capacity reject
+    dem[1, 0, 0, 0] = 0.6
+    out2 = morphology.place(hyd, liq, vac, dem, clu, clu)
+    assert out2.status == morphology.STATUS_CAPACITY
+
+
 def test_snapshot_backend_receives_owned_solids():
     cfg = _short_cfg()
     b1 = FakeSnapshotBackend(3e-12)

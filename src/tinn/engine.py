@@ -121,24 +121,46 @@ class Engine:
                                 _neighbor_best_label(labels, prev_liquid))
         site_mask = vacated > 0.0
         # a coated site (gel-conduit dissolution, PRD §4.2) may sit several
-        # voxels from any liquid: propagate labels ring by ring — a
-        # deterministic BFS through the solid to the nearest cluster. Applied
-        # to SITE cells only so the recon ownership partition of non-site dry
-        # regions is untouched.
+        # voxels from any liquid: propagate labels ring by ring, RELAYED ONLY
+        # through gel-bearing voxels or the sites themselves — the physical
+        # conduit is gel pore water, so labels must not flood across capillary
+        # gas or bare particle interiors (rev.2 review finding). Applied to
+        # SITE cells only so the recon ownership of non-site dry regions is
+        # untouched.
         if np.any(site_mask & (site_cluster < 0)):
+            relay = ((trial.hydrate_fraction.sum(axis=0) > transport.LIQ_EPS)
+                     | site_mask)
             deep = site_cluster.copy()
             for _ in range(2 * trial.grid_size):
                 if not (site_mask & (deep < 0)).any():
                     break
-                nxt = np.where(deep >= 0, deep,
-                               _neighbor_best_label(deep, prev_liquid))
+                nxt = np.where(relay, _neighbor_best_label(deep, prev_liquid),
+                               np.int64(-1))
+                nxt = np.where(deep >= 0, deep, nxt)
                 if int((nxt >= 0).sum()) == int((deep >= 0).sum()):
                     deep = nxt  # front stopped growing — rest is unreachable
                     break
                 deep = nxt
             site_cluster = np.where(site_mask, deep, site_cluster)
-        if np.any(site_mask & (site_cluster < 0)):
-            return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+        # a site with no conduit path to ANY cluster cannot dissolve — its
+        # target goes back to the solid as honest unmet (never a reject: the
+        # shortfall is dt-independent, so rejecting could only abort the run;
+        # rev.2 review finding: total dryout must degrade gracefully too)
+        unreachable = site_mask & (site_cluster < 0)
+        if unreachable.any():
+            for k, p in enumerate(KINETIC_PHASE_IDS):
+                give_back = np.where(unreachable, dis.removed_vol[k], 0.0)
+                back_vol = float(give_back.sum())
+                if back_vol <= 0.0:
+                    continue
+                chan = SOLID_PHASE_IDS.index(p)
+                trial.anhydrous_fraction[chan] += give_back
+                dis.removed_vol[k] -= give_back
+                vm = trial.vm_vox(reg, p)
+                dis.removed_mol[k] -= back_vol / vm
+                dis.unmet_mol[k] += back_vol / vm
+            vacated = dis.removed_vol.sum(axis=0)
+            site_mask = vacated > 0.0
 
         # per-cluster released mol and water availability
         released = np.zeros((n_clusters, len(KINETIC_PHASE_IDS)))
@@ -292,7 +314,13 @@ class Engine:
                 cap_c = (float(np.where(member_c, trial.capillary_liquid, 0.0).sum())
                          + s * float(np.where(member_c, vacated, 0.0).sum())
                          + float(np.clip(-delta_c, 0.0, None).sum()))
-                if float(np.clip(delta_c, 0.0, None).sum()) > cap_c:
+                # 1e-9 relative margin: the placement layers recompute this
+                # capacity through different float chains (give-back, remove
+                # clamps, per-voxel mutation) — a near-exact fit must freeze
+                # rather than gamble on ulp agreement, because a capacity
+                # reject here is dt-independent and would abort the run
+                # (rev.2 review finding)
+                if float(np.clip(delta_c, 0.0, None).sum()) > cap_c * (1.0 - 1e-9):
                     scale_c[c] = 0.0
                     residual[c] = inv_in[c]
                     continue
