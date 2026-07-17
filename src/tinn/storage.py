@@ -148,7 +148,7 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         raise StorageError(
             f"checkpoint format {header['format_version']} is not supported by "
             f"this build (current {FORMAT_VERSION}); pre-v2.2 checkpoints "
-            f"predate reversible chemistry — rerun from the config "
+            f"predate reversible chemistry - rerun from the config "
             f"(no migration code, PRD 0.3)")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
@@ -156,13 +156,13 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         if tuple(header[key]) != current:
             raise StorageError(
                 f"checkpoint {key} {header[key]} does not match this build "
-                f"{list(current)} — ledger vectors would be misinterpreted")
+                f"{list(current)} - ledger vectors would be misinterpreted")
     hydrate_ids = tuple(header["hydrate_phase_ids"])  # run-scoped, header-owned
     config = TinnConfig.model_validate(header["config"])
     if config.config_hash() != header["config_hash"]:
         raise StorageError(
             "checkpoint config_hash does not match the hash of its own embedded "
-            "config under this build — the config schema changed between versions; "
+            "config under this build - the config schema changed between versions; "
             "restarting would silently poison run provenance (no silent fallback)")
 
     arrays = {f: _read_zarr_array(root / "arrays" / f) for f in _DENSE_FIELDS}

@@ -231,7 +231,7 @@ class GemsWorker:
             if el == CHARGE_ELEMENT_ID:
                 if v != 0.0:
                     raise GemsError(
-                        "charge (Zz) targets are not supported — released "
+                        "charge (Zz) targets are not supported - released "
                         "inventories are charge-neutral by construction", kind="config")
                 continue
             if not math.isfinite(v) or v < 0.0:
@@ -480,7 +480,7 @@ class GemsBackend:
                 if mol_scaled > 1e-9 * total_scaled:
                     raise GemsError(
                         f"suppressed clinker phase {phase} precipitated "
-                        f"{mol_scaled!r} mol (scaled, input {total_scaled!r}) — "
+                        f"{mol_scaled!r} mol (scaled, input {total_scaled!r}) - "
                         f"suppression failed", kind="internal")
                 residual_phases.append(phase)
                 continue

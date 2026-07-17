@@ -182,7 +182,7 @@ class Engine:
         else:
             raise RuntimeError(
                 f"cluster inventory has {state.cluster_inventory.shape[0]} rows but "
-                f"{n_clusters} clusters were labeled — state is corrupted (no fallback)")
+                f"{n_clusters} clusters were labeled - state is corrupted (no fallback)")
 
         # ---- reaction phase (mode-dependent) --------------------------------
         # incremental (stoichiometric): parcels are NEW precipitates appended.
@@ -311,16 +311,37 @@ class Engine:
                     env_new[h_index[pc.phase_id]] += _envelope_vox(pc)
                 delta_c = env_new - own_vol[c]
                 member_c = recon == c
+                grow_c = float(np.clip(delta_c, 0.0, None).sum())
+                vac_tot_c = (s * float(np.where(member_c, vacated, 0.0).sum())
+                             + float(np.clip(-delta_c, 0.0, None).sum()))
                 cap_c = (float(np.where(member_c, trial.capillary_liquid, 0.0).sum())
-                         + s * float(np.where(member_c, vacated, 0.0).sum())
-                         + float(np.clip(-delta_c, 0.0, None).sum()))
+                         + vac_tot_c)
                 # 1e-9 relative margin: the placement layers recompute this
                 # capacity through different float chains (give-back, remove
                 # clamps, per-voxel mutation) — a near-exact fit must freeze
                 # rather than gamble on ulp agreement, because a capacity
                 # reject here is dt-independent and would abort the run
                 # (rev.2 review finding)
-                if float(np.clip(delta_c, 0.0, None).sum()) > cap_c * (1.0 - 1e-9):
+                freeze = grow_c > cap_c * (1.0 - 1e-9)
+                if not freeze:
+                    # water-relocation limit (rev.2 review finding 5, now
+                    # REPRODUCED): growth beyond this step's vacancies
+                    # displaces liquid, and the displaced volume that
+                    # chemistry does not consume must fit the cluster's own
+                    # gas space — reconciliation deficit is exactly
+                    # grow - vacancies - (chem + gel net) water volume, and a
+                    # gas-free saturated pocket rejects balance_water at
+                    # EVERY dt (snapshot deltas are not dt-scaled). Freeze
+                    # instead: a pocket with nowhere to push its water stops
+                    # hydrating, which is the same space-filling physics.
+                    gas_c_vol = float(np.where(member_c, trial.capillary_gas,
+                                               0.0).sum())
+                    water_out_vol = (result.water_consumed_mol * vm_w
+                                     + float((env_new * gel_eps).sum())
+                                     - owned_gel_c[c])
+                    deficit_est = grow_c - vac_tot_c - water_out_vol
+                    freeze = deficit_est > gas_c_vol - 1e-12 * max(1.0, gas_c_vol)
+                if freeze:
                     scale_c[c] = 0.0
                     residual[c] = inv_in[c]
                     continue
@@ -532,7 +553,7 @@ class Engine:
         if tuple(state.hydrate_ids) != self.hydrate_ids:
             raise RuntimeError(
                 "checkpoint hydrate channels do not match the backend's channel "
-                f"order — bundle changed between runs? state: {state.hydrate_ids} "
+                f"order - bundle changed between runs? state: {state.hydrate_ids} "
                 f"backend: {self.hydrate_ids}")
         sched = self.config.schedule
         outputs = [t for t in sched.output_times_h if t > state.time_h + 1e-12]

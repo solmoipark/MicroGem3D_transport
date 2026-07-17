@@ -214,6 +214,39 @@ def test_total_dryout_degrades_to_unmet():
     assert rep.ok, rep.violations
 
 
+def test_saturated_gasfree_pocket_freezes_not_aborts():
+    """rev.2 review finding 5, REPRODUCED then fixed: in a gas-free saturated
+    cluster, snapshot growth displaces liquid that chemistry does not consume;
+    the reconciliation deficit has no gas space to land in and balance_water
+    rejected at EVERY dt (snapshot deltas are not dt-scaled) — an abort. The
+    freeze gate now includes the water-relocation limit."""
+    cfg = _short_cfg()
+    eng = Engine(cfg, reaction_backend=FakeSnapshotBackend(1e-10))
+    state = eng.initial_state()
+    assert float(state.capillary_gas.sum()) == 0.0
+    t1, rej, _ = eng.try_step(state, 2.0)
+    assert rej is None, rej and rej.reason        # frozen, not rejected
+    assert float(t1.hydrate_fraction.sum()) == 0.0
+    assert float(t1.unmet_mol.sum()) > 0.0
+    rep = ledger.check_all(t1, REG)
+    assert rep.ok, rep.violations
+    # control: the same growth with gas headroom proceeds and places
+    state2 = eng.initial_state()
+    move = 0.2 * state2.capillary_liquid
+    state2.capillary_gas += move
+    state2.capillary_liquid -= move
+    moved_mol = float(move.sum()) / state2.vm_vox(REG, "H2O")
+    state2.initial_water_mol -= moved_mol
+    state2.water_free_mol -= moved_mol
+    state2.initial_elements = state2.initial_elements - element_vector(
+        REG.get("H2O").formula, moved_mol)
+    t2, rej2, _ = eng.try_step(state2, 2.0)
+    assert rej2 is None, rej2 and rej2.reason
+    assert float(t2.hydrate_fraction.sum()) > 0.0
+    rep2 = ledger.check_all(t2, REG)
+    assert rep2.ok, rep2.violations
+
+
 def test_place_overflow_dust_and_negative_liquid():
     """rev.2 review findings on the overflow pass: negative-dust liquid must
     not enter the capacity pool (no negative hydrate takes), and a near-exact

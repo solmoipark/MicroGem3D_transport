@@ -440,13 +440,13 @@ class TinnConfig(BaseModel):
             if not kept:
                 raise ValueError(
                     f"{label} PSD lies entirely above the rasterizable "
-                    f"maximum {d_max_allowed_um:.3f} um — truncation would "
+                    f"maximum {d_max_allowed_um:.3f} um - truncation would "
                     f"leave no particles")
             kept_vf = sum(b.volume_fraction for b in kept)
             if kept_vf <= 0.0:
                 raise ValueError(
                     f"{label} PSD has no volume below the rasterizable "
-                    f"maximum — truncation would leave no particles")
+                    f"maximum - truncation would leave no particles")
             self._psd_truncation[label] = 1.0 - kept_vf
             psd.bins = [PSDBin(d_lo_um=b.d_lo_um, d_hi_um=b.d_hi_um,
                                volume_fraction=b.volume_fraction / kept_vf)
@@ -488,13 +488,13 @@ class TinnConfig(BaseModel):
             if missing:
                 raise ValueError(
                     f"tabulated kinetics has no alpha series for binder phases "
-                    f"{sorted(missing)} — every reacting phase needs a schedule"
+                    f"{sorted(missing)} - every reacting phase needs a schedule"
                 )
             horizon = self.kinetics.table.times_h[-1]
             if self.schedule.output_times_h[-1] > horizon:
                 raise ValueError(
                     f"output time {self.schedule.output_times_h[-1]} h is beyond the "
-                    f"tabulated kinetics horizon {horizon} h — no extrapolation"
+                    f"tabulated kinetics horizon {horizon} h - no extrapolation"
                 )
         if self.chemistry.backend == "stoichiometric":
             missing = active - set(self.chemistry.stoichiometric_rules)
