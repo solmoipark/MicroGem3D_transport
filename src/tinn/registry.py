@@ -31,11 +31,10 @@ SCM_PHASE_IDS: Tuple[str, ...] = ("slag", "fly_ash", "metakaolin", "silica_fume"
 # Soluble salt carriers (PRD 1.2 v3.0/E3): the sulfate and alkali INPUT
 # channels. Interground gypsum/hemihydrate/anhydrite carry SO4 (AFt/AFm
 # timing); arcanite/thenardite carry the water-soluble alkalis that set pore
-# solution pH. They dissolve by first-order kinetics
-# (kinetics.SALT_TAU_H_PRESETS) and — unlike clinker — are NOT suppressed in
-# the GEMS equilibrium, so an oversaturated solution re-precipitates them as
-# equilibrium phases: the system converges to solubility control even though
-# the release schedule is a first-order approximation.
+# solution pH. They have NO rate law: dissolution is solubility-controlled, so
+# the engine offers the equilibrium whatever water can currently reach and
+# GEMS decides what stays solid (PRD 4.2 v3.0/E3b). Unlike clinker they are
+# never suppressed, so whatever the equilibrium keeps precipitates right back.
 SALT_PHASE_IDS: Tuple[str, ...] = ("gypsum", "hemihydrate", "anhydrite",
                                    "arcanite", "thenardite")
 KINETIC_PHASE_IDS: Tuple[str, ...] = (CLINKER_PHASE_IDS + SCM_PHASE_IDS
