@@ -64,6 +64,14 @@ class SimulationState:
     parcels: Dict[str, List]         # immutable rows appended on commit
     remap_events: Dict[str, List]
     cluster_inventory: np.ndarray    # (K, n_elements) mol, dissolved-solution ledger
+    # E2 (PRD 2.3/4.5 v3.0): per-cluster endmember pools (K, M) — the
+    # COMPOSITION memory of each cluster's owned hydrates. Amounts stay
+    # volume-share derived; these rows only set the endmember RATIOS fed back
+    # to re-equilibration, are replaced by the cluster's own parcels on every
+    # solved step (non-compounding), and are remapped by the same liquid
+    # overlap as cluster_inventory. Zero-overlap rows drop back to the global
+    # average (conservation lives in the global ledgers, not here).
+    cluster_endmember_mol: np.ndarray  # (K, M)
     # --- ledger / header (mol is authoritative) ---
     time_h: float
     dt_h: float
@@ -134,7 +142,8 @@ class SimulationState:
                     self.hydrate_elements_ch, self.endmember_mol,
                     self.endmember_elements, self.boundary_exchanged_elements,
                     self.injected_elements,
-                    self.initial_elements, self.cluster_inventory):
+                    self.initial_elements, self.cluster_inventory,
+                    self.cluster_endmember_mol):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(repr(self.hydrate_ids).encode())
         h.update(repr(self.endmember_ids).encode())
@@ -228,6 +237,7 @@ class SimulationState:
                      "skel_vol_vox": [], "bulk_vol_vox": []},
             remap_events={"time_h": [], "prev": [], "new": [], "overlap_vox": []},
             cluster_inventory=np.zeros((0, len(ELEMENT_IDS))),
+            cluster_endmember_mol=np.zeros((0, len(em_ids))),
             time_h=0.0,
             dt_h=config.schedule.dt_initial_h,
             phase_mol=phase_mol,

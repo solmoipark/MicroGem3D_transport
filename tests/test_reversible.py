@@ -213,6 +213,7 @@ def test_total_dryout_degrades_to_unmet():
                                             t1.water_free_mol))
     t1.water_free_mol = 0.0
     t1.cluster_inventory = np.zeros((0, len(ELEMENT_IDS)))
+    t1.cluster_endmember_mol = np.zeros((0, t1.cluster_endmember_mol.shape[1]))
     t2, rej2, _ = eng.try_step(t1, 2.0)   # kinetics still demand dn > 0
     assert rej2 is None, rej2 and rej2.reason
     assert float(t2.unmet_mol.sum()) > float(t1.unmet_mol.sum())

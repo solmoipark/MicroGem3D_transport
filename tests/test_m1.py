@@ -71,6 +71,7 @@ def _blank_state(n_liquid_voxels=0) -> SimulationState:
                  "skel_vol_vox": [], "bulk_vol_vox": []},
         remap_events={"time_h": [], "prev": [], "new": [], "overlap_vox": []},
         cluster_inventory=np.zeros((0, len(ELEMENT_IDS))),
+        cluster_endmember_mol=np.zeros((0, len(HYDRATE_PHASE_IDS))),
         time_h=0.0, dt_h=1.0,
         phase_mol=np.zeros(len(KINETIC_PHASE_IDS)), initial_phase_mol=np.zeros(len(KINETIC_PHASE_IDS)),
         unmet_mol=np.zeros(len(KINETIC_PHASE_IDS)), hydrate_mol=np.zeros(4),

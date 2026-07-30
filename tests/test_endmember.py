@@ -329,3 +329,236 @@ def test_from_geometry_requires_rows_for_multi_endmember():
             cfg, REG, rve, "stoichiometric", hydrate_ids=("CSH",),
             hydrate_endmembers={"CSH": ("TobH", "JenD")},
             endmember_elements=None)
+
+
+# ---------------- E2: per-cluster endmember pools (PRD 4.5 v3.0) ----------------
+
+def _em_rows():
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    tob = np.zeros(len(ELEMENT_IDS))
+    jen = np.zeros(len(ELEMENT_IDS))
+    tob[el["Ca"]], tob[el["Si"]], tob[el["O"]], tob[el["H"]] = 0.8, 1.0, 3.0, 2.0
+    jen[el["Ca"]], jen[el["Si"]], jen[el["O"]], jen[el["H"]] = 1.5, 1.0, 4.0, 3.0
+    return tob, jen
+
+
+class TwoEndmemberSnapshotBackend:
+    """FakeSnapshotBackend variant with a two-endmember CSH channel: emits a
+    fixed CSH amount at a scripted TobH/JenD split (plus optional CH), records
+    the solid_elements it was fed, and closes elements/water like the W2 fake."""
+    backend_id = "stoichiometric"
+    hydrate_ids = HYDRATE_PHASE_IDS
+    mode = "snapshot"
+
+    def __init__(self, csh_mol: float, tob_frac: float, ch_mol: float = 0.0):
+        self.csh_mol, self.tob_frac, self.ch_mol = csh_mol, tob_frac, ch_mol
+        tob, jen = _em_rows()
+        self.hydrate_endmembers = {h: (h,) for h in HYDRATE_PHASE_IDS}
+        self.hydrate_endmembers["CSH"] = ("TobH", "JenD")
+        self.endmember_elements = {
+            h: element_vector(REG.get(h).formula, 1.0) for h in HYDRATE_PHASE_IDS
+            if h != "CSH"}
+        self.endmember_elements["TobH"] = tob
+        self.endmember_elements["JenD"] = jen
+        self.calls = []
+
+    def react(self, released_mol, water_available_mol, inventory,
+              solid_elements=None):
+        self.calls.append({"released": dict(released_mol),
+                           "solid_elements": None if solid_elements is None
+                           else np.asarray(solid_elements).copy()})
+        e_in = np.asarray(inventory, dtype=float).copy()
+        for pid, mol in released_mol.items():
+            e_in += element_vector(REG.get(pid).formula, mol)
+        if solid_elements is not None:
+            e_in += np.asarray(solid_elements)
+        parcels = []
+        if self.csh_mol > 0.0:
+            m_t = self.csh_mol * self.tob_frac
+            m_j = self.csh_mol - m_t
+            tob, jen = _em_rows()
+            vec = m_t * tob + m_j * jen
+            entry = REG.get("CSH")
+            parcels.append(Parcel(
+                phase_id="CSH", mol=self.csh_mol, elements=vec,
+                skel_vol_cm3=self.csh_mol * entry.skeleton_molar_volume_cm3,
+                endmember_mol={"TobH": m_t, "JenD": m_j}))
+            e_in = e_in - vec
+        if self.ch_mol > 0.0:
+            entry = REG.get("CH")
+            vec = element_vector(entry.formula, self.ch_mol)
+            parcels.append(Parcel(
+                phase_id="CH", mol=self.ch_mol, elements=vec,
+                skel_vol_cm3=self.ch_mol * entry.skeleton_molar_volume_cm3))
+            e_in = e_in - vec
+        h_idx = ELEMENT_IDS.index("H")
+        h_new = sum(float(pc.elements[h_idx]) for pc in parcels)
+        h_owned = (0.0 if solid_elements is None
+                   else float(np.asarray(solid_elements)[h_idx]))
+        water_used = (h_new - h_owned) / 2.0
+        e_in = e_in + element_vector(REG.get("H2O").formula, water_used)
+        return ReactionResult(status=STATUS_OK, parcels=parcels,
+                              water_consumed_mol=water_used,
+                              residual_inventory=e_in)
+
+
+def _csh_slice(eng):
+    return eng._em_slice["CSH"]
+
+
+def test_pool_replacement_and_pool_ratio_feed():
+    """Core E2 semantics: (a) a solved cluster's pool IS its own parcels after
+    the step; (b) the next step's fed composition follows the cluster's pool
+    ratio, NOT the global average, at the volume-share amount."""
+    cfg = _short_cfg()
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b1)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    sl = _csh_slice(eng)
+    # (a) absolute replacement: single wet cluster owns the whole parcel split
+    pools = t1.cluster_endmember_mol
+    assert pools.shape == (t1.cluster_inventory.shape[0], eng._n_em)
+    total = pools[:, sl].sum(axis=0)
+    assert total[0] == pytest.approx(1.5e-12, rel=1e-12)   # TobH
+    assert total[1] == pytest.approx(1.5e-12, rel=1e-12)   # JenD
+    # (b) bias ONE cluster's pool away from the global 50:50 and step again —
+    # the fed solid_elements must follow the 90:10 pool, not the global ratio
+    t1.cluster_endmember_mol = pools.copy()
+    rows = np.abs(pools[:, sl]).sum(axis=1)
+    c = int(np.argmax(rows))                     # the materially wet cluster
+    scale = float(pools[c, sl].sum())
+    t1.cluster_endmember_mol[c, sl] = [0.9 * scale, 0.1 * scale]
+    b2 = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.25)
+    eng2 = Engine(cfg, reaction_backend=b2)
+    t2, rej2, _ = eng2.try_step(t1, 2.0)
+    assert rej2 is None
+    fed = [k["solid_elements"] for k in b2.calls if k["solid_elements"] is not None]
+    tob, jen = _em_rows()
+    amount = float(t1.hydrate_mol[HYDRATE_PHASE_IDS.index("CSH")])
+    want = amount * (0.9 * tob + 0.1 * jen)
+    assert any(np.allclose(f, want, rtol=1e-9, atol=1e-24) for f in fed), \
+        (fed, want)
+    # and the pool was replaced again by the NEW parcels (25:75), no blending
+    tot2 = t2.cluster_endmember_mol[:, sl].sum(axis=0)
+    assert tot2[0] / (tot2[0] + tot2[1]) == pytest.approx(0.25, rel=1e-9)
+
+
+def test_empty_pool_falls_back_to_global_ratio():
+    """A state without pools (legacy/fresh) feeds the global channel ratio —
+    E1 behavior — instead of inventing a composition."""
+    cfg = _short_cfg()
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b1)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    t1.cluster_endmember_mol = np.zeros((0, eng._n_em))    # wipe pools
+    b2 = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.25)
+    eng2 = Engine(cfg, reaction_backend=b2)
+    _, rej2, _ = eng2.try_step(t1, 2.0)
+    assert rej2 is None
+    fed = [k["solid_elements"] for k in b2.calls if k["solid_elements"] is not None]
+    tob, jen = _em_rows()
+    amount = float(t1.hydrate_mol[HYDRATE_PHASE_IDS.index("CSH")])
+    want = amount * (0.5 * tob + 0.5 * jen)                # global 50:50
+    assert any(np.allclose(f, want, rtol=1e-9, atol=1e-24) for f in fed)
+
+
+def test_frozen_cluster_keeps_its_pool():
+    """A space-filling frozen cluster is NOT re-solved: its pool must survive
+    the step bit-identically (composition memory does not evaporate)."""
+    cfg = _short_cfg()
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b1)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    pools_before = t1.cluster_endmember_mol.copy()
+    # an assemblage larger than the whole pore space -> space-filling freeze
+    b2 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5, ch_mol=6e-10)
+    eng2 = Engine(cfg, reaction_backend=b2)
+    t2, rej2, _ = eng2.try_step(t1, 2.0)
+    assert rej2 is None
+    assert float(t2.unmet_mol.sum()) > float(t1.unmet_mol.sum())  # frozen, honest
+    assert np.array_equal(t2.cluster_endmember_mol, pools_before)
+
+
+def test_pool_shape_guard_rejects_corruption():
+    cfg = _short_cfg()
+    b = TwoEndmemberSnapshotBackend(csh_mol=1e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b)
+    state = eng.initial_state()
+    state.cluster_endmember_mol = np.zeros((7, eng._n_em))  # wrong row count
+    with pytest.raises(RuntimeError, match="endmember pool"):
+        eng.try_step(state, 2.0)
+
+
+def test_incremental_backend_keeps_pools_empty_zeros():
+    """The stoichiometric (incremental) path never populates pools; rows track
+    the labeling as zeros so a later snapshot restart starts from fallback."""
+    cfg = _short_cfg()
+    state, _ = Engine(cfg).run()
+    assert state.cluster_endmember_mol.shape[0] == state.cluster_inventory.shape[0]
+    assert not np.any(state.cluster_endmember_mol)
+
+
+def test_checkpoint_roundtrips_pools_and_hash_covers_them(tmp_path):
+    cfg = _short_cfg()
+    b = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.4)
+    eng = Engine(cfg, reaction_backend=b)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None and np.any(t1.cluster_endmember_mol)
+    save_checkpoint(t1, str(tmp_path), "e2")
+    loaded = load_checkpoint(str(tmp_path / "e2"), REG)
+    assert np.array_equal(loaded.cluster_endmember_mol, t1.cluster_endmember_mol)
+    assert loaded.full_hash() == t1.full_hash()
+    loaded.cluster_endmember_mol = loaded.cluster_endmember_mol.copy()
+    loaded.cluster_endmember_mol.flat[0] += 1e-15
+    assert loaded.full_hash() != t1.full_hash()
+
+
+def test_cluster_ca_si_and_map():
+    """Per-cluster Ca/Si observable: ratios follow each cluster's OWN pool;
+    dust pools are skipped; the slice map paints ratio colors per cluster."""
+    cfg = _short_cfg()
+    state = Engine(cfg).initial_state()
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    state.endmember_ids = (("CSH", "rich"), ("CSH", "lean"), ("CH", "CH"))
+    rows = np.zeros((3, len(ELEMENT_IDS)))
+    rows[0, el["Ca"]], rows[0, el["Si"]] = 1.8, 1.0
+    rows[1, el["Ca"]], rows[1, el["Si"]] = 0.8, 1.0
+    rows[2, el["Ca"]] = 1.0
+    state.endmember_elements = rows
+    state.cluster_endmember_mol = np.array([
+        [2.0, 1.0, 5.0],       # cluster 0: Ca/Si = (2*1.8+1*0.8)/3
+        [0.5, 3.0, 0.0],       # cluster 1: Ca/Si = (0.5*1.8+3*0.8)/3.5
+        [1e-30, 0.0, 0.0]])    # cluster 2: dust -> skipped
+    got = analysis.cluster_ca_si(state)
+    assert set(got) == {0, 1}
+    assert got[0] == pytest.approx((2 * 1.8 + 1 * 0.8) / 3.0)
+    assert got[1] == pytest.approx((0.5 * 1.8 + 3 * 0.8) / 3.5)
+    n = state.grid_size
+    state.cluster_id[n // 2, :4, :4] = 0
+    state.cluster_id[n // 2, 8:12, 8:12] = 1
+    img = analysis.casi_map_rgb(state)
+    assert img is not None and img.shape == (n, n, 3)
+    assert not np.array_equal(img[0, 0], img[10, 10])      # distinct ratio colors
+    assert tuple(img[20, 20]) == (30, 30, 30)              # background stays dark
+
+
+@needs_gems
+def test_gems_pools_track_clusters_and_casi(tmp_path):
+    raw = json.loads((EXAMPLES / "opc_cnash_32.json").read_text(encoding="utf-8"))
+    raw["schedule"] = {"output_times_h": [2.0, 6.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["chemistry"]["gems_worker_python"] = str(GEMS_PYTHON)
+    cfg = TinnConfig.model_validate(raw)
+    eng = Engine(cfg)
+    state, _ = eng.run(out_dir=str(tmp_path / "run"))
+    pools = state.cluster_endmember_mol
+    assert pools.shape[0] == state.cluster_inventory.shape[0] > 0
+    # pools tile the global ledger: their sum tracks endmember_mol up to the
+    # remap drops (early age, fully wet: should be essentially exact)
+    assert np.allclose(pools.sum(axis=0), state.endmember_mol,
+                       rtol=1e-6, atol=1e-18)
+    casi = analysis.cluster_ca_si(state)
+    assert casi and all(0.6 <= v <= 2.5 for v in casi.values())

@@ -117,6 +117,62 @@ def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
     return out
 
 
+def cluster_ca_si(state: SimulationState) -> Dict[int, float]:
+    """E2 observable (PRD 4.5 v3.0): Ca/Si of each cluster's silicate
+    solid-solution holdings, from the per-cluster endmember pools — the
+    cluster-resolution composition map comparable to SEM-EDS element maps.
+    Diagnostics only; clusters whose silicate pool is dust are skipped."""
+    pools = state.cluster_endmember_mol
+    if pools.shape[0] == 0 or not len(state.endmember_ids):
+        return {}
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    by_channel: Dict[str, List[int]] = {}
+    for j, (h, _dc) in enumerate(state.endmember_ids):
+        by_channel.setdefault(h, []).append(j)
+    sil_idx = [j for h, idxs in by_channel.items() if len(idxs) >= 2
+               for j in idxs
+               if state.endmember_elements[idxs][:, el["Si"]].sum() > 0.0]
+    if not sil_idx:
+        return {}
+    rows = state.endmember_elements[sil_idx]
+    global_scale = float(np.abs(pools).sum())
+    out: Dict[int, float] = {}
+    for c in range(pools.shape[0]):
+        mols = pools[c, sil_idx]
+        if float(np.abs(mols).sum()) <= 1e-9 * max(global_scale, 1e-300):
+            continue
+        elems = mols @ rows
+        si = float(elems[el["Si"]])
+        if si > 0.0:
+            out[c] = float(elems[el["Ca"]]) / si
+    return out
+
+
+def casi_map_rgb(state: SimulationState, lo: float = 0.8, hi: float = 2.2
+                 ) -> Optional[np.ndarray]:
+    """Central-slice Ca/Si map (E2): cluster-resolution ratios painted over
+    the cluster label field, blue(lo) -> red(hi); non-cluster voxels dark,
+    ratio-less clusters gray. Returns None when no ratios exist."""
+    ratios = cluster_ca_si(state)
+    if not ratios:
+        return None
+    n = state.grid_size
+    labels = state.cluster_id[n // 2]
+    img = np.full((n, n, 3), 30, dtype=np.float64)
+    gray = np.array([120.0, 120.0, 120.0])
+    for c in np.unique(labels):
+        if c < 0:
+            continue
+        m = labels == c
+        r = ratios.get(int(c))
+        if r is None:
+            img[m] = gray
+        else:
+            t = min(1.0, max(0.0, (r - lo) / (hi - lo)))
+            img[m] = np.array([60 + 195 * t, 60, 255 - 195 * t])
+    return img.astype(np.uint8)
+
+
 def phase_volume_fractions(state: SimulationState) -> Dict[str, float]:
     """Volume fraction of the RVE per solid channel (anhydrous and hydrates)."""
     n_vox = state.capillary_liquid.size
@@ -663,6 +719,15 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         png_name = f"slice_{ck.name}.png"
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name
+        # E2: cluster-resolution Ca/Si composition map (PRD 4.5 v3.0)
+        casi = cluster_ca_si(state)
+        if casi:
+            row["cluster_ca_si"] = {int(k): float(v) for k, v in casi.items()}
+            rgb = casi_map_rgb(state)
+            if rgb is not None:
+                casi_name = f"casi_{ck.name}.png"
+                write_png(str(out / casi_name), rgb)
+                row["casi_png"] = casi_name
         rows.append(row)
     # checkpoint NAMES sort lexicographically (ckpt_1000 < ckpt_999) — time is
     # the authority for series order

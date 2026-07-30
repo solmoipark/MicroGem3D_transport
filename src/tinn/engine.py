@@ -204,6 +204,18 @@ class Engine:
             raise RuntimeError(
                 f"cluster inventory has {state.cluster_inventory.shape[0]} rows but "
                 f"{n_clusters} clusters were labeled - state is corrupted (no fallback)")
+        # E2: per-cluster endmember pools ride the same labeling contract
+        if state.cluster_endmember_mol.shape[0] == n_clusters \
+                and state.cluster_endmember_mol.shape[1] == self._n_em:
+            em_pool_in = state.cluster_endmember_mol
+        elif state.cluster_endmember_mol.shape[0] == 0:
+            em_pool_in = np.zeros((n_clusters, self._n_em))
+        else:
+            raise RuntimeError(
+                f"cluster endmember pool has shape "
+                f"{state.cluster_endmember_mol.shape} but "
+                f"({n_clusters}, {self._n_em}) was expected - state is "
+                f"corrupted (no fallback)")
 
         # ---- reaction phase (mode-dependent) --------------------------------
         # incremental (stoichiometric): parcels are NEW precipitates appended.
@@ -255,12 +267,29 @@ class Engine:
                                 minlength=n_clusters + 1)
                 own_vol[:, h] = b[1:]
                 share = b[1:] / tot
-                owned_elem[:, h, :] = share[:, None] * trial.hydrate_elements_ch[h]
                 owned_mol[:, h] = share * trial.hydrate_mol[h]
-                # E1: the endmember pool splits by the SAME volume share, so
-                # "subtract what was fed" stays exact for endmembers too
+                # E2 (PRD 4.5 v3.0): the AMOUNT stays volume-share derived,
+                # but the endmember RATIOS come from the cluster's OWN pool —
+                # the average-composition approximation is gone wherever a
+                # pool exists. New/rewetted clusters without a material pool
+                # fall back to the global channel ratio (self-heals next
+                # step: solved pools are replaced by their own parcels).
                 sl = self._em_slice[self.hydrate_ids[h]]
-                owned_em[:, sl] = share[:, None] * trial.endmember_mol[sl]
+                g = trial.endmember_mol[sl]
+                gsum = float(g.sum())
+                g_ratio = g / gsum if gsum > 0.0 else np.zeros(sl.stop - sl.start)
+                pool = em_pool_in[:, sl]
+                psum = pool.sum(axis=1)
+                amounts = owned_mol[:, h]
+                use_pool = psum > np.maximum(1e-9 * np.abs(amounts), 1e-300)
+                safe = np.where(use_pool, psum, 1.0)
+                ratios = np.where(use_pool[:, None], pool / safe[:, None],
+                                  g_ratio[None, :])
+                owned_em[:, sl] = amounts[:, None] * ratios
+                # fed elements follow the fed COMPOSITION exactly, so the
+                # global element/endmember ledgers stay mutually consistent
+                # by construction ("subtract what was fed")
+                owned_elem[:, h, :] = owned_em[:, sl] @ trial.endmember_elements[sl]
         owned_gel_c = (own_vol * gel_eps).sum(axis=1)
 
         total_water_mol = float(water_mol_c.sum())
@@ -572,6 +601,18 @@ class Engine:
         if remap.dryout:
             return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
         trial.cluster_inventory = remap.inventory
+        # E2: pools follow the assemblage — a solved cluster's pool IS its own
+        # parcels (absolute replacement, non-compounding); frozen clusters
+        # keep theirs. Remapped with the same overlaps as the inventory;
+        # zero-overlap rows drop (pools are compositional memory — the global
+        # ledgers carry conservation, so a stranded pool is not a dryout).
+        pools_prev = em_pool_in.copy()
+        if snapshot and bool(solved.any()):
+            pools_prev[solved] = parcel_em[solved]
+        pool_remap = transport.remap_inventories(
+            labels, prev_liquid, new_labels, trial.capillary_liquid,
+            pools_prev, n_new)
+        trial.cluster_endmember_mol = pool_remap.inventory
         trial.cluster_id = new_labels
         for prev_c, new_c, ov in remap.events:
             trial.remap_events["time_h"].append(trial.time_h + dt_h)

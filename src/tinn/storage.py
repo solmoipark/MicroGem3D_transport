@@ -25,7 +25,9 @@ from .state import SimulationState, _DENSE_FIELDS, code_version
 # v3 (E1, PRD 2.3 rev.3): endmember ledger (endmember_ids/mol/elements) plus
 # the reserved RT-W2 boundary_exchanged_elements vector — one format break for
 # both, per the endmember plan's co-ride decision. v2 checkpoints are
-# explicitly incompatible (no migration, PRD rule).
+# explicitly incompatible (no migration, PRD rule). E2's per-cluster pool
+# array (cluster_endmember_mol) rides the SAME version: no external v3
+# checkpoints existed when it landed, so no second break.
 FORMAT_VERSION = 3
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
@@ -87,6 +89,8 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
         for field in _DENSE_FIELDS:
             _write_zarr_array(tmp / "arrays" / field, getattr(state, field))
         _write_zarr_array(tmp / "arrays" / "cluster_inventory", state.cluster_inventory)
+        _write_zarr_array(tmp / "arrays" / "cluster_endmember_mol",
+                          state.cluster_endmember_mol)
 
         header = {
             "format_version": FORMAT_VERSION,
@@ -176,6 +180,8 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
 
     arrays = {f: _read_zarr_array(root / "arrays" / f) for f in _DENSE_FIELDS}
     cluster_inventory = _read_zarr_array(root / "arrays" / "cluster_inventory")
+    cluster_endmember_mol = _read_zarr_array(
+        root / "arrays" / "cluster_endmember_mol")
 
     tables = json.loads((root / "tables.json").read_text(encoding="utf-8"))
 
@@ -198,6 +204,7 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         parcels=tables["parcels"],
         remap_events=tables["remap_events"],
         cluster_inventory=cluster_inventory,
+        cluster_endmember_mol=cluster_endmember_mol,
         time_h=header["time_h"],
         dt_h=header["dt_h"],
         phase_mol=np.asarray(header["phase_mol"]),
