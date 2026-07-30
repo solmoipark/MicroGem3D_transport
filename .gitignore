@@ -7,3 +7,4 @@ runs/
 .gems_runs/
 ipmlog.txt
 xGEMS.log
+ipmlog*.txt

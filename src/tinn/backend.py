@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Protocol
+from typing import Dict, List, Optional, Protocol
 
 import numpy as np
 
@@ -39,6 +39,10 @@ class Parcel:
     mol: float
     elements: np.ndarray      # (E,) over ELEMENT_IDS, total element mol
     skel_vol_cm3: float       # solid skeleton volume of this parcel
+    # per-endmember (DC) mols of this parcel (E1, PRD 2.3 rev.3). None means
+    # the phase is single-endmember: the engine books {phase_id: mol}. A dict
+    # must sum to `mol` (worker-verified endmember-sum) — never invented.
+    endmember_mol: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -57,6 +61,11 @@ class ReactionResult:
 class ReactionBackend(Protocol):
     backend_id: str
     hydrate_ids: tuple  # fixed channel order of every parcel this backend emits
+    # E1 (PRD 2.3 rev.3): per-channel endmember (DC) names in fixed order, and
+    # each endmember's element row — both derived from the backend's own
+    # definition source (bundle DCH / registry), never hardcoded.
+    hydrate_endmembers: Dict[str, tuple]
+    endmember_elements: Dict[str, np.ndarray]
     # "incremental": parcels are NEW precipitates appended to holdings.
     # "snapshot": parcels are the cluster's ENTIRE new assemblage (absolute
     # replacement; water_consumed_mol may be negative on re-dissolution).
@@ -79,6 +88,12 @@ class StoichiometricBackend:
     def __init__(self, rules: Dict[str, ReactionRule], registry: Registry):
         self._rules = rules
         self._registry = registry
+        # every stoichiometric hydrate is single-endmember: the channel IS the
+        # endmember, with its registry formula as the element row
+        self.hydrate_endmembers = {h: (h,) for h in HYDRATE_PHASE_IDS}
+        self.endmember_elements = {
+            h: element_vector(registry.get(h).formula, 1.0)
+            for h in HYDRATE_PHASE_IDS}
 
     def react(self, released_mol: Dict[str, float], water_available_mol: float,
               inventory: np.ndarray, solid_elements=None) -> ReactionResult:

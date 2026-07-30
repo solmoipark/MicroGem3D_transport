@@ -67,7 +67,10 @@ def check_all(state: SimulationState, registry: Registry,
     # 1. element balance (expected = initial + anything the backend injected:
     # redox seeds and solver floors, both tracked exactly)
     cur = current_elements(state, registry)
-    expected = state.initial_elements + state.injected_elements
+    # boundary_exchanged_elements is the RT-W2 reservation (FORMAT_VERSION 3):
+    # zeros today, so this is a no-op until boundary reservoirs exist
+    expected = (state.initial_elements + state.injected_elements
+                + state.boundary_exchanged_elements)
     err = np.abs(cur - expected)
     bound = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(expected)
     rep.metrics["max_element_err_mol"] = float(err.max())
@@ -81,6 +84,36 @@ def check_all(state: SimulationState, registry: Registry,
     rep.metrics["injected_max_rel"] = inj_max / scale if scale > 0.0 else 0.0
     if scale > 0.0 and inj_max > 1e-6 * scale:
         rep.violations.append("balance_element:injected_excess")
+
+    # 1b. endmember closure (E1, PRD 6.1 rev.3), two identities per channel:
+    #     (a) sum of the channel's endmember mols == hydrate_mol[h]
+    #     (b) endmember mols x DCH element rows == hydrate_elements_ch[h]
+    # Both sides are accumulated from the SAME backend responses, so any gap
+    # is bookkeeping corruption, never physics.
+    if len(state.endmember_ids):
+        em = state.endmember_mol
+        n_h = len(state.hydrate_ids)
+        h_of = {h: i for i, h in enumerate(state.hydrate_ids)}
+        sum_mol = np.zeros(n_h)
+        elem_from_em = np.zeros((n_h, len(ELEMENT_IDS)))
+        for j, (h, _dc) in enumerate(state.endmember_ids):
+            hi = h_of[h]
+            sum_mol[hi] += em[j]
+            elem_from_em[hi] += em[j] * state.endmember_elements[j]
+        err_m = np.abs(sum_mol - state.hydrate_mol)
+        bound_m = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(state.hydrate_mol)
+        rep.metrics["endmember_sum_err_mol"] = float(err_m.max()) if n_h else 0.0
+        if np.any(err_m > bound_m):
+            bad = [state.hydrate_ids[i] for i in np.flatnonzero(err_m > bound_m)]
+            rep.violations.append(f"balance_endmember:{','.join(bad)}")
+        err_e = np.abs(elem_from_em - state.hydrate_elements_ch)
+        bound_e = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(state.hydrate_elements_ch)
+        rep.metrics["endmember_element_err_mol"] = float(err_e.max()) if n_h else 0.0
+        if np.any(err_e > bound_e):
+            rows = sorted({state.hydrate_ids[i]
+                           for i in np.flatnonzero(np.any(err_e > bound_e, axis=1))})
+            rep.violations.append(
+                f"balance_endmember_elements:{','.join(rows)}")
 
     # 2. voxel occupancy identity (no negatives, no clipping)
     total = (state.anhydrous_fraction.sum(axis=0) + state.hydrate_fraction.sum(axis=0)

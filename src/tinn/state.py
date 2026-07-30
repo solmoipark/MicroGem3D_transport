@@ -13,7 +13,7 @@ import hashlib
 import subprocess
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -75,6 +75,16 @@ class SimulationState:
     hydrate_elements_ch: np.ndarray  # (H, E) per-channel element pools of the
                                      # CURRENT hydrate holdings (signed updates
                                      # under full re-equilibration)
+    # --- E1 endmember ledger (PRD 2.3 rev.3; FORMAT_VERSION 3) ---
+    endmember_ids: tuple             # run-scoped ((hydrate_id, dc_name), ...)
+    endmember_mol: np.ndarray        # (M,) CURRENT holdings per endmember (signed)
+    endmember_elements: np.ndarray   # (M, E) element row per endmember — static
+                                     # per run, from the backend's own source
+                                     # (bundle DCH / registry), stored so
+                                     # checkpoint re-checks need no re-probe
+    boundary_exchanged_elements: np.ndarray  # (E,) RESERVED for RT-W2 boundary
+                                     # reservoirs (always zeros until then);
+                                     # closure reads initial+injected+boundary
     injected_elements: np.ndarray    # (E,) backend-injected seeds/solver floors
     water_free_mol: float
     water_gel_mol: float
@@ -121,10 +131,13 @@ class SimulationState:
         h = hashlib.sha256(self.dense_hash().encode())
         for arr in (self.phase_mol, self.initial_phase_mol, self.unmet_mol,
                     self.hydrate_mol, self.hydrate_env_vol_vox,
-                    self.hydrate_elements_ch, self.injected_elements,
+                    self.hydrate_elements_ch, self.endmember_mol,
+                    self.endmember_elements, self.boundary_exchanged_elements,
+                    self.injected_elements,
                     self.initial_elements, self.cluster_inventory):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(repr(self.hydrate_ids).encode())
+        h.update(repr(self.endmember_ids).encode())
         for x in (self.time_h, self.dt_h, self.water_free_mol, self.water_gel_mol,
                   self.water_bound_mol, self.initial_water_mol,
                   self.inert_volume_vox, self.accept_count):
@@ -159,7 +172,10 @@ class SimulationState:
     @classmethod
     def from_geometry(cls, config: TinnConfig, registry: Registry,
                       rve: RVEInit, backend_id: str,
-                      hydrate_ids: tuple = HYDRATE_PHASE_IDS) -> "SimulationState":
+                      hydrate_ids: tuple = HYDRATE_PHASE_IDS,
+                      hydrate_endmembers: Optional[Dict[str, tuple]] = None,
+                      endmember_elements: Optional[Dict[str, np.ndarray]] = None
+                      ) -> "SimulationState":
         n = config.rve.grid_size
         vox_cm3 = config.rve.voxel_size_um ** 3 * 1e-12
         phase_mol = np.zeros(len(KINETIC_PHASE_IDS))
@@ -173,6 +189,20 @@ class SimulationState:
         for i, p in enumerate(KINETIC_PHASE_IDS):
             initial_elements += formula_elements(registry.get(p).formula) * phase_mol[i]
         initial_elements += formula_elements(registry.get("H2O").formula) * water_mol
+
+        # E1 endmember index: run-scoped, backend-declared; a backend without
+        # endmember metadata (legacy fake in a test) maps each channel to
+        # itself with its registry formula — same rule as the stoich backend
+        if hydrate_endmembers is None:
+            hydrate_endmembers = {h: (h,) for h in hydrate_ids}
+        if endmember_elements is None:
+            endmember_elements = {
+                h: formula_elements(registry.get(h).formula)
+                for h in hydrate_ids}
+        em_ids = tuple((h, dc) for h in hydrate_ids
+                       for dc in hydrate_endmembers[h])
+        em_formulas = np.array([endmember_elements[dc] for _, dc in em_ids]) \
+            if em_ids else np.zeros((0, len(ELEMENT_IDS)))
 
         rng = np.random.Generator(np.random.PCG64(config.rve.seed))
         return cls(
@@ -198,6 +228,10 @@ class SimulationState:
             hydrate_mol=np.zeros(len(hydrate_ids)),
             hydrate_env_vol_vox=np.zeros(len(hydrate_ids)),
             hydrate_elements_ch=np.zeros((len(hydrate_ids), len(ELEMENT_IDS))),
+            endmember_ids=em_ids,
+            endmember_mol=np.zeros(len(em_ids)),
+            endmember_elements=em_formulas,
+            boundary_exchanged_elements=np.zeros(len(ELEMENT_IDS)),
             injected_elements=np.zeros(len(ELEMENT_IDS)),
             water_free_mol=water_mol,
             water_gel_mol=0.0,

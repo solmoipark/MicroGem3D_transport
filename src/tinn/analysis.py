@@ -20,8 +20,8 @@ import numpy as np
 
 from . import ledger
 from .config import TinnConfig
-from .registry import (CLINKER_PHASE_IDS, KINETIC_PHASE_IDS, Registry,
-                       SCM_PHASE_IDS, default_registry)
+from .registry import (CLINKER_PHASE_IDS, ELEMENT_IDS, KINETIC_PHASE_IDS,
+                       Registry, SCM_PHASE_IDS, default_registry)
 from .state import SimulationState
 from .storage import load_checkpoint
 from .transport import LIQ_EPS
@@ -67,6 +67,7 @@ def state_row(state: SimulationState, registry: Registry,
                       for i, p in enumerate(KINETIC_PHASE_IDS)},
         "water_mol": {"free": state.water_free_mol, "gel": state.water_gel_mol,
                       "bound": state.water_bound_mol},
+        "solid_solution_composition": solid_solution_composition(state),
         "porosity_capillary": cap_por,
         "porosity_total": cap_por + gel_por_vol / n_vox,
         "chem_shrinkage_ml_per_g_reacted": (gas_cm3 / reacted_mass_g
@@ -74,6 +75,41 @@ def state_row(state: SimulationState, registry: Registry,
         "accept_count": state.accept_count,
         "reject_counts": dict(state.reject_counts),
     }
+
+
+def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
+    """Derived observables from the E1 endmember ledger (PRD 2.3 rev.3) —
+    diagnostics only, the mol ledger stays authoritative. For every channel
+    with more than one endmember and material holdings: the endmember mol
+    split plus Ca/Si, H/Si (silicate gels) and Al/(Al+Fe) (Al-Fe solid
+    solutions) where the denominators carry mass."""
+    out: Dict[str, Dict] = {}
+    if not len(state.endmember_ids):
+        return out
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    by_channel: Dict[str, List[int]] = {}
+    for j, (h, _dc) in enumerate(state.endmember_ids):
+        by_channel.setdefault(h, []).append(j)
+    for h, idxs in by_channel.items():
+        if len(idxs) < 2:
+            continue
+        mols = state.endmember_mol[idxs]
+        total = float(mols.sum())
+        if total <= 0.0:
+            continue
+        elems = (mols[:, None] * state.endmember_elements[idxs]).sum(axis=0)
+        row: Dict[str, object] = {
+            "endmember_mol": {state.endmember_ids[j][1]: float(state.endmember_mol[j])
+                              for j in idxs if state.endmember_mol[j] != 0.0}}
+        si = float(elems[el["Si"]])
+        if si > 0.0:
+            row["ca_si"] = float(elems[el["Ca"]]) / si
+            row["h_si"] = float(elems[el["H"]]) / si
+        al, fe = float(elems[el["Al"]]), float(elems[el["Fe"]])
+        if al + fe > 0.0:
+            row["al_over_al_fe"] = al / (al + fe)
+        out[h] = row
+    return out
 
 
 def phase_volume_fractions(state: SimulationState) -> Dict[str, float]:

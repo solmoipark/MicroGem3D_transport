@@ -22,11 +22,16 @@ from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
                        Registry, SOLID_PHASE_IDS)
 from .state import SimulationState, _DENSE_FIELDS, code_version
 
-FORMAT_VERSION = 2
+# v3 (E1, PRD 2.3 rev.3): endmember ledger (endmember_ids/mol/elements) plus
+# the reserved RT-W2 boundary_exchanged_elements vector — one format break for
+# both, per the endmember plan's co-ride decision. v2 checkpoints are
+# explicitly incompatible (no migration, PRD rule).
+FORMAT_VERSION = 3
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
                    "hydrate_env_vol_vox", "injected_elements",
-                   "initial_elements")
+                   "initial_elements", "endmember_mol",
+                   "boundary_exchanged_elements")
 _LEDGER_SCALARS = ("time_h", "dt_h", "water_free_mol", "water_gel_mol",
                    "water_bound_mol", "initial_water_mol", "inert_volume_vox",
                    "accept_count", "config_hash", "backend_id")
@@ -96,12 +101,15 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             "solid_phase_ids": list(SOLID_PHASE_IDS),
             "hydrate_phase_ids": list(state.hydrate_ids),
             "element_ids": list(ELEMENT_IDS),
+            # E1: run-scoped endmember universe, positional over endmember_mol
+            "endmember_ids": [list(pair) for pair in state.endmember_ids],
         }
         for k in _LEDGER_SCALARS:
             header[k] = getattr(state, k)
         for k in _LEDGER_VECTORS:
             header[k] = np.asarray(getattr(state, k)).tolist()
         header["hydrate_elements_ch"] = np.asarray(state.hydrate_elements_ch).tolist()
+        header["endmember_elements"] = np.asarray(state.endmember_elements).tolist()
         (tmp / "header.json").write_text(json.dumps(header), encoding="utf-8")
 
         tables = {
@@ -147,9 +155,9 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     if header["format_version"] != FORMAT_VERSION:
         raise StorageError(
             f"checkpoint format {header['format_version']} is not supported by "
-            f"this build (current {FORMAT_VERSION}); pre-v2.2 checkpoints "
-            f"predate reversible chemistry - rerun from the config "
-            f"(no migration code, PRD 0.3)")
+            f"this build (current {FORMAT_VERSION}); v2 checkpoints predate "
+            f"the endmember ledger (E1) and earlier ones reversible chemistry "
+            f"- rerun from the config (no migration code, PRD 0.3)")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
                          ("element_ids", ELEMENT_IDS)):
@@ -158,6 +166,7 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
                 f"checkpoint {key} {header[key]} does not match this build "
                 f"{list(current)} - ledger vectors would be misinterpreted")
     hydrate_ids = tuple(header["hydrate_phase_ids"])  # run-scoped, header-owned
+    endmember_ids = tuple((str(h), str(dc)) for h, dc in header["endmember_ids"])
     config = TinnConfig.model_validate(header["config"])
     if config.config_hash() != header["config_hash"]:
         raise StorageError(
@@ -198,6 +207,12 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         hydrate_env_vol_vox=np.asarray(header["hydrate_env_vol_vox"]),
         hydrate_elements_ch=np.asarray(header["hydrate_elements_ch"]).reshape(
             len(hydrate_ids), len(ELEMENT_IDS)),
+        endmember_ids=endmember_ids,
+        endmember_mol=np.asarray(header["endmember_mol"]),
+        endmember_elements=np.asarray(header["endmember_elements"]).reshape(
+            len(endmember_ids), len(ELEMENT_IDS)),
+        boundary_exchanged_elements=np.asarray(
+            header["boundary_exchanged_elements"]),
         injected_elements=np.asarray(header["injected_elements"]),
         water_free_mol=header["water_free_mol"],
         water_gel_mol=header["water_gel_mol"],

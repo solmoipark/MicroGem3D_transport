@@ -79,6 +79,25 @@ class Engine:
             self.backend = GemsBackend(worker, config.temperature_K)
         self.kinetics = kinetics or make_kinetics(config)
         self.hydrate_ids = tuple(self.backend.hydrate_ids)
+        # E1 endmember metadata (PRD 2.3 rev.3): backend-declared; a backend
+        # without it (legacy test fakes) gets the single-endmember default in
+        # SimulationState.from_geometry
+        self._hydrate_endmembers = getattr(
+            self.backend, "hydrate_endmembers",
+            {h: (h,) for h in self.hydrate_ids})
+        self._endmember_elements = getattr(self.backend, "endmember_elements",
+                                           None)
+        # per-channel slices into the flat endmember vector, fixed run-scoped
+        self._em_index: Dict[Tuple[str, str], int] = {}
+        self._em_slice: Dict[str, slice] = {}
+        pos = 0
+        for h in self.hydrate_ids:
+            dcs = self._hydrate_endmembers[h]
+            self._em_slice[h] = slice(pos, pos + len(dcs))
+            for dc in dcs:
+                self._em_index[(h, dc)] = pos
+                pos += 1
+        self._n_em = pos
         # single implementation of the gel-porosity policy lives in analysis
         self._gel_eps = analysis.gel_porosity_vector(config, self.hydrate_ids,
                                                      self.registry)
@@ -86,9 +105,11 @@ class Engine:
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
         rve = initialize_rve(self.config, self.registry)
-        return SimulationState.from_geometry(self.config, self.registry, rve,
-                                             self.backend.backend_id,
-                                             hydrate_ids=self.hydrate_ids)
+        return SimulationState.from_geometry(
+            self.config, self.registry, rve, self.backend.backend_id,
+            hydrate_ids=self.hydrate_ids,
+            hydrate_endmembers=self._hydrate_endmembers,
+            endmember_elements=self._endmember_elements)
 
     # ------------------------------------------------------------------- step
     def try_step(self, state: SimulationState, dt_h: float
@@ -199,6 +220,7 @@ class Engine:
         parcel_env = np.zeros((n_clusters, n_h))   # NEW assemblage envelopes, vox
         parcel_mol = np.zeros((n_clusters, n_h))
         parcel_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
+        parcel_em = np.zeros((n_clusters, self._n_em))   # E1 endmember mols
         injected_add = np.zeros(len(ELEMENT_IDS))
         cluster_ph: Dict[int, float] = {}
         parcel_rows: List[tuple] = []
@@ -221,6 +243,7 @@ class Engine:
         own_vol = np.zeros((n_clusters, n_h))
         owned_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
         owned_mol = np.zeros((n_clusters, n_h))
+        owned_em = np.zeros((n_clusters, self._n_em))
         if snapshot and n_clusters > 0:
             recon_b = (recon + 1).ravel()
             for h in range(n_h):
@@ -234,6 +257,10 @@ class Engine:
                 share = b[1:] / tot
                 owned_elem[:, h, :] = share[:, None] * trial.hydrate_elements_ch[h]
                 owned_mol[:, h] = share * trial.hydrate_mol[h]
+                # E1: the endmember pool splits by the SAME volume share, so
+                # "subtract what was fed" stays exact for endmembers too
+                sl = self._em_slice[self.hydrate_ids[h]]
+                owned_em[:, sl] = share[:, None] * trial.endmember_mol[sl]
         owned_gel_c = (own_vol * gel_eps).sum(axis=1)
 
         total_water_mol = float(water_mol_c.sum())
@@ -358,6 +385,19 @@ class Engine:
                 parcel_env[c, hi] += env
                 parcel_mol[c, hi] += pc.mol
                 parcel_elem[c, hi] += pc.elements
+                # E1: book the parcel's endmember split; None = single-
+                # endmember phase (the channel is the endmember); an unknown
+                # endmember name is a protocol violation, never dropped
+                if pc.endmember_mol is None:
+                    parcel_em[c, self._em_index[(pc.phase_id, pc.phase_id)]] += pc.mol
+                else:
+                    for dc, m in pc.endmember_mol.items():
+                        key = (pc.phase_id, dc)
+                        if key not in self._em_index:
+                            raise RuntimeError(
+                                f"backend produced unknown endmember {dc!r} "
+                                f"for phase {pc.phase_id!r}")
+                        parcel_em[c, self._em_index[key]] += m
                 parcel_rows.append((float(trial.time_h + dt_h), int(c), pc.phase_id,
                                     float(pc.mol),
                                     float(pc.skel_vol_cm3 / trial.vox_cm3), float(env)))
@@ -501,12 +541,15 @@ class Engine:
                 parcel_env[sv].sum(axis=0) - own_vol[sv].sum(axis=0))
             trial.hydrate_elements_ch = trial.hydrate_elements_ch + (
                 parcel_elem[sv].sum(axis=0) - owned_elem[sv].sum(axis=0))
+            trial.endmember_mol = trial.endmember_mol + (
+                parcel_em[sv].sum(axis=0) - owned_em[sv].sum(axis=0))
         else:
             trial.hydrate_mol = trial.hydrate_mol + parcel_mol.sum(axis=0)
             trial.hydrate_env_vol_vox = (trial.hydrate_env_vol_vox
                                          + parcel_env.sum(axis=0))
             trial.hydrate_elements_ch = (trial.hydrate_elements_ch
                                          + parcel_elem.sum(axis=0))
+            trial.endmember_mol = trial.endmember_mol + parcel_em.sum(axis=0)
         trial.injected_elements = trial.injected_elements + injected_add
         trial.water_free_mol -= chem_total + gel_total
         trial.water_gel_mol += gel_total
@@ -562,6 +605,13 @@ class Engine:
                 "checkpoint hydrate channels do not match the backend's channel "
                 f"order - bundle changed between runs? state: {state.hydrate_ids} "
                 f"backend: {self.hydrate_ids}")
+        expect_em = tuple((h, dc) for h in self.hydrate_ids
+                          for dc in self._hydrate_endmembers[h])
+        if tuple(state.endmember_ids) != expect_em:
+            raise RuntimeError(
+                "checkpoint endmember universe does not match the backend's - "
+                "bundle changed between runs? (E1: endmember ledgers are "
+                "positional and never remapped)")
         sched = self.config.schedule
         outputs = [t for t in sched.output_times_h if t > state.time_h + 1e-12]
         summary: Dict = {

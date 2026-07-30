@@ -97,6 +97,8 @@ class GemsResult:
     phase_masses_kg: Dict[str, float]
     phase_volumes_m3: Dict[str, float]
     phase_elements_mol: Dict[str, Dict[str, float]]
+    # per-solid-phase endmember (DC) mols — E1, PRD 2.3 rev.3
+    phase_species_mol: Dict[str, Dict[str, float]] = field(default_factory=dict)
     aqueous_h2o_mol: Optional[float] = None  # solvent split of the aqueous phase
     element_input: Dict[str, object] = field(default_factory=dict)
     xgems_version: str = "not_available"
@@ -275,6 +277,7 @@ class GemsWorker:
             phase_masses_kg=response["phase_masses_kg"],
             phase_volumes_m3=response["phase_volumes_m3"],
             phase_elements_mol=response["phase_elements_mol"],
+            phase_species_mol=response.get("phase_species_mol", {}),
             aqueous_h2o_mol=response.get("aqueous_h2o_mol"),
             element_input=response.get("element_input", {}),
             xgems_version=response.get("xgems_version", "not_available"),
@@ -411,6 +414,31 @@ class GemsBackend:
         # hard-errors on unknown suppression names by design (typo guard)
         self._suppressed = tuple(p for p in SUPPRESSED_CLINKER_PHASES
                                  if p in set(info["phase_names"]))
+        # E1 (PRD 2.3 rev.3): endmember universe per hydrate channel and each
+        # endmember's element row — both straight from the bundle (info's
+        # phase_species + DCH stoichiometry matrix), never hardcoded
+        self.hydrate_endmembers = {
+            h: tuple(info["phase_species"][h]) for h in self.hydrate_ids}
+        species_elements = info.get("species_elements")
+        if species_elements is None:
+            raise GemsError(
+                "worker info lacks species_elements — bundle DCH stoichiometry "
+                "is required for the endmember ledger (E1)", kind="config")
+        import numpy as _np
+        el_idx = {el: i for i, el in enumerate(ELEMENT_IDS)}
+        self.endmember_elements = {}
+        for h in self.hydrate_ids:
+            for dc in self.hydrate_endmembers[h]:
+                row = species_elements.get(dc)
+                if row is None:
+                    raise GemsError(
+                        f"DCH has no stoichiometry row for endmember {dc!r} "
+                        f"of phase {h!r}", kind="config")
+                vec = _np.zeros(len(ELEMENT_IDS))
+                for el, coeff in row.items():
+                    if el in el_idx:  # charge (Zz) already dropped worker-side
+                        vec[el_idx[el]] = float(coeff)
+                self.endmember_elements[dc] = vec
         reg = default_registry()
         self._formula_vec = {p: element_vector(reg.get(p).formula, 1.0)
                              for p in KINETIC_PHASE_IDS}
@@ -502,9 +530,16 @@ class GemsBackend:
             for el, v in pe.items():
                 if el in self._h2o_index:
                     vec[self._h2o_index[el]] = v / s
+            # E1: endmember mols ride the parcel, rescaled by the same 1/s as
+            # mol/elements/volume so the endmember-sum identity survives the
+            # canonical scaling exactly (worker verified it at scale s)
+            em_scaled = r.phase_species_mol.get(phase)
+            em = ({dc: m / s for dc, m in em_scaled.items()}
+                  if em_scaled else None)
             parcels.append(Parcel(
                 phase_id=phase, mol=mol_scaled / s, elements=vec,
-                skel_vol_cm3=r.phase_volumes_m3.get(phase, 0.0) * 1e6 / s))
+                skel_vol_cm3=r.phase_volumes_m3.get(phase, 0.0) * 1e6 / s,
+                endmember_mol=em))
 
         if r.aqueous_h2o_mol is None:
             raise GemsError("worker did not split the aqueous solvent", kind="protocol")
@@ -598,6 +633,36 @@ def run_0d_probe(config, worker: GemsWorker,
 
 # ------------------------------------------------------------ worker process
 
+def _dch_species_elements(dat_lst: Path) -> Dict[str, Dict[str, float]]:
+    """Per-DC element coefficients from the bundle's DCH file (the -f "..."
+    list in the .lst names it first). Returns {dc_name: {element: coeff}} for
+    ALL DCs; the charge row (Zz) is dropped — the element ledger carries no
+    charge. Raises on malformed bundles (no guessing)."""
+    lst_text = dat_lst.read_text(encoding="utf-8", errors="replace")
+    import re
+    names = re.findall(r'"([^"]+)"', lst_text)
+    dch_name = next((n for n in names if "dch" in n.lower()), None)
+    if dch_name is None:
+        raise ValueError(f"bundle .lst names no DCH file: {dat_lst}")
+    dch_path = dat_lst.parent / dch_name
+    payload = json.loads(dch_path.read_text(encoding="utf-8"))
+    dch = payload[0]["dch"] if isinstance(payload, list) else payload["dch"]
+    ic_names = [str(x) for x in dch["ICNL"]]
+    dc_names = [str(x) for x in dch["DCNL"]]
+    a = dch["A"]
+    n_ic = len(ic_names)
+    if len(a) != len(dc_names) * n_ic:
+        raise ValueError(
+            f"DCH stoichiometry matrix shape mismatch in {dch_path.name}: "
+            f"len(A)={len(a)} != nDC({len(dc_names)}) x nIC({n_ic})")
+    out: Dict[str, Dict[str, float]] = {}
+    for j, dc in enumerate(dc_names):
+        row = a[j * n_ic:(j + 1) * n_ic]
+        out[dc] = {ic: float(v) for ic, v in zip(ic_names, row)
+                   if ic != CHARGE_ELEMENT_ID and float(v) != 0.0}
+    return out
+
+
 def _worker_execute(request: Mapping,
                     engine_cache: Optional[Dict[str, object]] = None) -> Dict:
     """Runs inside the isolated worker process — the only place xgems is imported.
@@ -625,11 +690,17 @@ def _worker_execute(request: Mapping,
         engine = xgems.ChemicalEngineDicts(str(dat))
         phase_species = {str(p): sorted(str(s) for s in engine.phase_species_amounts(p))
                          for p in engine.phase_names}
+        # per-species element rows straight from the bundle's DCH stoichiometry
+        # matrix (E1, PRD 2.3 rev.3): the SAME matrix xGEMS solves with, read
+        # from the JSON rather than guessed from formulas — endmember ledgers
+        # close against it by construction
+        species_elements = _dch_species_elements(dat)
         return {
             "ok": True,
             "phase_names": [str(p) for p in engine.phase_names],
             "element_names": [str(e) for e in engine.bulk_composition],
             "phase_species": phase_species,
+            "species_elements": species_elements,
             "xgems_version": version,
         }
 
@@ -715,8 +786,12 @@ def _worker_execute(request: Mapping,
 
     # every multi-species phase amount must equal the sum of its species
     # (endmember-sum verification, PRD M4: CSHQ never reinterpreted as a fixed
-    # formula) and the aqueous solvent is split out for the water ledger
+    # formula) and the aqueous solvent is split out for the water ledger.
+    # E1 (PRD 2.3 rev.3): the per-species mols of SOLID phases now ride the
+    # response — the parent's endmember ledger is fed by the same numbers the
+    # sum verification just checked.
     aqueous_h2o = None
+    phase_species_mol: Dict[str, Dict[str, float]] = {}
     for phase_name, total in phase_amounts.items():
         species = {str(k): float(v)
                    for k, v in engine.phase_species_amounts(phase_name).items()}
@@ -730,6 +805,8 @@ def _worker_execute(request: Mapping,
             aqueous_h2o = species.get("H2O@")
             if aqueous_h2o is None:
                 raise ValueError("aqueous phase lacks the H2O@ solvent species")
+        elif phase_name != GAS_PHASE:
+            phase_species_mol[phase_name] = species
 
     # some bundles report zero phase volume for phases holding a positive
     # amount (observed: single-DC solids in the CNASH Test bundle; InverseGems
@@ -756,6 +833,7 @@ def _worker_execute(request: Mapping,
         "phase_masses_kg": _mapping("phase_masses"),
         "phase_volumes_m3": phase_volumes,
         "phase_elements_mol": phase_elements,
+        "phase_species_mol": phase_species_mol,
         "aqueous_h2o_mol": aqueous_h2o,
         "element_input": element_input,
         "xgems_version": version,
