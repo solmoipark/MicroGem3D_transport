@@ -599,7 +599,7 @@ def run_0d_probe(config, worker: GemsWorker,
     Returns one row per time with pH, ionic strength, phase masses, and the
     element-closure error. Unreacted clinker is never an input."""
     from .kinetics import make_kinetics
-    from .registry import KINETIC_PHASE_IDS, default_registry
+    from .registry import KINETIC_PHASE_IDS, SALT_PHASE_IDS, default_registry
 
     reg = default_registry()
     kin = make_kinetics(config)
@@ -615,7 +615,13 @@ def run_0d_probe(config, worker: GemsWorker,
         alpha = kin.alpha_at(t)
         elements: Dict[str, float] = {"O": O2_SEED_MOL_O}
         for k, p in enumerate(KINETIC_PHASE_IDS):
-            released = n0[p] * float(alpha[k])
+            # E3 parity with the spatial engine: salt carriers have no kinetic
+            # alpha.  Their complete initial inventory is offered to GEMS and
+            # equilibrium decides what dissolves or remains as a solid.  Using
+            # alpha[k] here silently omitted sulfate/alkali from the old 0D
+            # reference because P&K correctly returns zero for these channels.
+            released = (n0[p] if p in SALT_PHASE_IDS
+                        else n0[p] * float(alpha[k]))
             if released <= 0.0:
                 continue
             for el, count in reg.get(p).formula.items():
@@ -631,7 +637,10 @@ def run_0d_probe(config, worker: GemsWorker,
             "ph": result.ph,
             "ph_status": result.ph_status,
             "ionic_strength": result.ionic_strength,
+            "phase_amounts_mol": result.phase_amounts_mol,
             "phase_masses_kg": result.phase_masses_kg,
+            "phase_elements_mol": result.phase_elements_mol,
+            "phase_species_mol": result.phase_species_mol,
             # solver self-consistency vs the effective (floor-clamped) input
             "element_closure_max_rel": result.element_closure_max_rel(),
             # divergence of the effective input from the physical ledger

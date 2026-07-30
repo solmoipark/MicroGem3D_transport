@@ -9,7 +9,7 @@ backend_failure, balance_* (from ledger checks).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -679,7 +679,15 @@ class Engine:
 
     # -------------------------------------------------------------------- run
     def run(self, state: Optional[SimulationState] = None,
-            out_dir: Optional[str] = None) -> Tuple[SimulationState, dict]:
+            out_dir: Optional[str] = None,
+            audit_hook: Optional[Callable[[dict], None]] = None
+            ) -> Tuple[SimulationState, dict]:
+        """Run through the configured output schedule.
+
+        ``audit_hook`` is an optional, read-only qualification observer.  It is
+        deliberately outside :class:`SimulationState`: enabling a paper audit
+        must not change the numerical trajectory or checkpoint format.
+        """
         state = state or self.initial_state()
         if tuple(state.hydrate_ids) != self.hydrate_ids:
             raise RuntimeError(
@@ -712,6 +720,16 @@ class Engine:
             "backend_id": state.backend_id,
             "outputs": [],
         }
+        if audit_hook is not None:
+            audit_hook({
+                "event": "run_start",
+                "time_h": float(state.time_h),
+                "dt_h": float(state.dt_h),
+                "accept_count": int(state.accept_count),
+                "reject_counts": dict(state.reject_counts),
+                "dense_hash": state.dense_hash(),
+                "full_hash": state.full_hash(),
+            })
         last_metrics: dict = {}
         for t_out in outputs:
             while state.time_h < t_out - 1e-12:
@@ -719,12 +737,30 @@ class Engine:
                 dt_try = min(cruise, t_out - state.time_h)
                 retries = 0
                 while True:
+                    dense_before = (state.dense_hash()
+                                    if audit_hook is not None else None)
+                    full_before = (state.full_hash()
+                                   if audit_hook is not None else None)
+                    injected_before = state.injected_elements.copy()
                     trial, reject, metrics = self.try_step(state, dt_try)
                     if trial is not None:
                         break
                     state.reject_counts[reject.reason] = (
                         state.reject_counts.get(reject.reason, 0) + 1)
                     retries += 1
+                    if audit_hook is not None:
+                        audit_hook({
+                            "event": "trial_rejected",
+                            "time_h": float(state.time_h),
+                            "dt_attempt_h": float(dt_try),
+                            "retry": int(retries),
+                            "reason": reject.reason,
+                            "metrics": dict(metrics),
+                            "committed_dense_hash_before": dense_before,
+                            "committed_dense_hash_after": state.dense_hash(),
+                            "committed_full_hash_before_bookkeeping": full_before,
+                            "committed_full_hash_after_bookkeeping": state.full_hash(),
+                        })
                     if retries > sched.max_retries:
                         raise EngineError(
                             f"step at t={state.time_h} h rejected {retries} times "
@@ -741,10 +777,32 @@ class Engine:
                     trial.dt_h = min(dt_try * 2.0, sched.dt_initial_h)
                 state = trial
                 last_metrics = metrics
+                if audit_hook is not None:
+                    audit_hook({
+                        "event": "step_accepted",
+                        "time_start_h": float(state.time_h - dt_try),
+                        "time_end_h": float(state.time_h),
+                        "dt_accepted_h": float(dt_try),
+                        "retries": int(retries),
+                        "metrics": dict(metrics),
+                        "injected_delta_mol": (
+                            state.injected_elements - injected_before).tolist(),
+                        "dense_hash": state.dense_hash(),
+                        "full_hash": state.full_hash(),
+                    })
             summary["outputs"].append(self._snapshot_row(state, last_metrics))
             if out_dir is not None:
                 k_global = self.config.schedule.output_times_h.index(t_out)
-                storage.save_checkpoint(state, out_dir, f"ckpt_{k_global:03d}")
+                ckpt = storage.save_checkpoint(
+                    state, out_dir, f"ckpt_{k_global:03d}")
+                if audit_hook is not None:
+                    audit_hook({
+                        "event": "checkpoint_written",
+                        "time_h": float(state.time_h),
+                        "path": str(ckpt),
+                        "dense_hash": state.dense_hash(),
+                        "full_hash": state.full_hash(),
+                    })
         summary["final"] = self._snapshot_row(state, last_metrics)
         summary["sanity_band"] = analysis.sanity_band(summary["outputs"],
                                                       self.config)

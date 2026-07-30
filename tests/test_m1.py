@@ -8,11 +8,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tinn import cli, dissolution, ledger, morphology, transport
+from tinn import analysis, cli, dissolution, ledger, morphology, transport
 from tinn.backend import (PH_NOT_AVAILABLE, STATUS_INSUFFICIENT_WATER, STATUS_OK,
                           StoichiometricBackend)
 from tinn.config import TinnConfig
-from tinn.engine import Engine, EngineError
+from tinn.engine import Engine, EngineError, StepReject
 from tinn.kinetics import TabulatedKinetics, make_kinetics
 from tinn.registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
                            SOLID_PHASE_IDS, default_registry)
@@ -98,6 +98,58 @@ def test_tabulated_interpolation():
     assert a[KINETIC_PHASE_IDS.index("C3S")] == pytest.approx(0.1)
     assert kin.alpha_at(24.0)[0] == pytest.approx(0.15)
     assert kin.alpha_at(0.0)[0] == 0.0
+
+
+def test_run_audit_hook_covers_every_accepted_step():
+    cfg = _cfg(
+        kinetics={"kind": "tabulated",
+                  "table": {"times_h": [0.0, 0.1],
+                            "alpha": {"C3S": [0.0, 0.001]}}},
+        schedule={"output_times_h": [0.1], "dt_initial_h": 0.1,
+                  "dt_min_h": 0.001})
+    events = []
+    state, _ = Engine(cfg).run(audit_hook=events.append)
+    kinds = [event["event"] for event in events]
+    assert kinds[0] == "run_start"
+    assert kinds.count("step_accepted") == state.accept_count == 1
+    accepted = next(e for e in events if e["event"] == "step_accepted")
+    assert accepted["full_hash"] == state.full_hash()
+    assert len(accepted["injected_delta_mol"]) == len(ELEMENT_IDS)
+    audit = analysis.qualification_summary(events)
+    assert audit["evidence_level"] == "engineering_regression_only"
+    assert audit["accepted_steps"] == 1
+    assert audit["rollback_dense_state_preserved"] is True
+
+
+def test_run_audit_proves_rejected_trial_dense_rollback(monkeypatch):
+    cfg = _cfg(
+        kinetics={"kind": "tabulated",
+                  "table": {"times_h": [0.0, 0.1],
+                            "alpha": {"C3S": [0.0, 0.001]}}},
+        schedule={"output_times_h": [0.1], "dt_initial_h": 0.1,
+                  "dt_min_h": 0.001})
+    engine = Engine(cfg)
+    real_try_step = engine.try_step
+    calls = 0
+
+    def reject_once(state, dt_h):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None, StepReject("forced_test_reject"), {}
+        return real_try_step(state, dt_h)
+
+    monkeypatch.setattr(engine, "try_step", reject_once)
+    events = []
+    state, _ = engine.run(audit_hook=events.append)
+    rejected = next(e for e in events if e["event"] == "trial_rejected")
+    assert rejected["committed_dense_hash_before"] == \
+        rejected["committed_dense_hash_after"]
+    assert state.reject_counts == {"forced_test_reject": 1}
+    audit = analysis.qualification_summary(events)
+    assert audit["rejection_counts"] == {"forced_test_reject": 1}
+    assert audit["rollback_dense_state_preserved"] is True
+    assert audit["accepted_dt_h"]["min"] == pytest.approx(0.05)
 
 
 def test_tabulated_beyond_horizon_raises():

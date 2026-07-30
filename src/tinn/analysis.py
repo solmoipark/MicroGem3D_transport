@@ -30,6 +30,85 @@ from .transport import LIQ_EPS
 _AXIS_NAMES = ("z", "y", "x")
 
 
+# ------------------------------------------------ qualification audit (paper §4.1)
+
+_QUALIFICATION_MAX_METRICS = (
+    "max_element_err_mol",
+    "injected_max_rel",
+    "endmember_sum_err_mol",
+    "endmember_element_err_mol",
+    "voxel_identity_max_err",
+    "water_partition_err_mol",
+    "dense_ledger_max_rel_err",
+    "placement_rel_err",
+)
+
+
+def qualification_summary(events: Sequence[dict]) -> Dict:
+    """Aggregate an engine audit stream without weakening its raw evidence.
+
+    The returned values are maxima over *every accepted step*, not merely the
+    last step before an output checkpoint.  Raw JSONL events remain the
+    authority for detailed review.
+    """
+    accepted = [e for e in events if e.get("event") == "step_accepted"]
+    rejected = [e for e in events if e.get("event") == "trial_rejected"]
+    written = [e for e in events if e.get("event") == "checkpoint_written"]
+
+    maxima: Dict[str, float] = {}
+    for key in _QUALIFICATION_MAX_METRICS:
+        vals = [float(e.get("metrics", {}).get(key, 0.0)) for e in accepted
+                if key in e.get("metrics", {})]
+        if vals:
+            maxima[key] = max(vals)
+
+    min_channels = [
+        float(e.get("metrics", {}).get("min_channel_value"))
+        for e in accepted if "min_channel_value" in e.get("metrics", {})
+    ]
+    injected = np.zeros(len(ELEMENT_IDS), dtype=np.float64)
+    for event in accepted:
+        delta = np.asarray(event.get("injected_delta_mol", []),
+                           dtype=np.float64)
+        if delta.shape == injected.shape:
+            injected += np.abs(delta)
+
+    reasons: Dict[str, int] = {}
+    for event in rejected:
+        reason = str(event.get("reason", "unknown"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+    rollback_ok = all(
+        e.get("committed_dense_hash_before")
+        == e.get("committed_dense_hash_after")
+        for e in rejected)
+
+    dts = [float(e["dt_accepted_h"]) for e in accepted]
+    return {
+        "evidence_level": "engineering_regression_only",
+        "claim_scope": (
+            "numerical qualification and conservation of the frozen "
+            "Parrot-Killoh + PC/xGEMS engineering baseline; not independent "
+            "scientific validation"
+        ),
+        "accepted_steps": len(accepted),
+        "rejected_trials": len(rejected),
+        "rejection_counts": reasons,
+        "rollback_dense_state_preserved": rollback_ok,
+        "accepted_dt_h": {
+            "min": min(dts) if dts else None,
+            "max": max(dts) if dts else None,
+            "unique": sorted(set(dts)),
+        },
+        "max_over_accepted_steps": maxima,
+        "min_channel_value_over_accepted_steps": (
+            min(min_channels) if min_channels else None),
+        "gross_solver_injection_mol_by_element": {
+            el: float(injected[i]) for i, el in enumerate(ELEMENT_IDS)
+        },
+        "checkpoint_writes": len(written),
+    }
+
+
 # ------------------------------------------------------------------ policies
 
 def gel_porosity_vector(config: TinnConfig, hydrate_ids: Sequence[str],

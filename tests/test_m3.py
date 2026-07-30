@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 from tinn.config import TinnConfig
 from tinn.gems import (BundleAuditError, GemsError, GemsWorker, audit_bundle,
                        run_0d_probe)
+from tinn.registry import SALT_PHASE_IDS, default_registry
 
 REPO = Path(__file__).resolve().parents[1]
 BUNDLE = REPO / "gems_bundles" / "PC" / "PC-dat.lst"
@@ -140,6 +142,35 @@ def test_nonconvergence_is_a_distinguishable_error(worker):
 
 
 # ---------------- 0D cumulative probe (M3 DoD) ----------------
+
+def test_0d_probe_offers_all_solubility_controlled_salt_inventory():
+    cfg = TinnConfig.from_json_file(str(
+        REPO / "examples" / "qualification"
+        / "deschner_opc_q32_dt06_28d.json"))
+    seen = {}
+
+    class CaptureWorker:
+        def info(self):
+            return {"phase_names": ["Alite", "Belite", "Aluminate", "Ferrite"]}
+
+        def equilibrate_elements(self, elements, *_args, **_kwargs):
+            seen.update(elements)
+            return SimpleNamespace(
+                ph=13.0, ph_status="ok", ionic_strength=0.1,
+                phase_amounts_mol={}, phase_masses_kg={},
+                phase_elements_mol={}, phase_species_mol={},
+                element_closure_max_rel=lambda: 0.0,
+                floor_adjust_max_rel=lambda: 0.0,
+                status="ok")
+
+    run_0d_probe(cfg, CaptureWorker(), times_h=[24.0])
+    reg = default_registry()
+    expected_s = sum(
+        cfg.binder.mass_fractions.get(p, 0.0)
+        / reg.get(p).molar_mass_g_mol
+        * reg.get(p).formula.get("S", 0.0)
+        for p in SALT_PHASE_IDS)
+    assert seen["S"] == pytest.approx(expected_s)
 
 @needs_gems
 def test_0d_probe_c3s_closure_and_sanity(worker):
