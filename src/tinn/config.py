@@ -13,7 +13,8 @@ from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from .registry import KINETIC_PHASE_IDS, default_registry
+from .registry import (KINETIC_PHASE_IDS, SALT_PHASE_IDS, SCM_PHASE_IDS,
+                       default_registry)
 
 # The rasterizer's periodic bounding box needs d/h + sqrt(3) + 2 voxels
 # (half-diagonal halo on each side plus floor granularity); keep in sync with
@@ -225,9 +226,23 @@ class KineticsConfig(BaseModel):
     # >= 1e-15 keeps 1 - seed representable so the Jander denominator stays finite
     pk_alpha_seed: float = Field(default=1e-8, ge=1e-15, lt=1.0)
     pk_max_substep_days: float = Field(default=0.01, gt=0.0)
+    # measured first-order dissolution time constants of the soluble salt
+    # carriers (PRD 1.2/4.2 v3.0/E3), overriding kinetics.SALT_TAU_H_PRESETS
+    # per phase; pk kinetics only (a table states alpha(t) directly)
+    salt_tau_h: Optional[Dict[str, float]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "KineticsConfig":
+        if self.salt_tau_h is not None:
+            unknown = set(self.salt_tau_h) - set(SALT_PHASE_IDS)
+            if unknown:
+                raise ValueError(
+                    f"salt_tau_h names non-carrier phases {sorted(unknown)}; "
+                    f"allowed: {SALT_PHASE_IDS}")
+            for pid, tau in self.salt_tau_h.items():
+                if not (tau > 0.0) or not math.isfinite(tau):
+                    raise ValueError(
+                        f"salt_tau_h[{pid}] must be finite and > 0, got {tau}")
         if self.kind == "pk":
             if self.preset not in PK_PRESETS:
                 raise ValueError(f"pk kinetics requires preset in {PK_PRESETS}, got {self.preset!r}")
@@ -242,6 +257,10 @@ class KineticsConfig(BaseModel):
                 raise ValueError("tabulated kinetics does not take a preset")
             if self.blaine_m2_kg is not None:
                 raise ValueError("blaine_m2_kg only applies to pk kinetics")
+            if self.salt_tau_h is not None:
+                raise ValueError(
+                    "salt_tau_h only applies to pk kinetics - a tabulated run "
+                    "states the salt alpha(t) columns in its own table")
         return self
 
 
@@ -418,7 +437,6 @@ class TinnConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> "TinnConfig":
-        from .registry import SCM_PHASE_IDS
         d_max_allowed_um = (self.rve.grid_size - RASTER_HALO_VOX) * self.rve.voxel_size_um
         for label, psd in (("__shared__", self.psd),
                            *((k, v)
@@ -452,7 +470,7 @@ class TinnConfig(BaseModel):
                                volume_fraction=b.volume_fraction / kept_vf)
                         for b in kept]
         if self.material_psd is not None:
-            allowed = {"clinker", *SCM_PHASE_IDS}
+            allowed = {"clinker", *SCM_PHASE_IDS, *SALT_PHASE_IDS}
             unknown = set(self.material_psd) - allowed
             if unknown:
                 raise ValueError(
@@ -463,7 +481,7 @@ class TinnConfig(BaseModel):
                     raise ValueError(
                         f"material_psd[{key!r}] given but the recipe has no {key} mass")
         if self.material_shape is not None:
-            allowed = {"clinker", *SCM_PHASE_IDS}
+            allowed = {"clinker", *SCM_PHASE_IDS, *SALT_PHASE_IDS}
             unknown = set(self.material_shape) - allowed
             if unknown:
                 raise ValueError(
@@ -501,7 +519,9 @@ class TinnConfig(BaseModel):
             if missing:
                 raise ValueError(
                     f"stoichiometric backend has no reaction rule for binder phases "
-                    f"{sorted(missing)}"
+                    f"{sorted(missing)} - SCM glasses and the E3 soluble salt "
+                    f"carriers dissolve into solution instead of precipitating a "
+                    f"fixed product, so they require the gems3k backend"
                 )
         return self
 
@@ -525,6 +545,10 @@ class TinnConfig(BaseModel):
         # same contract for material_shape (rev.2)
         if payload.get("material_shape") is None:
             payload.pop("material_shape", None)
+        # and for the E3 salt time constants: a salt-free config (or one on the
+        # presets) keeps its pre-E3 hash
+        if payload.get("kinetics", {}).get("salt_tau_h") is None:
+            payload.get("kinetics", {}).pop("salt_tau_h", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
         # TRUNCATED bins plus the original measured input — physics-faithful

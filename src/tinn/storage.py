@@ -166,9 +166,19 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
                          ("solid_phase_ids", SOLID_PHASE_IDS),
                          ("element_ids", ELEMENT_IDS)):
         if tuple(header[key]) != current:
+            extra = sorted(set(current) - set(header[key]))
+            hint = ""
+            if extra:
+                # E3 added the soluble salt carriers to the kinetic/solid
+                # channel lists; name them so the failure is self-diagnosing
+                # rather than an opaque list diff (PRD 5: no silent fallback,
+                # and no migration code either - rerun from the config)
+                hint = (f" (this build adds {extra}; a pre-E3 checkpoint has "
+                        f"no channel for them - rerun from the config)")
             raise StorageError(
                 f"checkpoint {key} {header[key]} does not match this build "
-                f"{list(current)} - ledger vectors would be misinterpreted")
+                f"{list(current)} - ledger vectors would be misinterpreted"
+                f"{hint}")
     hydrate_ids = tuple(header["hydrate_phase_ids"])  # run-scoped, header-owned
     endmember_ids = tuple((str(h), str(dc)) for h, dc in header["endmember_ids"])
     config = TinnConfig.model_validate(header["config"])

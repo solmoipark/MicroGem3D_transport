@@ -28,7 +28,18 @@ CLINKER_PHASE_IDS: Tuple[str, ...] = ("C3S", "C2S", "C3A", "C4AF")
 # SCM glasses (PRD v2.1): compositions/densities from InverseGems materials.yaml,
 # reaction schedules are logistic curves (kinetics.SCM_LOGISTIC_PRESETS)
 SCM_PHASE_IDS: Tuple[str, ...] = ("slag", "fly_ash", "metakaolin", "silica_fume")
-KINETIC_PHASE_IDS: Tuple[str, ...] = CLINKER_PHASE_IDS + SCM_PHASE_IDS
+# Soluble salt carriers (PRD 1.2 v3.0/E3): the sulfate and alkali INPUT
+# channels. Interground gypsum/hemihydrate/anhydrite carry SO4 (AFt/AFm
+# timing); arcanite/thenardite carry the water-soluble alkalis that set pore
+# solution pH. They dissolve by first-order kinetics
+# (kinetics.SALT_TAU_H_PRESETS) and — unlike clinker — are NOT suppressed in
+# the GEMS equilibrium, so an oversaturated solution re-precipitates them as
+# equilibrium phases: the system converges to solubility control even though
+# the release schedule is a first-order approximation.
+SALT_PHASE_IDS: Tuple[str, ...] = ("gypsum", "hemihydrate", "anhydrite",
+                                   "arcanite", "thenardite")
+KINETIC_PHASE_IDS: Tuple[str, ...] = (CLINKER_PHASE_IDS + SCM_PHASE_IDS
+                                      + SALT_PHASE_IDS)
 INERT_PHASE_ID = "inert"
 # Order of solid channels in the dense anhydrous_fraction array (fixed).
 SOLID_PHASE_IDS: Tuple[str, ...] = KINETIC_PHASE_IDS + (INERT_PHASE_ID,)
@@ -50,7 +61,7 @@ def element_vector(formula: dict, mol: float = 1.0):
     return v
 
 VALID_BASIS = ("solid_skeleton", "bulk_envelope")
-VALID_KINDS = ("clinker", "scm", "hydrate", "liquid", "inert")
+VALID_KINDS = ("clinker", "scm", "salt", "hydrate", "liquid", "inert")
 
 # oxide -> element counts for SCM glass composition conversion
 _OXIDES = {
@@ -136,7 +147,7 @@ class Registry:
                 raise RegistryError(f"duplicate phase id: {e.phase_id!r}")
             if e.kind not in VALID_KINDS:
                 raise RegistryError(f"{e.phase_id}: unknown kind {e.kind!r}")
-            if e.kind in ("clinker", "scm", "hydrate"):
+            if e.kind in ("clinker", "scm", "salt", "hydrate"):
                 if e.basis not in VALID_BASIS:
                     raise RegistryError(
                         f"{e.phase_id}: solid phase requires basis in {VALID_BASIS}, "
@@ -191,6 +202,24 @@ def default_registry() -> Registry:
                                  "Na2O": 0.1, "K2O": 0.5}, 2.50),
         scm_entry("silica_fume", {"SiO2": 99.3, "Al2O3": 0.1, "CaO": 0.1,
                                   "MgO": 0.1, "Na2O": 0.1, "K2O": 0.2}, 2.20),
+        # -- soluble salt carriers (PRD 1.2 v3.0/E3) --
+        # Molar volumes are the BUNDLE's own DCH V0 values (PC and CNASH agree
+        # exactly: Gp 74.69, hemihydrate 61.73, K2SO4 65.50, Na2SO4 53.33
+        # cm3/mol), so a salt that dissolves and re-precipitates through GEMS
+        # keeps one volume definition. Anhydrite is absent from both bundles —
+        # its 45.94 cm3/mol is the crystallographic value (M/rho =
+        # 136.14/2.963), and it therefore has no re-precipitation path: it is
+        # a dissolution-only carrier (documented, never silently substituted).
+        PhaseEntry("gypsum", "salt", {"Ca": 1, "S": 1, "O": 6, "H": 4}, 74.69,
+                   "solid_skeleton"),
+        PhaseEntry("hemihydrate", "salt", {"Ca": 1, "S": 1, "O": 4.5, "H": 1},
+                   61.73, "solid_skeleton"),
+        PhaseEntry("anhydrite", "salt", {"Ca": 1, "S": 1, "O": 4}, 45.94,
+                   "solid_skeleton"),
+        PhaseEntry("arcanite", "salt", {"K": 2, "S": 1, "O": 4}, 65.50,
+                   "solid_skeleton"),
+        PhaseEntry("thenardite", "salt", {"Na": 2, "S": 1, "O": 4}, 53.33,
+                   "solid_skeleton"),
         # Unassigned clinker residual: placement-only inert solid, no chemistry invented.
         PhaseEntry(INERT_PHASE_ID, "inert", density_override_g_cm3=3.15),
         # -- liquid --

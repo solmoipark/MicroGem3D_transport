@@ -21,8 +21,8 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import TinnConfig
-from .registry import (INERT_PHASE_ID, Registry, SCM_PHASE_IDS,
-                       SOLID_PHASE_IDS)
+from .registry import (INERT_PHASE_ID, Registry, SALT_PHASE_IDS,
+                       SCM_PHASE_IDS, SOLID_PHASE_IDS)
 
 RV_SUBGRID_MAX = 0.25  # d < h/2
 RV_FRACTIONAL_MAX = (3.0 / (4.0 * math.pi)) ** (1.0 / 3.0)  # sphere volume <= 1 voxel
@@ -209,15 +209,19 @@ def initialize_rve(config: TinnConfig, registry: Registry) -> RVEInit:
     # is its own pure-glass population with its own PSD. A single-material
     # (SCM-free) config makes byte-identical RNG draws to the legacy path.
     materials = []  # (name, phase_weights (P,), volume_target_vox, psd)
-    clinker_vol = sum(vol_g[p] for p in SOLID_PHASE_IDS if p not in SCM_PHASE_IDS)
+    # E3: the soluble salt carriers are interground but distinct solids (usually
+    # finer than clinker), so each gets its OWN population exactly like an SCM
+    # — never mixed into the clinker composition.
+    own_population = set(SCM_PHASE_IDS) | set(SALT_PHASE_IDS)
+    clinker_vol = sum(vol_g[p] for p in SOLID_PHASE_IDS if p not in own_population)
     psd_map = config.material_psd or {}
     if clinker_vol > 0.0:  # an all-SCM binder has no clinker population
-        clinker_w = np.array([vol_g[p] / clinker_vol if p not in SCM_PHASE_IDS
+        clinker_w = np.array([vol_g[p] / clinker_vol if p not in own_population
                               else 0.0 for p in SOLID_PHASE_IDS])
         materials.append(("clinker", clinker_w,
                           v_solid_target * (clinker_vol / v_solid),
                           psd_map.get("clinker", config.psd)))
-    for sid in SCM_PHASE_IDS:
+    for sid in SCM_PHASE_IDS + SALT_PHASE_IDS:
         if vol_g.get(sid, 0.0) > 0.0:
             w = np.zeros(len(SOLID_PHASE_IDS))
             w[SOLID_PHASE_IDS.index(sid)] = 1.0

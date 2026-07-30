@@ -110,7 +110,8 @@ class StoichiometricBackend:
             if rule is None:
                 raise RuntimeError(
                     f"stoichiometric backend has no reaction rule for released "
-                    f"phase {phase_id!r} (SCM glasses require the gems3k backend)")
+                    f"phase {phase_id!r} (SCM glasses and the E3 soluble salt "
+                    f"carriers require the gems3k backend)")
             water_need += n_mol * rule.water_mol
             for hid, coeff in rule.products.items():
                 totals[hid] = totals.get(hid, 0.0) + n_mol * coeff

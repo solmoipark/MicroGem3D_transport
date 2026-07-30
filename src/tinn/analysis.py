@@ -117,6 +117,34 @@ def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
     return out
 
 
+def binder_oxide_diagnostics(config: TinnConfig,
+                             registry: Optional[Registry] = None) -> Dict[str, float]:
+    """E3 diagnostic: the SO3 and alkali content the recipe actually carries,
+    in the oxide wt% the cement literature reports (per 100 g of binder as
+    batched, i.e. including the unassigned inert residual). Derived from the
+    registry formulas of every phase with mass — nothing declared separately,
+    so it cannot drift from the chemistry. Na2O-equivalent uses the standard
+    0.658 = M(Na2O)/M(K2O) factor. Diagnostics only (mol ledgers are the
+    authority); enables direct comparison with a mill certificate."""
+    reg = registry or default_registry()
+    m = {"SO3": 80.06, "Na2O": 61.979, "K2O": 94.196}
+    out = {"so3_pct": 0.0, "na2o_pct": 0.0, "k2o_pct": 0.0}
+    for pid, frac in config.binder.mass_fractions.items():
+        if frac <= 0.0:
+            continue
+        entry = reg.get(pid)
+        mm = entry.molar_mass_g_mol
+        if not mm:
+            continue
+        mol_per_g = frac / mm            # mol of formula unit per g of binder
+        f = entry.formula or {}
+        out["so3_pct"] += mol_per_g * f.get("S", 0.0) * m["SO3"] * 100.0
+        out["na2o_pct"] += mol_per_g * f.get("Na", 0.0) / 2.0 * m["Na2O"] * 100.0
+        out["k2o_pct"] += mol_per_g * f.get("K", 0.0) / 2.0 * m["K2O"] * 100.0
+    out["na2o_eq_pct"] = out["na2o_pct"] + 0.658 * out["k2o_pct"]
+    return out
+
+
 def casi_channel(state: SimulationState) -> Optional[str]:
     """The ONE channel the cluster Ca/Si observable reads: the multi-endmember
     (solid solution) channel holding the largest pooled Si mass. Summing every
@@ -763,6 +791,8 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         "run_dir": str(run),
         "config_hash": config.config_hash(),
         "backend": backend_id,
+        # E3: what SO3/alkali the recipe carries (mill-certificate units)
+        "binder_oxides": binder_oxide_diagnostics(config, reg),
         "outputs": rows,
         "sanity_band": sanity_band(rows, config),
         "notes": notes,

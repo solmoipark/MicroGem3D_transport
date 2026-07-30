@@ -18,8 +18,9 @@ from tinn.engine import Engine
 from tinn.kinetics import (SCM_LOGISTIC_PRESETS, ParrotKilloh,
                            scm_alpha, scm_effective_params)
 from tinn.registry import (ATOMIC_MASS_G_MOL, CLINKER_PHASE_IDS, ELEMENT_IDS,
-                           KINETIC_PHASE_IDS, RegistryError, SCM_PHASE_IDS,
-                           default_registry, scm_entry)
+                           KINETIC_PHASE_IDS, RegistryError, SALT_PHASE_IDS,
+                           SCM_PHASE_IDS, SOLID_PHASE_IDS, default_registry,
+                           scm_entry)
 
 REPO = Path(__file__).resolve().parents[1]
 EXAMPLES = REPO / "examples"
@@ -39,8 +40,12 @@ FA30 = {"C3S": 0.46353, "C2S": 0.05817, "C3A": 0.07549, "C4AF": 0.05107,
 # ---------------- registry: oxide glasses ----------------
 
 def test_kinetic_phase_order():
-    assert KINETIC_PHASE_IDS == CLINKER_PHASE_IDS + SCM_PHASE_IDS
+    # positional ledger contract: clinker, then SCM, then the E3 salt carriers
+    # (appended, so every pre-E3 index keeps its meaning)
+    assert KINETIC_PHASE_IDS == CLINKER_PHASE_IDS + SCM_PHASE_IDS + SALT_PHASE_IDS
     assert SCM_PHASE_IDS == ("slag", "fly_ash", "metakaolin", "silica_fume")
+    assert SALT_PHASE_IDS == ("gypsum", "hemihydrate", "anhydrite",
+                              "arcanite", "thenardite")
 
 
 def test_fly_ash_registry_entry_matches_composition():
@@ -208,9 +213,20 @@ def test_blend_3d_sanity_band_uses_clinker_only(blend_run):
 
 # ---------------- per-material populations (PRD v2.2, W1) ----------------
 
+# (dense_hash, placement_hash) per legacy example. dense_hash covers the
+# per-channel anhydrous array, so it MOVES whenever the solid channel list
+# grows — E3 appended five all-zero salt-carrier channels (pre-E3 values were
+# 689171a7... / a9ce52e1...). placement_hash covers what must never move:
+# the occupancy FIELD (channel sum), water, gas and particle ids — i.e. the
+# RNG draws and rasterization. A physics regression breaks both; a channel
+# list extension breaks only the first.
 LEGACY_HASHES = {
-    "c3s_32.json": "689171a7001babb62ba785d8eaf266c11d876e0324c3a7e03ddffeb1ffe70c76",
-    "opc_srm114q_32.json": "a9ce52e1cf07a9b02265e6815cccbe7402aec20fa288419f7972f89e31e432ea",
+    "c3s_32.json": (
+        "941c09fdaa49112831e925128073edc726da5ea53c847f83bd28dc091c910570",
+        "83cffe827c2e56dc1de5e5ebac12ede16ed555dcc36725e2e42d11455fb5ed01"),
+    "opc_srm114q_32.json": (
+        "83471efa81c1abe91cedf2e7acca9823fc3fd39f14bf59e4495104d1b819adb4",
+        "478acbe54441d3499d1dd6683174e49bdc5fea0b2755c5f15e4dc369ae424311"),
 }
 
 SLAG_PSD = {"bins": [
@@ -277,10 +293,20 @@ def test_config_hash_stable_without_material_shape():
 
 
 def test_geometry_legacy_bitwise_unchanged():
+    import hashlib
     from tinn.geometry import initialize_rve
-    for name, expect in LEGACY_HASHES.items():
+    for name, (dense_expect, place_expect) in LEGACY_HASHES.items():
         cfg = TinnConfig.from_json_file(str(EXAMPLES / name))
-        assert initialize_rve(cfg, REG).dense_hash() == expect, name
+        rve = initialize_rve(cfg, REG)
+        assert rve.dense_hash() == dense_expect, name
+        h = hashlib.sha256()
+        for arr in (rve.anhydrous_fraction.sum(axis=0), rve.capillary_liquid,
+                    rve.capillary_gas, rve.particle_id):
+            h.update(np.ascontiguousarray(arr).tobytes())
+        assert h.hexdigest() == place_expect, f"{name} placement moved"
+        # the E3 salt channels exist but stay empty for a salt-free recipe
+        salt_idx = [SOLID_PHASE_IDS.index(p) for p in SALT_PHASE_IDS]
+        assert not np.any(rve.anhydrous_fraction[salt_idx])
 
 
 def _blend_rve(material_psd=None):
