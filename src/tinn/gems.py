@@ -532,10 +532,17 @@ class GemsBackend:
                     vec[self._h2o_index[el]] = v / s
             # E1: endmember mols ride the parcel, rescaled by the same 1/s as
             # mol/elements/volume so the endmember-sum identity survives the
-            # canonical scaling exactly (worker verified it at scale s)
+            # canonical scaling exactly (worker verified it at scale s). A
+            # solid with amount but no species split is a protocol violation
+            # (None is reserved for single-endmember synthetic backends whose
+            # channel IS the endmember — bundle DC names differ from phase
+            # names, so None is never bookable for GEMS parcels).
             em_scaled = r.phase_species_mol.get(phase)
-            em = ({dc: m / s for dc, m in em_scaled.items()}
-                  if em_scaled else None)
+            if not em_scaled:
+                raise GemsError(
+                    f"worker response lacks the endmember split for solid "
+                    f"phase {phase!r}", kind="protocol")
+            em = {dc: m / s for dc, m in em_scaled.items()}
             parcels.append(Parcel(
                 phase_id=phase, mol=mol_scaled / s, elements=vec,
                 skel_vol_cm3=r.phase_volumes_m3.get(phase, 0.0) * 1e6 / s,
@@ -645,7 +652,16 @@ def _dch_species_elements(dat_lst: Path) -> Dict[str, Dict[str, float]]:
     if dch_name is None:
         raise ValueError(f"bundle .lst names no DCH file: {dat_lst}")
     dch_path = dat_lst.parent / dch_name
-    payload = json.loads(dch_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(dch_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # pre-E1 any xgems-loadable bundle worked; the endmember ledger needs
+        # the DCH as JSON (-j export). Refuse key-value (-t) exports with a
+        # diagnosable message instead of a bare parse crash.
+        raise ValueError(
+            f"bundle DCH {dch_path.name} is not JSON — the E1 endmember "
+            f"ledger requires GEMS3K JSON (-j) exports, not key-value (-t) "
+            f"bundles: {e}") from e
     dch = payload[0]["dch"] if isinstance(payload, list) else payload["dch"]
     ic_names = [str(x) for x in dch["ICNL"]]
     dc_names = [str(x) for x in dch["DCNL"]]
@@ -658,8 +674,17 @@ def _dch_species_elements(dat_lst: Path) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for j, dc in enumerate(dc_names):
         row = a[j * n_ic:(j + 1) * n_ic]
-        out[dc] = {ic: float(v) for ic, v in zip(ic_names, row)
-                   if ic != CHARGE_ELEMENT_ID and float(v) != 0.0}
+        entry = {ic: float(v) for ic, v in zip(ic_names, row)
+                 if ic != CHARGE_ELEMENT_ID and float(v) != 0.0}
+        # Cemdata bundles legitimately repeat a DC name across phases (e.g.
+        # C4AH13 as pure phase AND AFm endmember) with IDENTICAL rows; a
+        # same-named DC with a DIFFERENT stoichiometry would silently
+        # mis-map the ledger, so refuse it (no guessing)
+        if dc in out and out[dc] != entry:
+            raise ValueError(
+                f"DCH declares DC {dc!r} twice with differing stoichiometry "
+                f"- endmember rows would be ambiguous")
+        out[dc] = entry
     return out
 
 

@@ -43,7 +43,14 @@ def remove(hydrate_fraction: np.ndarray, channel: int, request_vol: float,
     field = hydrate_fraction[channel]
     local = np.where(member_mask, field, 0.0)
     available = float(local.sum())
-    if request_vol > available * (1.0 + 1e-12) + 1e-30:
+    # the caller's request comes from np.bincount (naive summation) while
+    # `available` is a pairwise np.sum over the same voxels — on a full-channel
+    # removal leg the two legitimately diverge by ~n_member * eps (observed
+    # 1e-11 relative at 128^3 / 750k voxels), so the over-request allowance
+    # must scale with the member count; anything beyond is a real logic error
+    n_member = int(member_mask.sum())
+    allow_rel = max(1e-12, 1e-16 * n_member)
+    if request_vol > available * (1.0 + allow_rel) + 1e-30:
         raise ValueError(
             f"removal request {request_vol!r} exceeds available {available!r} "
             f"on channel {channel}")

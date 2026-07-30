@@ -244,3 +244,88 @@ def test_gems_run_endmember_closure_and_observables(tmp_path):
     mid = load_checkpoint(str(ck), REG)
     resumed, _ = Engine(cfg).run(state=mid)
     assert resumed.full_hash() == state.full_hash()
+
+
+# ---------------- review-gate regressions (E1 adversarial review) ----------------
+
+def test_remove_guard_scales_with_member_count():
+    """bincount-vs-pairwise summation legitimately diverges ~n*eps on a
+    full-channel removal leg; the over-request allowance must scale with the
+    member count instead of hard-crashing at 128^3 (review finding)."""
+    from tinn import morphology
+    n = 16
+    hyd = np.zeros((4, n, n, n))
+    rng = np.random.default_rng(11)
+    hyd[0] = rng.random((n, n, n)) * 1e-3
+    member = np.ones((n, n, n), dtype=bool)
+    available = float(np.where(member, hyd[0], 0.0).sum())
+    n_member = int(member.sum())
+    # a request just above the OLD 1e-12 allowance but inside the scaled one
+    req = available * (1.0 + 5e-13 + 1e-16 * n_member * 0.5)
+    _, removed = morphology.remove(hyd, 0, req, member)
+    assert removed == pytest.approx(available, rel=1e-9)   # clamped, no crash
+    hyd[0][:] = 0.1
+    with pytest.raises(ValueError, match="exceeds available"):
+        morphology.remove(hyd, 0, float(np.sum(hyd[0])) * 1.01, member)
+
+
+def test_ledger_1b_tolerates_full_vanish_dust():
+    """A channel that fully redissolves keeps signed dust ~eps x turnover;
+    the closure bounds reference the GLOBAL holdings scale so legitimate dust
+    passes while real corruption (>> rtol x global) still trips."""
+    cfg = _short_cfg()
+    state, _ = Engine(cfg).run()
+    state.endmember_mol = state.endmember_mol.copy()
+    state.hydrate_mol = state.hydrate_mol.copy()
+    state.hydrate_elements_ch = state.hydrate_elements_ch.copy()
+    ch = int(np.argmax(state.hydrate_mol))
+    h = state.hydrate_ids[ch]
+    j = next(i for i, (hh, _) in enumerate(state.endmember_ids) if hh == h)
+    X = float(state.hydrate_mol[ch])
+    # simulate the vanished channel: every ledger leg holds INDEPENDENT
+    # signed dust (~eps x pre-vanish turnover) as the signed commit leaves it
+    state.hydrate_mol[ch] = -3e-16 * X
+    state.endmember_mol[j] = 1e-16 * X
+    state.hydrate_elements_ch[ch] *= 0.5e-16
+    rep = ledger.check_all(state, REG)
+    assert not any(v.startswith("balance_endmember") for v in rep.violations), \
+        rep.violations
+
+
+def test_engine_rejects_none_split_for_multi_endmember_phase():
+    class NoneSplitBackend:
+        backend_id = "stoichiometric"
+        hydrate_ids = ("CSH",)
+        hydrate_endmembers = {"CSH": ("TobH", "JenD")}
+        endmember_elements = {"TobH": np.zeros(len(ELEMENT_IDS)),
+                              "JenD": np.zeros(len(ELEMENT_IDS))}
+        mode = "incremental"
+
+        def react(self, released_mol, water_available_mol, inventory,
+                  solid_elements=None):
+            entry = REG.get("CSH")
+            mol = 1e-13
+            return ReactionResult(
+                status=STATUS_OK,
+                parcels=[Parcel(phase_id="CSH", mol=mol,
+                                elements=element_vector(entry.formula, mol),
+                                skel_vol_cm3=mol * entry.skeleton_molar_volume_cm3,
+                                endmember_mol=None)],
+                water_consumed_mol=0.0,
+                residual_inventory=np.asarray(inventory).copy())
+
+    eng = Engine(_short_cfg(), reaction_backend=NoneSplitBackend())
+    with pytest.raises(RuntimeError, match="omitted the endmember split"):
+        eng.try_step(eng.initial_state(), 2.0)
+
+
+def test_from_geometry_requires_rows_for_multi_endmember():
+    from tinn.geometry import initialize_rve
+    from tinn.state import SimulationState
+    cfg = _short_cfg()
+    rve = initialize_rve(cfg, REG)
+    with pytest.raises(ValueError, match="no endmember element rows"):
+        SimulationState.from_geometry(
+            cfg, REG, rve, "stoichiometric", hydrate_ids=("CSH",),
+            hydrate_endmembers={"CSH": ("TobH", "JenD")},
+            endmember_elements=None)

@@ -196,6 +196,14 @@ class SimulationState:
         if hydrate_endmembers is None:
             hydrate_endmembers = {h: (h,) for h in hydrate_ids}
         if endmember_elements is None:
+            multi = [h for h in hydrate_ids
+                     if tuple(hydrate_endmembers[h]) != (h,)]
+            if multi:
+                raise ValueError(
+                    f"backend declares non-trivial endmember universes for "
+                    f"{multi} but no endmember element rows — the registry "
+                    f"formula fallback only covers channel==endmember "
+                    f"(no guessing)")
             endmember_elements = {
                 h: formula_elements(registry.get(h).formula)
                 for h in hydrate_ids}

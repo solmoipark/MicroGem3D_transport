@@ -100,14 +100,25 @@ def check_all(state: SimulationState, registry: Registry,
             hi = h_of[h]
             sum_mol[hi] += em[j]
             elem_from_em[hi] += em[j] * state.endmember_elements[j]
+        # tolerance reference: a channel that FULLY redissolves keeps signed
+        # float dust ~eps x its pre-vanish holdings while its post-step
+        # magnitude collapses to ~0 — bounding by the post-step channel value
+        # alone misreports that legitimate dust as corruption (review finding,
+        # reproduced at 128^3 scales). The dust is bounded by eps x total
+        # turnover, so the reference includes the GLOBAL holdings scale; real
+        # corruption remains orders of magnitude above rtol x global.
+        scale_mol = float(np.abs(state.hydrate_mol).sum())
         err_m = np.abs(sum_mol - state.hydrate_mol)
-        bound_m = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(state.hydrate_mol)
+        bound_m = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.maximum(
+            np.abs(state.hydrate_mol), scale_mol)
         rep.metrics["endmember_sum_err_mol"] = float(err_m.max()) if n_h else 0.0
         if np.any(err_m > bound_m):
             bad = [state.hydrate_ids[i] for i in np.flatnonzero(err_m > bound_m)]
             rep.violations.append(f"balance_endmember:{','.join(bad)}")
+        col_scale = np.abs(state.hydrate_elements_ch).sum(axis=0)  # (E,)
         err_e = np.abs(elem_from_em - state.hydrate_elements_ch)
-        bound_e = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.abs(state.hydrate_elements_ch)
+        bound_e = ELEMENT_ATOL_MOL + ELEMENT_RTOL * np.maximum(
+            np.abs(state.hydrate_elements_ch), col_scale[None, :])
         rep.metrics["endmember_element_err_mol"] = float(err_e.max()) if n_h else 0.0
         if np.any(err_e > bound_e):
             rows = sorted({state.hydrate_ids[i]

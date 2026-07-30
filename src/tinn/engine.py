@@ -389,7 +389,17 @@ class Engine:
                 # endmember phase (the channel is the endmember); an unknown
                 # endmember name is a protocol violation, never dropped
                 if pc.endmember_mol is None:
-                    parcel_em[c, self._em_index[(pc.phase_id, pc.phase_id)]] += pc.mol
+                    key = (pc.phase_id, pc.phase_id)
+                    if key not in self._em_index:
+                        # bundles name single-DC species differently from the
+                        # phase (PC: Calcite->Cal etc.) and solid solutions
+                        # have no self-named endmember — a None split there is
+                        # a backend protocol violation, not bookable
+                        raise RuntimeError(
+                            f"backend omitted the endmember split for phase "
+                            f"{pc.phase_id!r} whose endmember universe is "
+                            f"{self._hydrate_endmembers[pc.phase_id]}")
+                    parcel_em[c, self._em_index[key]] += pc.mol
                 else:
                     for dc, m in pc.endmember_mol.items():
                         key = (pc.phase_id, dc)
@@ -612,6 +622,17 @@ class Engine:
                 "checkpoint endmember universe does not match the backend's - "
                 "bundle changed between runs? (E1: endmember ledgers are "
                 "positional and never remapped)")
+        # names matching is not enough: a bundle whose DCH stoichiometry rows
+        # changed under unchanged DC names must fail FAST here, not drift into
+        # a mid-run balance_endmember_elements abort (review finding)
+        if self._endmember_elements is not None and len(expect_em):
+            expect_rows = np.array([self._endmember_elements[dc]
+                                    for _, dc in expect_em])
+            if not np.array_equal(expect_rows, state.endmember_elements):
+                raise RuntimeError(
+                    "checkpoint endmember element rows do not match the "
+                    "backend's DCH stoichiometry - bundle content changed "
+                    "between runs (no silent fallback)")
         sched = self.config.schedule
         outputs = [t for t in sched.output_times_h if t > state.time_h + 1e-12]
         summary: Dict = {

@@ -90,12 +90,17 @@ def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
     by_channel: Dict[str, List[int]] = {}
     for j, (h, _dc) in enumerate(state.endmember_ids):
         by_channel.setdefault(h, []).append(j)
+    # dust floor: fully-redissolved channels legally keep signed float dust
+    # (~eps x turnover) in the ledger; ratios computed from dust are noise,
+    # so channels below a relative floor of the global holdings are skipped
+    global_abs = float(np.abs(state.endmember_mol).sum())
+    floor = 1e-9 * global_abs
     for h, idxs in by_channel.items():
         if len(idxs) < 2:
             continue
         mols = state.endmember_mol[idxs]
         total = float(mols.sum())
-        if total <= 0.0:
+        if total <= floor:
             continue
         elems = (mols[:, None] * state.endmember_elements[idxs]).sum(axis=0)
         row: Dict[str, object] = {
