@@ -22,7 +22,7 @@ from . import ledger
 from .config import TinnConfig
 from .registry import (CLINKER_PHASE_IDS, ELEMENT_IDS, KINETIC_PHASE_IDS,
                        Registry, SALT_PHASE_IDS, SCM_PHASE_IDS,
-                       default_registry)
+                       default_registry, registry_for)
 from .state import SimulationState
 from .storage import load_checkpoint
 from .transport import LIQ_EPS
@@ -818,6 +818,9 @@ def report(run_dir: str, out_dir: Optional[str] = None,
     for ck in ckpts:
         state = load_checkpoint(str(ck), reg)
         config = state.config
+        if registry is None:
+            # the run's own registry (a config may declare its own SCM glass)
+            reg = registry_for(config)
         backend_id = state.backend_id
         if first_state is None:
             first_state = state   # initial_phase_mol is constant across a run

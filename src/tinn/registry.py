@@ -37,6 +37,15 @@ SCM_PHASE_IDS: Tuple[str, ...] = ("slag", "fly_ash", "metakaolin", "silica_fume"
 # never suppressed, so whatever the equilibrium keeps precipitates right back.
 SALT_PHASE_IDS: Tuple[str, ...] = ("gypsum", "hemihydrate", "anhydrite",
                                    "arcanite", "thenardite")
+# The alkali sulfates sit IN the clinker rather than beside it: they are the
+# readily-soluble alkali fraction that condenses on clinker surfaces during
+# cooling or crystallizes in its pores (Deschner et al., CCR 42 (2012) 1389,
+# Table 1 quantifies arcanite as a clinker phase). So they are placed inside
+# the clinker population instead of forming their own particles, which also
+# removes the tiny-population sampling error a 0.5 wt% phase would otherwise
+# carry. The calcium sulfates stay separate — those really are interground
+# as their own mineral grains.
+ALKALI_SALT_PHASE_IDS: Tuple[str, ...] = ("arcanite", "thenardite")
 KINETIC_PHASE_IDS: Tuple[str, ...] = (CLINKER_PHASE_IDS + SCM_PHASE_IDS
                                       + SALT_PHASE_IDS)
 INERT_PHASE_ID = "inert"
@@ -179,6 +188,30 @@ class Registry:
 
     def ids(self) -> Tuple[str, ...]:
         return tuple(self._entries)
+
+
+def registry_for(config) -> Registry:
+    """The registry a run actually uses: the defaults, with any SCM whose
+    measured composition the config declares REPLACED by that composition
+    (PRD 1.2 v3.0). The built-in SCM glasses are one published dataset
+    (InverseGems materials.yaml); a study with its own measured fly ash — a
+    different alkali content changes pore-solution pH outright — must be able
+    to state it instead of inheriting ours. Nothing else in the run changes:
+    the phase id, its channel position and the ledger layout stay put, so
+    checkpoints stay compatible and only `config_hash` records the swap."""
+    overrides = getattr(config, "scm_composition", None) or {}
+    if not overrides:
+        return default_registry()
+    entries = []
+    for e in default_registry()._entries.values():
+        spec = overrides.get(e.phase_id)
+        if spec is None:
+            entries.append(e)
+            continue
+        entries.append(scm_entry(e.phase_id, dict(spec.oxides_wt_pct),
+                                 spec.density_g_cm3,
+                                 gel_porosity=e.gel_porosity))
+    return Registry(tuple(entries))
 
 
 def default_registry() -> Registry:

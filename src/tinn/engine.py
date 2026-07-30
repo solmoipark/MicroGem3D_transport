@@ -20,7 +20,7 @@ from .geometry import initialize_rve
 from .kinetics import KineticsModel, make_kinetics
 from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
                        Registry, SALT_PHASE_IDS, SOLID_PHASE_IDS,
-                       default_registry)
+                       registry_for)
 from .state import SimulationState, code_version
 
 REJECT_BACKEND_FAILURE = "backend_failure"
@@ -63,7 +63,7 @@ class Engine:
                  reaction_backend: Optional[backend_mod.ReactionBackend] = None,
                  kinetics: Optional[KineticsModel] = None):
         self.config = config
-        self.registry = registry or default_registry()
+        self.registry = registry or registry_for(config)
         if reaction_backend is not None:
             self.backend = reaction_backend
         elif config.chemistry.backend == "stoichiometric":
@@ -77,7 +77,8 @@ class Engine:
                 python_executable=(os.environ.get("TINN_GEMS_PYTHON")
                                    or config.chemistry.gems_worker_python),
                 work_root=None)
-            self.backend = GemsBackend(worker, config.temperature_K)
+            self.backend = GemsBackend(worker, config.temperature_K,
+                                       registry=self.registry)
         self.kinetics = kinetics or make_kinetics(config)
         self.hydrate_ids = tuple(self.backend.hydrate_ids)
         # E1 endmember metadata (PRD 2.3 rev.3): backend-declared; a backend

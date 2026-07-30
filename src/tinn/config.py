@@ -394,6 +394,32 @@ class ParticleShape(BaseModel):
         return max(self.normalized_axes())
 
 
+class ScmComposition(BaseModel):
+    """A measured SCM glass composition, replacing the built-in one for that
+    phase id (PRD 1.2 v3.0). Oxide wt% is the form a mill certificate or an
+    XRF table reports; the formula unit is those oxides per 100 g, exactly as
+    registry.scm_entry builds the built-ins. Only the LISTED oxides enter the
+    chemistry — an unlisted residue (LOI, unburnt carbon) is simply absent,
+    never invented into reactive mass. The density fixes the molar volume."""
+    model_config = _STRICT
+    oxides_wt_pct: Dict[str, float]
+    density_g_cm3: float = Field(gt=0.0, le=8.0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "ScmComposition":
+        if not self.oxides_wt_pct:
+            raise ValueError("scm_composition needs at least one oxide")
+        for ox, wt in self.oxides_wt_pct.items():
+            if not (0.0 <= wt <= 100.0):
+                raise ValueError(f"oxide {ox} wt% must be in [0, 100], got {wt}")
+        total = sum(self.oxides_wt_pct.values())
+        if total > 100.0 + 1e-9:
+            raise ValueError(
+                f"listed oxides sum to {total} wt% > 100 - a glass composition "
+                f"is per 100 g of material")
+        return self
+
+
 class TinnConfig(BaseModel):
     model_config = _STRICT
     binder: BinderRecipe
@@ -406,6 +432,10 @@ class TinnConfig(BaseModel):
     # materials absent from the map stay spherical. None keeps every earlier
     # config (and its hash, and its RNG stream) unchanged.
     material_shape: Optional[Dict[str, ParticleShape]] = None
+    # measured SCM glass compositions replacing the built-in ones (PRD 1.2
+    # v3.0): keys are SCM phase ids. The channel layout is untouched, so
+    # only the hash records the swap. None keeps every earlier config.
+    scm_composition: Optional[Dict[str, ScmComposition]] = None
     w_c: float = Field(gt=0.0, le=2.0)
     temperature_K: float = Field(ge=273.15, le=372.15)
     kinetics: KineticsConfig
@@ -538,6 +568,10 @@ class TinnConfig(BaseModel):
         # same contract for material_shape (rev.2)
         if payload.get("material_shape") is None:
             payload.pop("material_shape", None)
+        # and for the declared SCM compositions (v3.0): a config that inherits
+        # the built-in glasses keeps its earlier hash
+        if payload.get("scm_composition") is None:
+            payload.pop("scm_composition", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
         # TRUNCATED bins plus the original measured input — physics-faithful

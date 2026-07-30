@@ -391,7 +391,8 @@ class GemsBackend:
     # returning bound water to solution)
     mode = "snapshot"
 
-    def __init__(self, worker: GemsWorker, temperature_k: float):
+    def __init__(self, worker: GemsWorker, temperature_k: float,
+                 registry=None):
         from collections import OrderedDict
         from .registry import (ELEMENT_IDS, KINETIC_PHASE_IDS, default_registry,
                                element_vector)
@@ -439,7 +440,9 @@ class GemsBackend:
                     if el in el_idx:  # charge (Zz) already dropped worker-side
                         vec[el_idx[el]] = float(coeff)
                 self.endmember_elements[dc] = vec
-        reg = default_registry()
+        # the RUN's registry: a config-declared SCM composition (PRD 1.2
+        # v3.0) must reach the elements this backend is actually fed
+        reg = registry or default_registry()
         self._formula_vec = {p: element_vector(reg.get(p).formula, 1.0)
                              for p in KINETIC_PHASE_IDS}
         self._h2o_vec = element_vector(reg.get("H2O").formula, 1.0)

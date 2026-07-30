@@ -170,22 +170,29 @@ def test_offer_is_everything_water_can_reach():
 
 # ---------------- geometry / config ----------------
 
-def test_salt_carriers_get_their_own_populations():
-    """Interground but distinct solids: each carrier is its own population with
-    pure composition, never blended into the clinker particles."""
+def test_calcium_sulfates_get_own_populations_alkalis_ride_clinker():
+    """The calcium sulfates really are interground as their own mineral grains,
+    so each is its own population. The alkali sulfates are NOT separate grains
+    — they are the readily soluble alkali on and in the clinker (Deschner et
+    al. 2012 quantify arcanite as a clinker phase), so they ride the clinker
+    population instead of forming a 0.5 wt% population of their own."""
     from tinn.geometry import initialize_rve
+    from tinn.registry import ALKALI_SALT_PHASE_IDS
     rve = initialize_rve(TinnConfig.model_validate(_salt_raw()), REG)
     mats = rve.report["materials"]
     assert list(mats)[0] == "clinker"
-    assert set(list(mats)[1:]) == {"gypsum", "arcanite", "thenardite"}
+    assert set(list(mats)[1:]) == {"gypsum"}
+    assert set(ALKALI_SALT_PHASE_IDS) == {"arcanite", "thenardite"}
+    # the alkali volume is still placed, just inside the clinker grains
+    for pid in ALKALI_SALT_PHASE_IDS:
+        assert float(rve.anhydrous_fraction[SOLID_PHASE_IDS.index(pid)].sum()) > 0.0
     # each carrier population hits its own volume target and — being a
     # single-phase population — its dense channel holds exactly that volume,
     # which is what "not blended into the clinker particles" means
-    for pid in ("gypsum", "arcanite", "thenardite"):
-        row = mats[pid]
-        assert row["rel_error"] < 0.01, (pid, row)
-        chan = float(rve.anhydrous_fraction[SOLID_PHASE_IDS.index(pid)].sum())
-        assert chan == pytest.approx(row["volume_achieved_vox"], rel=1e-9)
+    row = mats["gypsum"]
+    assert row["rel_error"] < 0.01, row
+    chan = float(rve.anhydrous_fraction[SOLID_PHASE_IDS.index("gypsum")].sum())
+    assert chan == pytest.approx(row["volume_achieved_vox"], rel=1e-9)
     # and the volume targets follow the recipe's volume shares
     fracs = _salt_raw()["binder"]["mass_fractions"]
     v = {p: f / REG.get(p).density_g_cm3 for p, f in fracs.items()}
@@ -194,6 +201,11 @@ def test_salt_carriers_get_their_own_populations():
     tot_target = sum(r["volume_target_vox"] for r in mats.values())
     assert mats["gypsum"]["volume_target_vox"] / tot_target == pytest.approx(
         v["gypsum"] / v_tot, rel=1e-6)
+    # the clinker population now carries the alkali volume too
+    alk = sum(v[p] for p in ("arcanite", "thenardite"))
+    assert mats["clinker"]["volume_target_vox"] / tot_target == pytest.approx(
+        (v_tot - v["gypsum"]) / v_tot, rel=1e-6)
+    assert alk > 0.0
     # the carriers are FINER than the clinker population only if a PSD says so;
     # with a shared PSD their specific surface still differs by density alone
     assert mats["gypsum"]["ssa_est_m2_kg"] > 0.0
@@ -357,12 +369,17 @@ def test_dense_packing_carrier_is_not_capped_by_t0_geometry():
     reservoir = float(st.initial_phase_mol[i_arc])
     assert reservoir > 0.0
     t = st
-    for _ in range(3):
+    left = [reservoir]
+    for _ in range(4):
         t2, rej, _ = eng.try_step(t, 1.0)
         assert rej is None, rej
         t = t2
-    left = float(t.phase_mol[i_arc])
-    assert left <= 1e-3 * reservoir, (left, reservoir, left / reservoir)
+        left.append(float(t.phase_mol[i_arc]))
+    # the point is that the offer is never FROZEN by the t=0 geometry: the
+    # alkali sits inside clinker grains, so it keeps coming out as those
+    # surfaces are exposed — strictly decreasing, no plateau
+    assert all(b < a for a, b in zip(left, left[1:])), left
+    assert left[-1] <= 0.1 * reservoir, (left[-1], reservoir)
     # nothing was written off as unmet either: an unreachable grain is still
     # THERE, not lost, so unmet must stay at dust level for the carriers
     for pid in SALT_PHASE_IDS:
