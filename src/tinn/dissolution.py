@@ -44,6 +44,38 @@ class DissolutionResult:
     unmet_mol: np.ndarray     # (4,)
 
 
+def conductive_weight(trial: SimulationState) -> np.ndarray:
+    """Per-voxel conductive-face count (the accessibility measure this module
+    allocates by). Own/neighbor faces holding cluster liquid count 1, faces
+    holding hydrate count GEL_FACE_WEIGHT. Zero means the voxel is sealed
+    inside a particle and cannot dissolve at all.
+
+    Public because the engine needs the SAME measure to decide how much of a
+    solubility-controlled carrier is water-accessible this step (PRD 4.2
+    v3.0/E3): those phases have no rate law, so their offer is "everything the
+    water can currently reach" and the equilibrium decides what stays solid."""
+    wet = (trial.capillary_liquid > LIQ_EPS).astype(np.float64)
+    gel = (trial.hydrate_fraction.sum(axis=0) > LIQ_EPS).astype(np.float64)
+    return (wet + neighbor_liquid_sum(wet)
+            + GEL_FACE_WEIGHT * (gel + neighbor_liquid_sum(gel)))
+
+
+def accessible_mol(trial: SimulationState, registry: Registry,
+                   phase_ids) -> np.ndarray:
+    """Mol of each named phase that water can currently reach, in
+    KINETIC_PHASE_IDS positions (zero elsewhere)."""
+    weight = conductive_weight(trial)
+    out = np.zeros(len(KINETIC_PHASE_IDS))
+    for p in phase_ids:
+        k = KINETIC_PHASE_IDS.index(p)
+        chan = SOLID_PHASE_IDS.index(p)
+        avail = trial.anhydrous_fraction[chan]
+        vol = float(np.where(weight > 0.0, avail, 0.0).sum())
+        if vol > 0.0:
+            out[k] = vol / trial.vm_vox(registry, p)
+    return out
+
+
 def dissolve(trial: SimulationState, registry: Registry,
              dn_target_mol: np.ndarray) -> DissolutionResult:
     """Remove dn_target_mol per kinetic phase from trial.anhydrous_fraction in place."""
@@ -51,10 +83,7 @@ def dissolve(trial: SimulationState, registry: Registry,
     # conductive-face count: cluster liquid (same threshold as labeling) plus
     # hydrate gel faces at GEL_FACE_WEIGHT — a coated site reaches its cluster
     # through the gel, so attribution may need multi-hop (engine handles it)
-    wet = (trial.capillary_liquid > LIQ_EPS).astype(np.float64)
-    gel = (trial.hydrate_fraction.sum(axis=0) > LIQ_EPS).astype(np.float64)
-    weight = (wet + neighbor_liquid_sum(wet)
-              + GEL_FACE_WEIGHT * (gel + neighbor_liquid_sum(gel)))
+    weight = conductive_weight(trial)
     removed_vol = np.zeros((len(KINETIC_PHASE_IDS), n, n, n))
     removed_mol = np.zeros(len(KINETIC_PHASE_IDS))
     unmet_mol = np.zeros(len(KINETIC_PHASE_IDS))

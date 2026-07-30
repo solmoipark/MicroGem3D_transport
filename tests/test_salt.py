@@ -13,7 +13,7 @@ import pytest
 from tinn import analysis
 from tinn.config import TinnConfig
 from tinn.engine import Engine
-from tinn.kinetics import SALT_TAU_H_PRESETS, make_kinetics, salt_alpha
+from tinn.kinetics import make_kinetics
 from tinn.registry import (ATOMIC_MASS_G_MOL, KINETIC_PHASE_IDS, SALT_PHASE_IDS,
                            SOLID_PHASE_IDS, default_registry)
 from tinn.storage import StorageError, load_checkpoint, save_checkpoint
@@ -103,54 +103,69 @@ def test_salt_channels_appended_not_inserted():
 
 # ---------------- kinetics ----------------
 
-def test_first_order_salt_alpha_math_and_ordering():
-    assert salt_alpha(0.0, 3.0) == 0.0
-    assert salt_alpha(-1.0, 3.0) == 0.0
-    assert salt_alpha(3.0, 3.0) == pytest.approx(1.0 - math.exp(-1.0))
-    assert salt_alpha(1e9, 3.0) == pytest.approx(1.0)
-    # only the ORDERING of the presets is literature-grounded (PRD 1.2)
-    t = SALT_TAU_H_PRESETS
-    assert t["hemihydrate"] < t["gypsum"] < t["anhydrite"]
-    assert t["arcanite"] == t["thenardite"] < t["hemihydrate"]
-
-
-def test_pk_kinetics_drives_salt_channels_and_masks_absent_ones():
+def test_kinetics_does_not_drive_salt_channels():
+    """Salt carriers are solubility-controlled, so kinetics deliberately holds
+    NO rate law for them: their alpha slots stay zero and the engine decides
+    the offer from accessibility instead (PRD 4.2 v3.0). The earlier
+    first-order presets were invented numbers and are gone."""
+    import tinn.kinetics as K
+    assert not hasattr(K, "SALT_TAU_H_PRESETS")
+    assert not hasattr(K, "salt_alpha")
     cfg = TinnConfig.model_validate(_salt_raw())
     kin = make_kinetics(cfg)
-    i = {p: KINETIC_PHASE_IDS.index(p) for p in SALT_PHASE_IDS}
-    a0 = kin.alpha_at(0.0)
-    assert float(a0[i["gypsum"]]) == 0.0
-    a3 = kin.alpha_at(3.0)
-    assert float(a3[i["gypsum"]]) == pytest.approx(1.0 - math.exp(-1.0))
-    assert float(a3[i["arcanite"]]) > 0.99          # tau = 0.1 h
-    # phases with no recipe mass stay at zero (existing masking contract)
-    assert float(a3[i["hemihydrate"]]) == 0.0
-    assert float(a3[i["anhydrite"]]) == 0.0
-    # clinker integration is untouched by the new channels
-    assert 0.0 < float(a3[KINETIC_PHASE_IDS.index("C3S")]) < 1.0
-
-
-def test_salt_tau_override_and_validation():
+    for t in (0.0, 3.0, 24.0, 168.0):
+        a = kin.alpha_at(t)
+        for pid in SALT_PHASE_IDS:
+            assert float(a[KINETIC_PHASE_IDS.index(pid)]) == 0.0, (pid, t)
+    # clinker integration is untouched by the extra channels
+    assert 0.0 < float(kin.alpha_at(24.0)[KINETIC_PHASE_IDS.index("C3S")]) < 1.0
+    # and the config no longer carries a time-constant knob at all
     raw = _salt_raw()
     raw["kinetics"] = dict(raw["kinetics"], salt_tau_h={"gypsum": 8.0})
-    cfg = TinnConfig.model_validate(raw)
-    kin = make_kinetics(cfg)
-    assert kin.salt_tau_h["gypsum"] == 8.0
-    assert kin.salt_tau_h["arcanite"] == SALT_TAU_H_PRESETS["arcanite"]
-    a = kin.alpha_at(8.0)[KINETIC_PHASE_IDS.index("gypsum")]
-    assert float(a) == pytest.approx(1.0 - math.exp(-1.0))
-    for bad in ({"C3S": 2.0}, {"gypsum": 0.0}, {"gypsum": -1.0}):
-        rawb = _salt_raw()
-        rawb["kinetics"] = dict(rawb["kinetics"], salt_tau_h=bad)
-        with pytest.raises(Exception):
-            TinnConfig.model_validate(rawb)
-    # tabulated runs state alpha(t) directly, so the knob does not apply
-    rawt = _salt_raw()
-    rawt["kinetics"] = {"kind": "tabulated", "salt_tau_h": {"gypsum": 3.0},
-                        "table": {"times_h": [0.0, 4.0],
-                                  "alpha": {"C3S": [0.0, 0.1]}}}
-    with pytest.raises(Exception, match="only applies to pk"):
-        TinnConfig.model_validate(rawt)
+    with pytest.raises(Exception):
+        TinnConfig.model_validate(raw)
+
+
+def test_tabulated_schedule_for_a_carrier_is_refused():
+    """A tabulated alpha for a carrier would be silently ignored, so it is
+    refused instead of accepted and dropped (no silent fallback)."""
+    raw = _salt_raw()
+    raw["kinetics"] = {"kind": "tabulated",
+                       "table": {"times_h": [0.0, 4.0],
+                                 "alpha": {"C3S": [0.0, 0.05],
+                                           "C2S": [0.0, 0.0], "C3A": [0.0, 0.0],
+                                           "C4AF": [0.0, 0.0],
+                                           "gypsum": [0.0, 1.0]}}}
+    raw["schedule"] = {"output_times_h": [4.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.01}
+    with pytest.raises(Exception, match="no rate law"):
+        TinnConfig.model_validate(raw)
+    # without the carrier column the same config validates (carriers need no
+    # schedule at all, so their absence is not "missing")
+    raw["kinetics"]["table"]["alpha"].pop("gypsum")
+    raw["chemistry"] = {"backend": "gems3k",
+                        "gems_worker_python": str(GEMS_PYTHON)}
+    TinnConfig.model_validate(raw)
+
+
+def test_offer_is_everything_water_can_reach():
+    """The engine offers the equilibrium exactly the water-accessible carrier
+    mol — no more (sealed grains stay put) and no less (no invented rate)."""
+    from tinn import dissolution
+    cfg = TinnConfig.model_validate(_salt_raw())
+    eng = Engine(cfg, reaction_backend=_NullBackend())
+    st = eng.initial_state()
+    acc = dissolution.accessible_mol(st, REG, SALT_PHASE_IDS)
+    for pid in ("gypsum", "arcanite", "thenardite"):
+        k = KINETIC_PHASE_IDS.index(pid)
+        assert acc[k] > 0.0
+        assert acc[k] <= st.phase_mol[k] * (1.0 + 1e-12)
+    # seal every carrier voxel away from water and the offer drops to zero
+    dry = eng.initial_state()
+    dry.capillary_liquid[:] = 0.0
+    dry.capillary_gas[:] = 0.0
+    dry.hydrate_fraction[:] = 0.0
+    assert not np.any(dissolution.accessible_mol(dry, REG, SALT_PHASE_IDS))
 
 
 # ---------------- geometry / config ----------------
@@ -200,14 +215,13 @@ def test_material_psd_and_shape_accept_salt_keys():
 def test_stoichiometric_backend_refuses_salt_recipes():
     raw = _salt_raw()
     raw["chemistry"] = {"backend": "stoichiometric"}
+    # carriers take no schedule (solubility-controlled), so the table only
+    # covers the clinker phases — what must fail is the BACKEND choice
     raw["kinetics"] = {"kind": "tabulated",
                        "table": {"times_h": [0.0, 4.0],
                                  "alpha": {"C3S": [0.0, 0.05],
                                            "C2S": [0.0, 0.0], "C3A": [0.0, 0.0],
-                                           "C4AF": [0.0, 0.0],
-                                           "gypsum": [0.0, 1.0],
-                                           "arcanite": [0.0, 1.0],
-                                           "thenardite": [0.0, 1.0]}}}
+                                           "C4AF": [0.0, 0.0]}}}
     raw["schedule"] = {"output_times_h": [4.0], "dt_initial_h": 2.0,
                        "dt_min_h": 0.01}
     with pytest.raises(Exception, match="gems3k"):
@@ -244,13 +258,6 @@ def test_salt_free_config_hash_unchanged():
         assert payload["kinetics"].get("salt_tau_h") is None
         assert not (set(payload["binder"]["mass_fractions"]) & set(SALT_PHASE_IDS))
         assert cfg.config_hash() == expect, name
-    # and a config that DOES set salt_tau_h hashes differently from one that
-    # leaves it on the presets (the knob is physics, so it must be in the hash)
-    raw = _salt_raw()
-    base = TinnConfig.model_validate(raw).config_hash()
-    raw2 = _salt_raw()
-    raw2["kinetics"] = dict(raw2["kinetics"], salt_tau_h={"gypsum": 3.0})
-    assert TinnConfig.model_validate(raw2).config_hash() != base
 
 
 # ---------------- diagnostics ----------------
@@ -331,12 +338,13 @@ def test_pre_e3_checkpoint_refused_with_named_channels(tmp_path):
 
 # ---------------- review-gate regressions (E3 adversarial review) ----------------
 
-def test_short_tau_carrier_is_not_capped_by_t0_geometry():
-    """E3 review finding: with tau << dt the carrier's alpha saturates in step
-    one, so under the per-interval demand rule the t=0 wetted-face geometry
-    became a PERMANENT cap — grains that started dry were booked unmet and
-    never asked for again (10 % of the arcanite dose stranded at w/c 0.25).
-    Salt channels must track the CUMULATIVE target instead."""
+def test_dense_packing_carrier_is_not_capped_by_t0_geometry():
+    """E3 review finding: with a fitted time constant the t=0 wetted-face
+    geometry became a PERMANENT cap on the carrier dose — grains that started
+    dry were booked unmet and, with delta_alpha ~ 0 afterwards, never asked
+    for again (10 % of the arcanite reservoir stranded at w/c 0.25). Under
+    solubility control the offer is recomputed from CURRENT accessibility
+    every step, so newly wetted grains are picked up."""
     from tinn.registry import KINETIC_PHASE_IDS as KID
     raw = _salt_raw()
     raw["w_c"] = 0.25                       # dense packing: carriers start dry
@@ -348,50 +356,43 @@ def test_short_tau_carrier_is_not_capped_by_t0_geometry():
     i_arc = KID.index("arcanite")
     reservoir = float(st.initial_phase_mol[i_arc])
     assert reservoir > 0.0
-    # step 1 alone cannot reach every grain (that is the premise)
     t = st
     for _ in range(3):
         t2, rej, _ = eng.try_step(t, 1.0)
         assert rej is None, rej
         t = t2
     left = float(t.phase_mol[i_arc])
-    # the cumulative rule keeps asking, so the stranded fraction shrinks to
-    # nothing instead of freezing at its step-1 value
     assert left <= 1e-3 * reservoir, (left, reservoir, left / reservoir)
+    # nothing was written off as unmet either: an unreachable grain is still
+    # THERE, not lost, so unmet must stay at dust level for the carriers
+    for pid in SALT_PHASE_IDS:
+        k = KID.index(pid)
+        assert float(t.unmet_mol[k]) <= 1e-12 * max(
+            1.0, float(t.initial_phase_mol[k])), pid
 
 
-def test_salt_demand_is_cumulative_clinker_demand_is_not():
-    """The cumulative rule is scoped to the salt channels: a clinker shortfall
-    must still be recorded as unmet and never re-demanded (PRD 4.2)."""
+def test_salt_offer_tracks_current_accessibility_not_a_schedule():
+    """The carrier offer must follow the CURRENT geometry: wetting more of the
+    RVE raises it, and it never exceeds what is left in the reservoir."""
+    from tinn import dissolution
     from tinn.registry import KINETIC_PHASE_IDS as KID
-    raw = _salt_raw()
-    raw["schedule"] = {"output_times_h": [2.0], "dt_initial_h": 1.0,
-                       "dt_min_h": 0.01}
-    cfg = TinnConfig.model_validate(raw)
-    eng = Engine(cfg)
+    cfg = TinnConfig.model_validate(_salt_raw())
+    eng = Engine(cfg, reaction_backend=_NullBackend())
     st = eng.initial_state()
-    # pretend a previous step under-delivered both a clinker phase and a salt
-    i_c3s, i_gyp = KID.index("C3S"), KID.index("gypsum")
-    st.phase_mol = st.phase_mol.copy()
-    alpha1 = eng.kinetics.alpha_at(1.0)
-    dn = np.clip(st.initial_phase_mol * alpha1, 0.0, st.phase_mol)
-    # nothing dissolved yet, so the cumulative target IS the whole alpha(t)
-    d_alpha = alpha1 - eng.kinetics.alpha_at(0.0)
-    per_interval = np.clip(st.initial_phase_mol * d_alpha, 0.0, st.phase_mol)
-    assert dn[i_gyp] == pytest.approx(per_interval[i_gyp])   # equal at t=0
-    # now strand half the gypsum and half the C3S demand, then re-ask
-    st.phase_mol[i_gyp] -= 0.25 * st.initial_phase_mol[i_gyp]
-    st.phase_mol[i_c3s] -= 0.25 * st.initial_phase_mol[i_c3s]
-    st.time_h = 1.0
-    a2 = eng.kinetics.alpha_at(2.0)
-    d2 = a2 - eng.kinetics.alpha_at(1.0)
-    salt_cum = (st.initial_phase_mol[i_gyp] * a2[i_gyp]
-                - (st.initial_phase_mol[i_gyp] - st.phase_mol[i_gyp]))
-    salt_per_interval = st.initial_phase_mol[i_gyp] * d2[i_gyp]
-    # the salt asks for the accumulated shortfall, the clinker does not
-    assert salt_cum > salt_per_interval
-    clinker_per_interval = st.initial_phase_mol[i_c3s] * d2[i_c3s]
-    assert clinker_per_interval < st.initial_phase_mol[i_c3s] * a2[i_c3s]
+    k = KID.index("gypsum")
+    base = dissolution.accessible_mol(st, REG, SALT_PHASE_IDS)[k]
+    dry = st.clone()
+    dry.capillary_liquid[:] = 0.0
+    dry.capillary_gas[:] = 1.0 - (dry.anhydrous_fraction.sum(axis=0)
+                                  + dry.hydrate_fraction.sum(axis=0))
+    assert dissolution.accessible_mol(dry, REG, SALT_PHASE_IDS)[k] == 0.0
+    assert base > 0.0
+    # after some carrier has dissolved, the offer is bounded by the remainder
+    part = st.clone()
+    part.phase_mol = part.phase_mol.copy()
+    part.phase_mol[k] *= 0.1
+    part.anhydrous_fraction[SOLID_PHASE_IDS.index("gypsum")] *= 0.1
+    assert dissolution.accessible_mol(part, REG, SALT_PHASE_IDS)[k] <=         part.phase_mol[k] * (1.0 + 1e-12)
 
 
 def test_phase_volume_fractions_keeps_carrier_and_hydrate_separate():

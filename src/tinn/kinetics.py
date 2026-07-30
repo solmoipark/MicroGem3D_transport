@@ -80,30 +80,11 @@ def scm_effective_params(phase_mass_fractions: Dict[str, float]
     return effective
 
 
-# Soluble-salt dissolution (PRD 4.2 v3.0/E3): first-order release
-# alpha(t) = 1 - exp(-t/tau). The physical control is SOLUBILITY, not a rate
-# law — but the GEMS equilibrium re-precipitates an oversaturated solution
-# (these phases are never suppressed), so the system converges to solubility
-# control and tau only sets how fast the reservoir is offered. Only the
-# ORDERING of these defaults is literature-grounded (hemihydrate dissolves
-# within minutes; interground gypsum is consumed over the first hours;
-# anhydrite lags by a day; water-soluble alkali sulfates are gone almost
-# immediately). Override per phase with kinetics.salt_tau_h when a measured
-# sulfate-depletion time is available.
-SALT_TAU_H_PRESETS: Dict[str, float] = {
-    "gypsum": 3.0,
-    "hemihydrate": 0.25,
-    "anhydrite": 24.0,
-    "arcanite": 0.1,
-    "thenardite": 0.1,
-}
-
-
-def salt_alpha(t_h: float, tau_h: float) -> float:
-    """First-order dissolved fraction of a soluble salt carrier."""
-    if t_h <= 0.0:
-        return 0.0
-    return 1.0 - math.exp(-t_h / tau_h)
+# Soluble salt carriers (E3) deliberately have NO rate law here: they are
+# solubility-controlled, so the engine offers the equilibrium whatever the
+# water can reach and GEMS decides what stays solid (PRD 4.2 v3.0). Their
+# alpha slots stay zero — a fitted time constant would be an invented
+# number, and the earlier first-order presets were exactly that.
 
 
 def scm_alpha(t_days: float, params: Tuple[float, float, float, float, float]) -> float:
@@ -197,8 +178,7 @@ class ParrotKilloh:
     def __init__(self, preset_name: str, w_c: float, temperature_k: float,
                  blaine_m2_kg: float, phase_mass_fractions: Dict[str, float],
                  relative_humidity: float = 1.0,
-                 alpha_seed: float = 1e-8, max_substep_days: float = 0.01,
-                 salt_tau_h: Optional[Dict[str, float]] = None):
+                 alpha_seed: float = 1e-8, max_substep_days: float = 0.01):
         if preset_name not in PK_PRESETS:
             raise ValueError(
                 f"unknown P&K preset {preset_name!r}; choose one of {sorted(PK_PRESETS)}")
@@ -226,21 +206,6 @@ class ParrotKilloh:
         effective = scm_effective_params(phase_mass_fractions)
         self._scm_params = [effective[pid] for pid in SCM_PHASE_IDS]
         self.scm_effective_d = {pid: effective[pid][3] for pid in SCM_PHASE_IDS}
-        # soluble salt carriers (E3): first-order tau per phase, preset unless
-        # the config supplies a measured value
-        taus = dict(SALT_TAU_H_PRESETS)
-        for pid, tau in (salt_tau_h or {}).items():
-            if pid not in SALT_TAU_H_PRESETS:
-                raise ValueError(
-                    f"salt_tau_h names {pid!r}, which is not a salt carrier "
-                    f"phase {SALT_PHASE_IDS}")
-            if not math.isfinite(tau) or tau <= 0.0:
-                raise ValueError(f"salt_tau_h[{pid}] must be finite and > 0, "
-                                 f"got {tau}")
-            taus[pid] = tau
-        self.salt_tau_h = {pid: taus[pid] for pid in SALT_PHASE_IDS}
-        self._salt_taus = np.array([taus[pid] for pid in SALT_PHASE_IDS])
-        self._n_scm = len(SCM_PHASE_IDS)
         # fixed-grid prefix memo for alpha_at: {n_full: (clinker_state, t)}
         self._prefix_cache: Dict[int, tuple] = {}
 
@@ -355,10 +320,6 @@ class ParrotKilloh:
         # SCM schedules are closed-form logistic curves (PRD v2.1)
         for j, params in enumerate(self._scm_params):
             alpha[self._n_clinker + j] = scm_alpha(t_days, params)
-        # soluble salt carriers: closed-form first order (PRD 4.2 v3.0/E3)
-        base = self._n_clinker + self._n_scm
-        for j, tau in enumerate(self._salt_taus):
-            alpha[base + j] = salt_alpha(t_h, float(tau))
         # phases with no mass in the recipe have no meaningful alpha target
         return np.where(self._weights > 0.0, alpha, 0.0)
 
@@ -375,5 +336,4 @@ def make_kinetics(config: TinnConfig) -> KineticsModel:
         phase_mass_fractions=config.binder.mass_fractions,
         alpha_seed=kin.pk_alpha_seed,
         max_substep_days=kin.pk_max_substep_days,
-        salt_tau_h=kin.salt_tau_h,
     )

@@ -132,27 +132,23 @@ class Engine:
         # (PRD §4.2). A shortfall stays recorded as cumulative unmet — it is
         # never re-demanded, so per-step demand always shrinks with dt and a
         # transient blockage cannot balloon into an unplaceable catch-up burst.
-        alpha_next = self.kinetics.alpha_at(trial.time_h + dt_h)
-        d_alpha = alpha_next - self.kinetics.alpha_at(trial.time_h)
+        d_alpha = (self.kinetics.alpha_at(trial.time_h + dt_h)
+                   - self.kinetics.alpha_at(trial.time_h))
         dn = np.clip(trial.initial_phase_mol * d_alpha, 0.0, trial.phase_mol)
-        # E3 exception, soluble salt carriers (PRD 4.2 v3.0): their release is
-        # solubility- not rate-controlled, and tau is short enough that alpha
-        # saturates within one or two steps. Under the per-interval rule the
-        # t=0 wetted-face geometry would become a PERMANENT cap: grains that
-        # start dry are booked unmet and, with delta_alpha ~ 0 forever after,
-        # are never asked for again — silently truncating the alkali dose that
-        # sets pore-solution pH (measured: 10 % of the arcanite reservoir
-        # stranded at w/c 0.25; E3 review finding). These channels therefore
-        # track the CUMULATIVE target: whatever the schedule says should be
-        # dissolved by now, minus what already is. The catch-up burst the
-        # per-interval rule guards against cannot occur here because the
-        # demand is bounded by the reservoir that is left.
+        # Soluble salt carriers are SOLUBILITY-controlled, not rate-controlled
+        # (PRD 4.2 v3.0/E3): gypsum keeps dissolving while the solution is
+        # undersaturated and stops when it is not, and the alkali sulfates are
+        # readily soluble. There is no rate law to write down, so the engine
+        # does not invent one — it offers the equilibrium everything the water
+        # can currently reach and lets GEMS decide what stays solid. Anything
+        # the equilibrium keeps comes back as its own solid phase (these
+        # phases are never suppressed), so the carriers are governed by their
+        # solubility product rather than by a fitted time constant.
         if self._salt_channels.size:
             s = self._salt_channels
-            dissolved = trial.initial_phase_mol[s] - trial.phase_mol[s]
-            dn[s] = np.clip(
-                trial.initial_phase_mol[s] * alpha_next[s] - dissolved,
-                0.0, trial.phase_mol[s])
+            dn[s] = np.minimum(
+                dissolution.accessible_mol(trial, reg, SALT_PHASE_IDS)[s],
+                trial.phase_mol[s])
 
         prev_liquid = trial.capillary_liquid.copy()
         labels, n_clusters = transport.label_clusters(prev_liquid)

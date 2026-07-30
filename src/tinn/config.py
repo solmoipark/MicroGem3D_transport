@@ -226,23 +226,9 @@ class KineticsConfig(BaseModel):
     # >= 1e-15 keeps 1 - seed representable so the Jander denominator stays finite
     pk_alpha_seed: float = Field(default=1e-8, ge=1e-15, lt=1.0)
     pk_max_substep_days: float = Field(default=0.01, gt=0.0)
-    # measured first-order dissolution time constants of the soluble salt
-    # carriers (PRD 1.2/4.2 v3.0/E3), overriding kinetics.SALT_TAU_H_PRESETS
-    # per phase; pk kinetics only (a table states alpha(t) directly)
-    salt_tau_h: Optional[Dict[str, float]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "KineticsConfig":
-        if self.salt_tau_h is not None:
-            unknown = set(self.salt_tau_h) - set(SALT_PHASE_IDS)
-            if unknown:
-                raise ValueError(
-                    f"salt_tau_h names non-carrier phases {sorted(unknown)}; "
-                    f"allowed: {SALT_PHASE_IDS}")
-            for pid, tau in self.salt_tau_h.items():
-                if not (tau > 0.0) or not math.isfinite(tau):
-                    raise ValueError(
-                        f"salt_tau_h[{pid}] must be finite and > 0, got {tau}")
         if self.kind == "pk":
             if self.preset not in PK_PRESETS:
                 raise ValueError(f"pk kinetics requires preset in {PK_PRESETS}, got {self.preset!r}")
@@ -257,10 +243,6 @@ class KineticsConfig(BaseModel):
                 raise ValueError("tabulated kinetics does not take a preset")
             if self.blaine_m2_kg is not None:
                 raise ValueError("blaine_m2_kg only applies to pk kinetics")
-            if self.salt_tau_h is not None:
-                raise ValueError(
-                    "salt_tau_h only applies to pk kinetics - a tabulated run "
-                    "states the salt alpha(t) columns in its own table")
         return self
 
 
@@ -502,7 +484,18 @@ class TinnConfig(BaseModel):
                         f"rasterizable maximum {d_max_allowed_um:.3f} um")
         active = {p for p, f in self.binder.mass_fractions.items() if f > 0.0}
         if self.kinetics.kind == "tabulated":
-            missing = active - set(self.kinetics.table.alpha)
+            # salt carriers are solubility-controlled: the engine offers the
+            # equilibrium whatever water reaches and GEMS decides (PRD 4.2
+            # v3.0/E3). A tabulated alpha for them would be silently ignored,
+            # so it is refused rather than accepted and dropped.
+            scheduled_salts = set(self.kinetics.table.alpha) & set(SALT_PHASE_IDS)
+            if scheduled_salts:
+                raise ValueError(
+                    f"tabulated kinetics carries alpha series for the soluble "
+                    f"salt carriers {sorted(scheduled_salts)}, which have no "
+                    f"rate law - their dissolution is decided by the GEMS "
+                    f"equilibrium, so the schedule would be ignored")
+            missing = (active - set(self.kinetics.table.alpha)) - set(SALT_PHASE_IDS)
             if missing:
                 raise ValueError(
                     f"tabulated kinetics has no alpha series for binder phases "
@@ -545,10 +538,6 @@ class TinnConfig(BaseModel):
         # same contract for material_shape (rev.2)
         if payload.get("material_shape") is None:
             payload.pop("material_shape", None)
-        # and for the E3 salt time constants: a salt-free config (or one on the
-        # presets) keeps its pre-E3 hash
-        if payload.get("kinetics", {}).get("salt_tau_h") is None:
-            payload.get("kinetics", {}).pop("salt_tau_h", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
         # TRUNCATED bins plus the original measured input — physics-faithful
