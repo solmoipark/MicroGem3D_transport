@@ -19,7 +19,8 @@ from .config import TinnConfig
 from .geometry import initialize_rve
 from .kinetics import KineticsModel, make_kinetics
 from .registry import (ELEMENT_IDS, HYDRATE_PHASE_IDS, KINETIC_PHASE_IDS,
-                       Registry, SOLID_PHASE_IDS, default_registry)
+                       Registry, SALT_PHASE_IDS, SOLID_PHASE_IDS,
+                       default_registry)
 from .state import SimulationState, code_version
 
 REJECT_BACKEND_FAILURE = "backend_failure"
@@ -101,6 +102,10 @@ class Engine:
         # single implementation of the gel-porosity policy lives in analysis
         self._gel_eps = analysis.gel_porosity_vector(config, self.hydrate_ids,
                                                      self.registry)
+        # E3: kinetic-vector positions of the soluble salt carriers, whose
+        # demand rule differs (cumulative, see try_step)
+        self._salt_channels = np.array(
+            [KINETIC_PHASE_IDS.index(p) for p in SALT_PHASE_IDS], dtype=np.intp)
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -127,9 +132,27 @@ class Engine:
         # (PRD §4.2). A shortfall stays recorded as cumulative unmet — it is
         # never re-demanded, so per-step demand always shrinks with dt and a
         # transient blockage cannot balloon into an unplaceable catch-up burst.
-        d_alpha = (self.kinetics.alpha_at(trial.time_h + dt_h)
-                   - self.kinetics.alpha_at(trial.time_h))
+        alpha_next = self.kinetics.alpha_at(trial.time_h + dt_h)
+        d_alpha = alpha_next - self.kinetics.alpha_at(trial.time_h)
         dn = np.clip(trial.initial_phase_mol * d_alpha, 0.0, trial.phase_mol)
+        # E3 exception, soluble salt carriers (PRD 4.2 v3.0): their release is
+        # solubility- not rate-controlled, and tau is short enough that alpha
+        # saturates within one or two steps. Under the per-interval rule the
+        # t=0 wetted-face geometry would become a PERMANENT cap: grains that
+        # start dry are booked unmet and, with delta_alpha ~ 0 forever after,
+        # are never asked for again — silently truncating the alkali dose that
+        # sets pore-solution pH (measured: 10 % of the arcanite reservoir
+        # stranded at w/c 0.25; E3 review finding). These channels therefore
+        # track the CUMULATIVE target: whatever the schedule says should be
+        # dissolved by now, minus what already is. The catch-up burst the
+        # per-interval rule guards against cannot occur here because the
+        # demand is bounded by the reservoir that is left.
+        if self._salt_channels.size:
+            s = self._salt_channels
+            dissolved = trial.initial_phase_mol[s] - trial.phase_mol[s]
+            dn[s] = np.clip(
+                trial.initial_phase_mol[s] * alpha_next[s] - dissolved,
+                0.0, trial.phase_mol[s])
 
         prev_liquid = trial.capillary_liquid.copy()
         labels, n_clusters = transport.label_clusters(prev_liquid)

@@ -21,7 +21,8 @@ import numpy as np
 from . import ledger
 from .config import TinnConfig
 from .registry import (CLINKER_PHASE_IDS, ELEMENT_IDS, KINETIC_PHASE_IDS,
-                       Registry, SCM_PHASE_IDS, default_registry)
+                       Registry, SALT_PHASE_IDS, SCM_PHASE_IDS,
+                       default_registry)
 from .state import SimulationState
 from .storage import load_checkpoint
 from .transport import LIQ_EPS
@@ -51,9 +52,16 @@ def state_row(state: SimulationState, registry: Registry,
     cap_por = float((state.capillary_liquid + state.capillary_gas).mean())
     gel_por_vol = float((state.hydrate_env_vol_vox * gel_eps).sum())
     n_vox = state.capillary_liquid.size
+    # chemical shrinkage is reported per gram of REACTED BINDER. A salt
+    # carrier merely dissolves — it is not a hydration reaction — and E3 made
+    # it a kinetic phase, so leaving it in this denominator would dilute the
+    # ratio by the carrier dose (measured: 22 % of "reacted" mass at 12 h,
+    # enough to flip the PRD 6.3 verdict). Carriers are excluded; the gas
+    # volume in the numerator still counts everything (E3 review finding).
     reacted_mass_g = float(np.sum(
-        (state.initial_phase_mol - state.phase_mol)
-        * np.array([registry.get(p).molar_mass_g_mol for p in KINETIC_PHASE_IDS])))
+        [(state.initial_phase_mol[i] - state.phase_mol[i])
+         * registry.get(p).molar_mass_g_mol
+         for i, p in enumerate(KINETIC_PHASE_IDS) if p not in SALT_PHASE_IDS]))
     gas_cm3 = float(state.capillary_gas.sum()) * state.vox_cm3
     return {
         "time_h": state.time_h,
@@ -117,31 +125,71 @@ def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
     return out
 
 
-def binder_oxide_diagnostics(config: TinnConfig,
-                             registry: Optional[Registry] = None) -> Dict[str, float]:
-    """E3 diagnostic: the SO3 and alkali content the recipe actually carries,
-    in the oxide wt% the cement literature reports (per 100 g of binder as
-    batched, i.e. including the unassigned inert residual). Derived from the
-    registry formulas of every phase with mass — nothing declared separately,
-    so it cannot drift from the chemistry. Na2O-equivalent uses the standard
-    0.658 = M(Na2O)/M(K2O) factor. Diagnostics only (mol ledgers are the
-    authority); enables direct comparison with a mill certificate."""
-    reg = registry or default_registry()
-    m = {"SO3": 80.06, "Na2O": 61.979, "K2O": 94.196}
+_OXIDE_M = {"SO3": 80.06, "Na2O": 61.979, "K2O": 94.196}
+
+
+def _oxides_from_mass(mass_g: Dict[str, float], registry: Registry,
+                      basis_g: float) -> Dict[str, float]:
     out = {"so3_pct": 0.0, "na2o_pct": 0.0, "k2o_pct": 0.0}
-    for pid, frac in config.binder.mass_fractions.items():
-        if frac <= 0.0:
+    if basis_g <= 0.0:
+        out["na2o_eq_pct"] = 0.0
+        return out
+    for pid, grams in mass_g.items():
+        if grams <= 0.0:
             continue
-        entry = reg.get(pid)
+        entry = registry.get(pid)
         mm = entry.molar_mass_g_mol
         if not mm:
             continue
-        mol_per_g = frac / mm            # mol of formula unit per g of binder
+        mol_per_g = grams / mm / basis_g   # mol of formula unit per g of binder
         f = entry.formula or {}
-        out["so3_pct"] += mol_per_g * f.get("S", 0.0) * m["SO3"] * 100.0
-        out["na2o_pct"] += mol_per_g * f.get("Na", 0.0) / 2.0 * m["Na2O"] * 100.0
-        out["k2o_pct"] += mol_per_g * f.get("K", 0.0) / 2.0 * m["K2O"] * 100.0
+        out["so3_pct"] += mol_per_g * f.get("S", 0.0) * _OXIDE_M["SO3"] * 100.0
+        out["na2o_pct"] += (mol_per_g * f.get("Na", 0.0) / 2.0
+                            * _OXIDE_M["Na2O"] * 100.0)
+        out["k2o_pct"] += (mol_per_g * f.get("K", 0.0) / 2.0
+                           * _OXIDE_M["K2O"] * 100.0)
     out["na2o_eq_pct"] = out["na2o_pct"] + 0.658 * out["k2o_pct"]
+    return out
+
+
+def binder_oxide_diagnostics(config: TinnConfig,
+                             registry: Optional[Registry] = None,
+                             state: Optional[SimulationState] = None
+                             ) -> Dict[str, float]:
+    """E3 diagnostic: SO3 and alkali content in the oxide wt% a mill
+    certificate reports (per 100 g of binder as batched, inert residual
+    included). Derived from the registry formulas of every phase with mass.
+    Na2O-equivalent uses the standard 0.658 = M(Na2O)/M(K2O).
+
+    With `state`, the AS-BUILT values are added under `*_as_built`: the same
+    oxides recomputed from `initial_phase_mol`, i.e. what the rasterized RVE
+    actually holds. These differ from the recipe because the particle sampler
+    hits a small population's volume target only approximately (a 0.6 wt%
+    carrier at 32^3 is ~90 voxels, where one particle is the whole
+    population), and it is the AS-BUILT dose that drives the simulated
+    chemistry (E3 review finding). A large gap means the carrier needs a finer
+    material_psd or a larger grid — never a silent correction here."""
+    reg = registry or default_registry()
+    out = _oxides_from_mass(
+        dict(config.binder.mass_fractions), reg, basis_g=1.0)
+    if state is None:
+        return out
+    mass = {}
+    total = 0.0
+    for i, pid in enumerate(KINETIC_PHASE_IDS):
+        mm = reg.get(pid).molar_mass_g_mol
+        if not mm:
+            continue
+        grams = float(state.initial_phase_mol[i]) * mm
+        mass[pid] = grams
+        total += grams
+    # the inert residual carries no oxides but IS part of the batched basis
+    frac = config.binder.mass_fractions
+    assigned = sum(frac.values())
+    if assigned > 0.0:
+        total += total * (config.binder.unassigned / assigned)
+    for k, v in _oxides_from_mass(mass, reg, basis_g=total).items():
+        out[f"{k}_as_built"] = v
     return out
 
 
@@ -227,7 +275,14 @@ def casi_map_rgb(state: SimulationState, lo: float = 0.8, hi: float = 2.2
 
 
 def phase_volume_fractions(state: SimulationState) -> Dict[str, float]:
-    """Volume fraction of the RVE per solid channel (anhydrous and hydrates)."""
+    """Volume fraction of the RVE per solid channel (anhydrous and hydrates).
+
+    The two channel sets live in different namespaces and E3 made them
+    collide: a bundle declares equilibrium phases named `hemihydrate`,
+    `arcanite`, `thenardite` — exactly the ids of the undissolved carriers.
+    The re-precipitated hydrate used to overwrite the anhydrous entry (a
+    ~100x under-report of the carrier still sitting in the RVE), so a
+    colliding hydrate is suffixed instead (E3 review finding)."""
     n_vox = state.capillary_liquid.size
     out: Dict[str, float] = {}
     from .registry import SOLID_PHASE_IDS
@@ -238,7 +293,8 @@ def phase_volume_fractions(state: SimulationState) -> Dict[str, float]:
     for i, h in enumerate(state.hydrate_ids):
         v = float(state.hydrate_fraction[i].sum()) / n_vox
         if v > 0.0:
-            out[h] = v
+            key = f"{h} (hydrate)" if h in SOLID_PHASE_IDS else h
+            out[key] = v
     return out
 
 
@@ -614,7 +670,11 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
         # so for blends the check reports "info" instead of judging (rev.2)
         last_a = rows[-1]["alpha"]
         mf = config.binder.mass_fractions
-        reacted = {p: mf.get(p, 0.0) * last_a.get(p, 0.0) for p in mf}
+        # salt carriers are excluded here for the same reason as in the
+        # shrinkage denominator: dissolving them is not binder reaction, and
+        # counting them would shrink the SCM share below the blend threshold
+        reacted = {p: mf.get(p, 0.0) * last_a.get(p, 0.0) for p in mf
+                   if p not in SALT_PHASE_IDS}
         tot_reacted = sum(reacted.values())
         scm_share = (sum(v for p, v in reacted.items() if p in SCM_PHASE_IDS)
                      / tot_reacted if tot_reacted > 0 else 0.0)
@@ -660,6 +720,7 @@ def sanity_band(rows: List[dict], config: TinnConfig) -> dict:
 _COL_ANHYDROUS = np.array([90, 90, 90], dtype=np.float64)    # clinker: gray
 _COL_SCM = np.array([30, 110, 130], dtype=np.float64)        # reactive SCM: teal
 _COL_INERT = np.array([70, 150, 70], dtype=np.float64)       # unassigned filler: green
+_COL_SALT = np.array([200, 190, 80], dtype=np.float64)       # salt carriers: ochre
 _COL_HYDRATE = np.array([215, 150, 60], dtype=np.float64)    # hydrates: orange
 _COL_LIQUID = np.array([40, 90, 220], dtype=np.float64)      # capillary water: blue
 _COL_GAS = np.array([235, 235, 235], dtype=np.float64)       # shrinkage gas: near-white
@@ -682,22 +743,29 @@ def write_png(path: str, rgb: np.ndarray) -> None:
 
 
 def central_slice_rgb(state: SimulationState) -> np.ndarray:
-    """Central z-slice as an RGB8 image: clinker gray, unassigned inert filler
-    green, hydrates orange, liquid blue, gas near-white (convex combination)."""
+    """Central z-slice as an RGB8 image: clinker gray, reactive SCM teal,
+    undissolved salt carriers ochre, unassigned inert filler green, hydrates
+    orange, liquid blue, gas near-white (convex combination). The carriers get
+    their own colour because lumping them with inert filler rendered a 2.6 %
+    gypsum population as unreactive filler (E3 review finding)."""
     from .registry import CLINKER_PHASE_IDS as _CLK
     from .registry import SCM_PHASE_IDS as _SCM
     from .registry import SOLID_PHASE_IDS
     z = state.grid_size // 2
     clk = [SOLID_PHASE_IDS.index(p) for p in _CLK]
     scm = [SOLID_PHASE_IDS.index(p) for p in _SCM]
-    other = [i for i in range(len(SOLID_PHASE_IDS)) if i not in clk + scm]
+    salt = [SOLID_PHASE_IDS.index(p) for p in SALT_PHASE_IDS]
+    other = [i for i in range(len(SOLID_PHASE_IDS))
+             if i not in clk + scm + salt]
     anh = state.anhydrous_fraction[clk, z].sum(axis=0)
     scm_f = state.anhydrous_fraction[scm, z].sum(axis=0)
+    salt_f = state.anhydrous_fraction[salt, z].sum(axis=0)
     inert = state.anhydrous_fraction[other, z].sum(axis=0)
     hyd = state.hydrate_fraction[:, z].sum(axis=0)
     liq = state.capillary_liquid[z]
     gas = state.capillary_gas[z]
     img = (anh[..., None] * _COL_ANHYDROUS + scm_f[..., None] * _COL_SCM
+           + salt_f[..., None] * _COL_SALT
            + inert[..., None] * _COL_INERT + hyd[..., None] * _COL_HYDRATE
            + liq[..., None] * _COL_LIQUID + gas[..., None] * _COL_GAS)
     return np.clip(np.rint(img), 0, 255).astype(np.uint8)
@@ -746,10 +814,13 @@ def report(run_dir: str, out_dir: Optional[str] = None,
     rows: List[dict] = []
     config = None
     backend_id = None
+    first_state = None
     for ck in ckpts:
         state = load_checkpoint(str(ck), reg)
         config = state.config
         backend_id = state.backend_id
+        if first_state is None:
+            first_state = state   # initial_phase_mol is constant across a run
         gel_eps = gel_porosity_vector(config, state.hydrate_ids, reg)
         row = state_row(state, reg, gel_eps)
         check = ledger.check_all(state, reg)
@@ -791,8 +862,10 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         "run_dir": str(run),
         "config_hash": config.config_hash(),
         "backend": backend_id,
-        # E3: what SO3/alkali the recipe carries (mill-certificate units)
-        "binder_oxides": binder_oxide_diagnostics(config, reg),
+        # E3: what SO3/alkali the recipe carries AND what the rasterized RVE
+        # actually holds (mill-certificate units; the *_as_built keys expose
+        # the small-population sampling gap instead of hiding it)
+        "binder_oxides": binder_oxide_diagnostics(config, reg, first_state),
         "outputs": rows,
         "sanity_band": sanity_band(rows, config),
         "notes": notes,

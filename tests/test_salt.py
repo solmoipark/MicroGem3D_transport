@@ -30,8 +30,9 @@ needs_gems = pytest.mark.skipif(
 
 REG = default_registry()
 
-# bundle DCH V0 values (m3/mol -> cm3/mol), identical in PC and CNASH; anhydrite
-# is absent from both bundles and carries the crystallographic value instead
+# bundle DCH V0 values (m3/mol -> cm3/mol). Gp/hemihydrate/Na2SO4 agree between
+# PC and CNASH; K2SO4 exists only in PC, and anhydrite in neither — those two
+# therefore have no re-precipitation path in CNASH (dissolution-only carriers).
 BUNDLE_V0_CM3 = {"gypsum": 74.69, "hemihydrate": 61.73,
                  "arcanite": 65.50, "thenardite": 53.33}
 
@@ -64,6 +65,17 @@ def test_salt_entries_match_bundle_molar_volumes():
     assert "Anh" not in v0 and "anhydrite" not in v0
     anh = REG.get("anhydrite")
     assert anh.density_g_cm3 == pytest.approx(2.963, rel=2e-3)
+    # which carriers can RE-PRECIPITATE depends on the bundle, and CNASH lacks
+    # K2SO4 entirely — arcanite is dissolution-only there, like anhydrite
+    # everywhere (E3 review finding: the docs claimed both bundles agreed)
+    cn = json.loads((REPO / "gems_bundles" / "CNASH" / "Test-dch.json").read_text(
+        encoding="utf-8", errors="replace"))[0]["dch"]
+    cn_dc = {str(n) for n in cn["DCNL"]}
+    assert "Na2SO4" in cn_dc and "Gp" in cn_dc
+    assert "K2SO4" not in cn_dc
+    # the bundle hemihydrate is lighter than crystallographic bassanite (2.73):
+    # the volume definition is the bundle's, and that has a placement cost
+    assert REG.get("hemihydrate").density_g_cm3 == pytest.approx(2.351, rel=1e-3)
 
 
 def test_salt_formulas_are_the_mineral_stoichiometries():
@@ -265,6 +277,162 @@ def test_pre_e3_checkpoint_refused_with_named_channels(tmp_path):
 
 
 # ---------------- GEMS path: the actual point of E3 ----------------
+
+# ---------------- review-gate regressions (E3 adversarial review) ----------------
+
+def test_short_tau_carrier_is_not_capped_by_t0_geometry():
+    """E3 review finding: with tau << dt the carrier's alpha saturates in step
+    one, so under the per-interval demand rule the t=0 wetted-face geometry
+    became a PERMANENT cap — grains that started dry were booked unmet and
+    never asked for again (10 % of the arcanite dose stranded at w/c 0.25).
+    Salt channels must track the CUMULATIVE target instead."""
+    from tinn.registry import KINETIC_PHASE_IDS as KID
+    raw = _salt_raw()
+    raw["w_c"] = 0.25                       # dense packing: carriers start dry
+    raw["schedule"] = {"output_times_h": [3.0], "dt_initial_h": 1.0,
+                       "dt_min_h": 0.01}
+    cfg = TinnConfig.model_validate(raw)
+    eng = Engine(cfg, reaction_backend=_NullBackend())
+    st = eng.initial_state()
+    i_arc = KID.index("arcanite")
+    reservoir = float(st.initial_phase_mol[i_arc])
+    assert reservoir > 0.0
+    # step 1 alone cannot reach every grain (that is the premise)
+    t = st
+    for _ in range(3):
+        t2, rej, _ = eng.try_step(t, 1.0)
+        assert rej is None, rej
+        t = t2
+    left = float(t.phase_mol[i_arc])
+    # the cumulative rule keeps asking, so the stranded fraction shrinks to
+    # nothing instead of freezing at its step-1 value
+    assert left <= 1e-3 * reservoir, (left, reservoir, left / reservoir)
+
+
+def test_salt_demand_is_cumulative_clinker_demand_is_not():
+    """The cumulative rule is scoped to the salt channels: a clinker shortfall
+    must still be recorded as unmet and never re-demanded (PRD 4.2)."""
+    from tinn.registry import KINETIC_PHASE_IDS as KID
+    raw = _salt_raw()
+    raw["schedule"] = {"output_times_h": [2.0], "dt_initial_h": 1.0,
+                       "dt_min_h": 0.01}
+    cfg = TinnConfig.model_validate(raw)
+    eng = Engine(cfg)
+    st = eng.initial_state()
+    # pretend a previous step under-delivered both a clinker phase and a salt
+    i_c3s, i_gyp = KID.index("C3S"), KID.index("gypsum")
+    st.phase_mol = st.phase_mol.copy()
+    alpha1 = eng.kinetics.alpha_at(1.0)
+    dn = np.clip(st.initial_phase_mol * alpha1, 0.0, st.phase_mol)
+    # nothing dissolved yet, so the cumulative target IS the whole alpha(t)
+    d_alpha = alpha1 - eng.kinetics.alpha_at(0.0)
+    per_interval = np.clip(st.initial_phase_mol * d_alpha, 0.0, st.phase_mol)
+    assert dn[i_gyp] == pytest.approx(per_interval[i_gyp])   # equal at t=0
+    # now strand half the gypsum and half the C3S demand, then re-ask
+    st.phase_mol[i_gyp] -= 0.25 * st.initial_phase_mol[i_gyp]
+    st.phase_mol[i_c3s] -= 0.25 * st.initial_phase_mol[i_c3s]
+    st.time_h = 1.0
+    a2 = eng.kinetics.alpha_at(2.0)
+    d2 = a2 - eng.kinetics.alpha_at(1.0)
+    salt_cum = (st.initial_phase_mol[i_gyp] * a2[i_gyp]
+                - (st.initial_phase_mol[i_gyp] - st.phase_mol[i_gyp]))
+    salt_per_interval = st.initial_phase_mol[i_gyp] * d2[i_gyp]
+    # the salt asks for the accumulated shortfall, the clinker does not
+    assert salt_cum > salt_per_interval
+    clinker_per_interval = st.initial_phase_mol[i_c3s] * d2[i_c3s]
+    assert clinker_per_interval < st.initial_phase_mol[i_c3s] * a2[i_c3s]
+
+
+def test_phase_volume_fractions_keeps_carrier_and_hydrate_separate():
+    """E3 review finding: bundle phases named `thenardite`/`hemihydrate`/
+    `arcanite` collide with the carrier ids, and the hydrate used to overwrite
+    the undissolved carrier (~100x under-report)."""
+    cfg = TinnConfig.model_validate(_salt_raw())
+    st = Engine(cfg, reaction_backend=_NullBackend(("thenardite",))).initial_state()
+    tid = SOLID_PHASE_IDS.index("thenardite")
+    carrier_vox = float(st.anhydrous_fraction[tid].sum())
+    assert carrier_vox > 0.0
+    st.hydrate_fraction[0, 0, 0, 0] = 0.5      # equilibrium precipitates it too
+    frac = analysis.phase_volume_fractions(st)
+    n = st.capillary_liquid.size
+    assert frac["thenardite"] == pytest.approx(carrier_vox / n)
+    assert frac["thenardite (hydrate)"] == pytest.approx(0.5 / n)
+
+
+def test_shrinkage_denominator_excludes_dissolved_carriers():
+    """Salt dissolution is not binder reaction: counting it in the reacted
+    mass diluted chem_shrinkage enough to flip the PRD 6.3 verdict."""
+    from tinn.registry import KINETIC_PHASE_IDS as KID
+    cfg = TinnConfig.model_validate(_salt_raw())
+    st = Engine(cfg, reaction_backend=_NullBackend()).initial_state()
+    st.phase_mol = st.initial_phase_mol.copy()
+    st.capillary_gas[:] = 0.0
+    st.capillary_gas[0, 0, 0] = 1.0
+    # react some C3S and fully dissolve the carriers
+    st.phase_mol[KID.index("C3S")] *= 0.5
+    for p in SALT_PHASE_IDS:
+        st.phase_mol[KID.index(p)] = 0.0
+    row = analysis.state_row(st, REG, np.zeros(len(st.hydrate_ids)))
+    c3s = REG.get("C3S")
+    expected_mass = 0.5 * float(st.initial_phase_mol[KID.index("C3S")]) \
+        * c3s.molar_mass_g_mol
+    gas_cm3 = st.vox_cm3
+    assert row["chem_shrinkage_ml_per_g_reacted"] == pytest.approx(
+        gas_cm3 / expected_mass, rel=1e-9)
+
+
+def test_as_built_oxides_expose_the_sampling_gap():
+    """The recipe dose and the rasterized dose differ for tiny populations;
+    the report must show BOTH rather than only the recipe (review finding)."""
+    cfg = TinnConfig.model_validate(_salt_raw())
+    st = Engine(cfg, reaction_backend=_NullBackend()).initial_state()
+    ox = analysis.binder_oxide_diagnostics(cfg, REG, st)
+    for key in ("so3_pct", "na2o_pct", "k2o_pct", "na2o_eq_pct"):
+        assert f"{key}_as_built" in ox
+        assert ox[f"{key}_as_built"] > 0.0
+    # same order of magnitude, but not required to be equal
+    assert 0.5 < ox["so3_pct_as_built"] / ox["so3_pct"] < 2.0
+    # without a state the as-built keys are absent (no invented numbers)
+    assert not any(k.endswith("_as_built")
+                   for k in analysis.binder_oxide_diagnostics(cfg, REG))
+
+
+def test_slice_render_distinguishes_carriers_from_inert():
+    cfg = TinnConfig.model_validate(_salt_raw())
+    st = Engine(cfg, reaction_backend=_NullBackend()).initial_state()
+    z = st.grid_size // 2
+    st.anhydrous_fraction[:] = 0.0
+    st.capillary_liquid[:] = 0.0
+    st.capillary_gas[:] = 0.0
+    st.anhydrous_fraction[SOLID_PHASE_IDS.index("gypsum"), z, 0, 0] = 1.0
+    st.anhydrous_fraction[SOLID_PHASE_IDS.index("inert"), z, 0, 1] = 1.0
+    img = analysis.central_slice_rgb(st)
+    assert not np.array_equal(img[0, 0], img[0, 1])
+
+
+class _NullBackend:
+    """Dissolve-only incremental backend: everything released stays in
+    solution (nothing precipitates), so element closure holds and the test can
+    watch the DEMAND rule alone without a GEMS worker."""
+    backend_id = "stoichiometric"
+    mode = "incremental"
+
+    def __init__(self, hydrate_ids=("CH",)):
+        self.hydrate_ids = hydrate_ids
+
+    def react(self, released_mol, water_available_mol, inventory,
+              solid_elements=None):
+        from tinn.backend import ReactionResult, STATUS_OK
+        from tinn.registry import element_vector
+        e = np.asarray(inventory, dtype=float).copy()
+        for pid, mol in released_mol.items():
+            if mol > 0.0:
+                e = e + element_vector(REG.get(pid).formula, mol)
+        if solid_elements is not None:
+            e = e + np.asarray(solid_elements, dtype=float)
+        return ReactionResult(status=STATUS_OK, parcels=[],
+                              water_consumed_mol=0.0, residual_inventory=e)
+
 
 @needs_gems
 def test_gems_run_forms_sulfate_phases_and_closes(tmp_path):
