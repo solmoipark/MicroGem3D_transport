@@ -104,7 +104,7 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
 - `examples/opc_slag_populations_32.json` — 슬래그 블렌드 + 재료별 PSD.
 - `examples/opc_gypsum_cnash_32.json` — **황산염·알칼리 채널(v3.0/E3)**: OPC 4상 +
   석고 5.0 + 아르카나이트(K2SO4) 0.6 + 테나르다이트(Na2SO4) 0.4 wt%. 미배정 잔여
-  2.0%는 inert 유지. 이 담체 분율은 **시연 배합**으로, SO3 ≈ 2.6 %·Na2O당량 ≈ 0.39 %
+  2.0%는 inert 유지. 이 담체 분율은 **시연 배합**으로, SO3 ≈ 2.83 %·Na2O당량 ≈ 0.39 %
   (리포트 `binder_oxides`에 파생 표기)라는 일반 OPC 수준을 재현하도록 고른 값이다 —
   밀 성적서 실측치가 있으면 그대로 교체하면 된다. 담체별 용해 시간상수는
   `kinetics.salt_tau_h`로 덮어쓸 수 있다(기본값은 순서만 문헌 근거, PRD §1.2).

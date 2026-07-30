@@ -214,17 +214,43 @@ def test_stoichiometric_backend_refuses_salt_recipes():
         TinnConfig.model_validate(raw)
 
 
+# config_hash of every salt-free example, MEASURED under the pre-E3 build
+# (caa8689) and unchanged by E3. Pinning the literal values is the point: an
+# identity check like hash(x) == hash(x) passes even when the salt_tau_h
+# None-pop is deleted, which would silently shift the hash of every archived
+# run (E3 review finding — that mutant survived the whole suite).
+PRE_E3_CONFIG_HASHES = {
+    "c3s_32.json":
+        "1c06a07b2717bedc144137698ebe2439593d8bd7a54db8324648db74c6bf2201",
+    "opc_cnash_32.json":
+        "9bb609c979d628c4afcb491038db37dbd36bf504769958797c17c604a0e0366b",
+    "opc_gems_32.json":
+        "d663728e29df3257d669f8c1d3f4fc7d467025c25a95c7b489e15a458ed98084",
+    "opc_slag_populations_32.json":
+        "6d3c2d1942694167001375b9b630684e18caa97ef474ab341b41b899604011fa",
+    "opc_srm114q_32.json":
+        "c9377fe3092728f0d1b681d30d7847545a8827f440ab77e34adf6021c7e0c346",
+    "opc_srm114q_measured_psd_64.json":
+        "2acab088473fb2a3f9228db502e111ec54b48056e4e362190c5b25bf83084c86",
+}
+
+
 def test_salt_free_config_hash_unchanged():
-    """A salt-free config must keep its pre-E3 hash: salt_tau_h pops when it is
-    None, and the carriers add nothing to the payload."""
-    legacy = TinnConfig.from_json_file(str(EXAMPLES / "opc_cnash_32.json"))
-    payload = legacy.model_dump(mode="json")
-    assert payload["kinetics"].get("salt_tau_h") is None
-    assert "gypsum" not in payload["binder"]["mass_fractions"]
-    # the embedded-config hash contract that checkpoints rely on still holds
-    assert legacy.config_hash() == TinnConfig.model_validate(
-        json.loads((EXAMPLES / "opc_cnash_32.json").read_text(
-            encoding="utf-8"))).config_hash()
+    """Every pre-E3 example keeps its exact pre-E3 config_hash, so archived
+    runs still match their configs (storage.load_checkpoint enforces this)."""
+    for name, expect in PRE_E3_CONFIG_HASHES.items():
+        cfg = TinnConfig.from_json_file(str(EXAMPLES / name))
+        payload = cfg.model_dump(mode="json")
+        assert payload["kinetics"].get("salt_tau_h") is None
+        assert not (set(payload["binder"]["mass_fractions"]) & set(SALT_PHASE_IDS))
+        assert cfg.config_hash() == expect, name
+    # and a config that DOES set salt_tau_h hashes differently from one that
+    # leaves it on the presets (the knob is physics, so it must be in the hash)
+    raw = _salt_raw()
+    base = TinnConfig.model_validate(raw).config_hash()
+    raw2 = _salt_raw()
+    raw2["kinetics"] = dict(raw2["kinetics"], salt_tau_h={"gypsum": 3.0})
+    assert TinnConfig.model_validate(raw2).config_hash() != base
 
 
 # ---------------- diagnostics ----------------
@@ -239,9 +265,21 @@ def test_binder_oxide_diagnostics_math():
         so3 += frac / e.molar_mass_g_mol * (e.formula or {}).get("S", 0.0)
     assert ox["so3_pct"] == pytest.approx(so3 * 80.06 * 100.0, rel=1e-12)
     assert 2.0 < ox["so3_pct"] < 4.0            # a normal Type I cement
-    assert ox["na2o_eq_pct"] == pytest.approx(
-        ox["na2o_pct"] + 0.658 * ox["k2o_pct"], rel=1e-12)
-    assert 0.2 < ox["na2o_eq_pct"] < 1.0
+    # the alkali arms need their OWN hand computation: checking only
+    # na2o_eq == na2o + 0.658*k2o restates the implementation, so a dropped
+    # /2 (two alkali atoms per oxide) or a wrong M(K2O) survives it — all
+    # three of those mutants passed the earlier test (E3 review finding)
+    arc, then_ = REG.get("arcanite"), REG.get("thenardite")
+    f = cfg.binder.mass_fractions
+    k2o = f["arcanite"] / arc.molar_mass_g_mol * (2 / 2.0) * 94.196 * 100.0
+    na2o = f["thenardite"] / then_.molar_mass_g_mol * (2 / 2.0) * 61.979 * 100.0
+    assert ox["k2o_pct"] == pytest.approx(k2o, rel=1e-12)
+    assert ox["na2o_pct"] == pytest.approx(na2o, rel=1e-12)
+    assert ox["na2o_eq_pct"] == pytest.approx(na2o + 0.658 * k2o, rel=1e-12)
+    # absolute anchors so a factor-level error cannot hide inside a wide band
+    assert ox["k2o_pct"] == pytest.approx(0.3243, abs=5e-4)
+    assert ox["na2o_pct"] == pytest.approx(0.1745, abs=5e-4)
+    assert ox["na2o_eq_pct"] == pytest.approx(0.3880, abs=5e-4)
     # a salt-free OPC reports exactly zero (nothing invented)
     plain = TinnConfig.from_json_file(str(EXAMPLES / "opc_cnash_32.json"))
     assert analysis.binder_oxide_diagnostics(plain, REG) == {
@@ -272,8 +310,21 @@ def test_pre_e3_checkpoint_refused_with_named_channels(tmp_path):
     manifest = json.loads(man.read_text(encoding="utf-8"))
     manifest["header.json"] = hashlib.sha256(hdr.read_bytes()).hexdigest()
     man.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(StorageError, match="gypsum"):
+    # match the HINT's own wording, not just a channel name: the base message
+    # already interpolates the full current list (which contains "gypsum"), so
+    # a name-only match passes even with the hint block deleted (review finding)
+    with pytest.raises(StorageError, match="this build adds"):
         load_checkpoint(str(tmp_path / "now"), REG)
+    with pytest.raises(StorageError, match="rerun from the config"):
+        load_checkpoint(str(tmp_path / "now"), REG)
+    # and the hint must name the channels this build added
+    try:
+        load_checkpoint(str(tmp_path / "now"), REG)
+    except StorageError as exc:
+        msg = str(exc)
+        hint = msg[msg.index("this build adds"):]
+        for pid in SALT_PHASE_IDS:
+            assert pid in hint, (pid, hint)
 
 
 # ---------------- GEMS path: the actual point of E3 ----------------
