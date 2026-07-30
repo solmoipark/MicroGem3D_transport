@@ -125,6 +125,17 @@ def check_all(state: SimulationState, registry: Registry,
                            for i in np.flatnonzero(np.any(err_e > bound_e, axis=1))})
             rep.violations.append(
                 f"balance_endmember_elements:{','.join(rows)}")
+        # (c) per-endmember holdings must stay non-negative beyond vanish dust
+        # (same GLOBAL scale reference as (a)/(b)). The closure identities
+        # cannot see an overdraft — both sides move by the same fed amounts —
+        # so a material negative here is the ONLY witness that some cluster
+        # was fed composition that does not exist (E2 review finding).
+        bound_n = ELEMENT_ATOL_MOL + ELEMENT_RTOL * scale_mol
+        rep.metrics["endmember_min_mol"] = float(em.min()) if len(em) else 0.0
+        if np.any(-em > bound_n):
+            bad = sorted({f"{h}:{dc}" for j in np.flatnonzero(-em > bound_n)
+                          for h, dc in (state.endmember_ids[j],)})
+            rep.violations.append(f"balance_endmember_negative:{','.join(bad)}")
 
     # 2. voxel occupancy identity (no negatives, no clipping)
     total = (state.anhydrous_fraction.sum(axis=0) + state.hydrate_fraction.sum(axis=0)

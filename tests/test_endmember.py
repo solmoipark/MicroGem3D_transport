@@ -422,13 +422,14 @@ def test_pool_replacement_and_pool_ratio_feed():
     total = pools[:, sl].sum(axis=0)
     assert total[0] == pytest.approx(1.5e-12, rel=1e-12)   # TobH
     assert total[1] == pytest.approx(1.5e-12, rel=1e-12)   # JenD
-    # (b) bias ONE cluster's pool away from the global 50:50 and step again —
-    # the fed solid_elements must follow the 90:10 pool, not the global ratio
+    # (b) bias ONE cluster's pool away from the global 50:50 (within holdings:
+    # a 60:40 feed keeps the post-commit ledger non-negative) and step again —
+    # the fed solid_elements must follow the pool, not the global ratio
     t1.cluster_endmember_mol = pools.copy()
     rows = np.abs(pools[:, sl]).sum(axis=1)
     c = int(np.argmax(rows))                     # the materially wet cluster
     scale = float(pools[c, sl].sum())
-    t1.cluster_endmember_mol[c, sl] = [0.9 * scale, 0.1 * scale]
+    t1.cluster_endmember_mol[c, sl] = [0.6 * scale, 0.4 * scale]
     b2 = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.25)
     eng2 = Engine(cfg, reaction_backend=b2)
     t2, rej2, _ = eng2.try_step(t1, 2.0)
@@ -436,12 +437,33 @@ def test_pool_replacement_and_pool_ratio_feed():
     fed = [k["solid_elements"] for k in b2.calls if k["solid_elements"] is not None]
     tob, jen = _em_rows()
     amount = float(t1.hydrate_mol[HYDRATE_PHASE_IDS.index("CSH")])
-    want = amount * (0.9 * tob + 0.1 * jen)
+    want = amount * (0.6 * tob + 0.4 * jen)
     assert any(np.allclose(f, want, rtol=1e-9, atol=1e-24) for f in fed), \
         (fed, want)
     # and the pool was replaced again by the NEW parcels (25:75), no blending
     tot2 = t2.cluster_endmember_mol[:, sl].sum(axis=0)
     assert tot2[0] / (tot2[0] + tot2[1]) == pytest.approx(0.25, rel=1e-9)
+
+
+def test_overdraft_feed_rejects_at_step_level():
+    """The E2 review's silent-corruption repro: a pool biased far beyond the
+    global holdings would commit a negative endmember ledger with every
+    closure identity green. Ledger 1b(c) must now reject the step instead."""
+    cfg = _short_cfg()
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b1)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    sl = _csh_slice(eng)
+    pools = t1.cluster_endmember_mol.copy()
+    c = int(np.argmax(np.abs(pools[:, sl]).sum(axis=1)))
+    scale = float(pools[c, sl].sum())
+    pools[c, sl] = [0.9 * scale, 0.1 * scale]   # feeds 2.7e-12 TobH of 1.5e-12
+    t1.cluster_endmember_mol = pools
+    b2 = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.25)
+    t2, rej2, _ = Engine(cfg, reaction_backend=b2).try_step(t1, 2.0)
+    assert t2 is None and rej2 is not None
+    assert rej2.reason.startswith("balance_endmember_negative")
 
 
 def test_empty_pool_falls_back_to_global_ratio():
@@ -518,7 +540,9 @@ def test_checkpoint_roundtrips_pools_and_hash_covers_them(tmp_path):
 
 def test_cluster_ca_si_and_map():
     """Per-cluster Ca/Si observable: ratios follow each cluster's OWN pool;
-    dust pools are skipped; the slice map paints ratio colors per cluster."""
+    dust pools are skipped; the slice map pins the full rendering contract —
+    colormap direction (blue=lo, red=hi), [lo,hi] clamp, gray for ratio-less
+    clusters, dark background, hi>lo guard (E2 review: none were asserted)."""
     cfg = _short_cfg()
     state = Engine(cfg).initial_state()
     el = {e: i for i, e in enumerate(ELEMENT_IDS)}
@@ -539,10 +563,299 @@ def test_cluster_ca_si_and_map():
     n = state.grid_size
     state.cluster_id[n // 2, :4, :4] = 0
     state.cluster_id[n // 2, 8:12, 8:12] = 1
+    state.cluster_id[n // 2, 16:18, 16:18] = 2     # dust cluster: no ratio
     img = analysis.casi_map_rgb(state)
     assert img is not None and img.shape == (n, n, 3)
-    assert not np.array_equal(img[0, 0], img[10, 10])      # distinct ratio colors
-    assert tuple(img[20, 20]) == (30, 30, 30)              # background stays dark
+    # direction: cluster 0 (1.467) is redder than cluster 1 (0.943)
+    assert img[0, 0][0] > img[10, 10][0] and img[0, 0][2] < img[10, 10][2]
+    assert img[10, 10][2] > img[10, 10][0]                 # near-lo: blue wins
+    assert tuple(img[16, 16]) == (120, 120, 120)           # ratio-less: gray
+    assert tuple(img[24, 24]) == (30, 30, 30)              # background stays dark
+    # clamp: with hi below both ratios the pixel saturates at exact full red
+    img2 = analysis.casi_map_rgb(state, lo=0.5, hi=0.6)
+    assert tuple(img2[0, 0]) == (255, 60, 60)
+    with pytest.raises(ValueError, match="hi > lo"):
+        analysis.casi_map_rgb(state, lo=1.5, hi=1.5)
+
+
+def test_cluster_ca_si_picks_dominant_silicate_channel():
+    """E2 review finding: summing every Si-bearing solid solution blends
+    C-S-H with hydrogarnet/M-S-H into a phase that does not exist. Exactly
+    one channel — the largest pooled-Si solid solution — must be read."""
+    cfg = _short_cfg()
+    state = Engine(cfg).initial_state()
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    state.hydrate_ids = ("CSH", "HG")
+    state.endmember_ids = (("CSH", "rich"), ("CSH", "lean"),
+                           ("HG", "a"), ("HG", "b"))
+    rows = np.zeros((4, len(ELEMENT_IDS)))
+    rows[0, el["Ca"]], rows[0, el["Si"]] = 1.8, 1.0
+    rows[1, el["Ca"]], rows[1, el["Si"]] = 0.8, 1.0
+    rows[2, el["Ca"]], rows[2, el["Si"]] = 3.0, 0.84   # siliceous hydrogarnet
+    rows[3, el["Ca"]], rows[3, el["Si"]] = 3.0, 0.84
+    state.endmember_elements = rows
+    state.cluster_endmember_mol = np.array([[2.0, 1.0, 0.1, 0.1]])
+    assert analysis.casi_channel(state) == "CSH"
+    got = analysis.cluster_ca_si(state)
+    # hydrogarnet does NOT pollute the C-S-H ratio
+    assert got[0] == pytest.approx((2 * 1.8 + 1 * 0.8) / 3.0)
+    state.cluster_endmember_mol = np.array([[0.01, 0.01, 5.0, 5.0]])
+    assert analysis.casi_channel(state) == "HG"
+    assert analysis.cluster_ca_si(state)[0] == pytest.approx(3.0 / 0.84)
+
+
+def test_covered_portion_feed_blends_pool_and_global():
+    """E2 review fix: the pool is authoritative ONLY for the mass it actually
+    remembers (covered = min(psum, amount)); the remainder is fed at the
+    global ratio, so a small pool can never define the composition of a much
+    larger amount (the sliver/merge overdraft path)."""
+    cfg = _short_cfg()
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b1)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    sl = _csh_slice(eng)
+    pools = t1.cluster_endmember_mol
+    c = int(np.argmax(np.abs(pools[:, sl]).sum(axis=1)))
+    amount = float(t1.hydrate_mol[HYDRATE_PHASE_IDS.index("CSH")])
+    # the pool remembers only HALF the amount, as pure TobH; the uncovered
+    # half is fed at the global 50:50 -> TobH 3/4, JenD 1/4 of the amount
+    t1.cluster_endmember_mol = pools.copy()
+    t1.cluster_endmember_mol[c, sl] = [amount / 2.0, 0.0]
+    b2 = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.5)
+    eng2 = Engine(cfg, reaction_backend=b2)
+    _, rej2, _ = eng2.try_step(t1, 2.0)
+    assert rej2 is None
+    fed = [k["solid_elements"] for k in b2.calls if k["solid_elements"] is not None]
+    tob, jen = _em_rows()
+    want = amount * (0.75 * tob + 0.25 * jen)
+    assert any(np.allclose(f, want, rtol=1e-9, atol=1e-24) for f in fed), \
+        (fed, want)
+
+
+class PerWaterSnapshotBackend(TwoEndmemberSnapshotBackend):
+    """Scripted per-cluster assemblage keyed on the cluster's water volume:
+    the big pocket gets a small pure-TobH CSH (solves), the small pocket a
+    space-filling CH slab (freezes)."""
+
+    def __init__(self, split_water_mol: float):
+        super().__init__(csh_mol=0.0, tob_frac=0.5)
+        self.split_water_mol = split_water_mol
+
+    def react(self, released_mol, water_available_mol, inventory,
+              solid_elements=None):
+        if water_available_mol > self.split_water_mol:
+            self.csh_mol, self.tob_frac, self.ch_mol = 2e-13, 1.0, 0.0
+        else:
+            self.csh_mol, self.tob_frac, self.ch_mol = 0.0, 0.5, 2.5e-12
+        r = super().react(released_mol, water_available_mol, inventory,
+                          solid_elements=solid_elements)
+        self.calls[-1]["water"] = water_available_mol
+        return r
+
+
+def test_mixed_frozen_and_solved_clusters_keep_pool_semantics():
+    """The E2 mutant killer (review finding: single-cluster fixtures let
+    `pools_prev = parcel_em` survive): a two-pocket step where A solves and B
+    freezes must (a) feed each cluster its OWN pool composition, (b) replace
+    ONLY A's pool with its parcels, (c) keep B's pool bit-identical, and
+    (d) discard B's oversized assemblage entirely."""
+    from tinn import transport
+    from tinn.state import SimulationState
+    cfg = _short_cfg(kinetics={"kind": "tabulated",
+                               "table": {"times_h": [0.0, 4.0],
+                                         "alpha": {"C3S": [0.0, 0.0]}}})
+    backend = PerWaterSnapshotBackend(split_water_mol=8e-12)
+    eng = Engine(cfg, reaction_backend=backend)
+    st = eng.initial_state()   # correct universe/arrays, then rebuild geometry
+    n = st.grid_size
+    tob, jen = _em_rows()
+    csh = HYDRATE_PHASE_IDS.index("CSH")
+    sl = _csh_slice(eng)
+    st.anhydrous_fraction[:] = 0.0
+    st.anhydrous_fraction[0] = 1.0             # C3S everywhere...
+    st.hydrate_fraction[:] = 0.0
+    st.capillary_liquid[:] = 0.0
+    st.capillary_gas[:] = 0.0
+    # pocket A: 6^3 box, one plane partly gas (room to displace water) — far
+    # from the growth seeds at z=2 so placement cannot pinch the cluster
+    st.anhydrous_fraction[0][2:8, 2:8, 2:8] = 0.0
+    st.capillary_liquid[2:8, 2:8, 2:8] = 1.0
+    st.capillary_liquid[6, 2:8, 2:8] = 0.3
+    st.capillary_gas[6, 2:8, 2:8] = 0.7
+    # pocket B: 4^3 box, far from A
+    st.anhydrous_fraction[0][20:24, 20:24, 20:24] = 0.0
+    st.capillary_liquid[20:24, 20:24, 20:24] = 1.0
+    # owned CSH: 1.0 vox dense in A (2 half-voxels), 0.5 vox in B
+    for z, y, x in ((2, 2, 2), (2, 2, 3)):
+        st.hydrate_fraction[csh, z, y, x] = 0.5
+        st.capillary_liquid[z, y, x] = 0.5
+    st.hydrate_fraction[csh, 20, 20, 20] = 0.5
+    st.capillary_liquid[20, 20, 20] = 0.5
+    labels, k = transport.label_clusters(st.capillary_liquid)
+    assert k == 2
+    a_lab = int(labels[2, 2, 2])
+    b_lab = int(labels[20, 20, 20])
+    # ledgers consistent with the 1.5 vox dense envelope: total CSH = 1e-14
+    # mol; volume shares A = 1.0/1.5, B = 0.5/1.5 of that
+    total_csh = 1e-14
+    amt_a = total_csh * (1.0 / 1.5)
+    amt_b = total_csh * (0.5 / 1.5)
+    st.hydrate_mol[:] = 0.0
+    st.hydrate_mol[csh] = total_csh
+    st.hydrate_env_vol_vox[:] = 0.0
+    st.hydrate_env_vol_vox[csh] = 1.5
+    st.endmember_mol[:] = 0.0
+    st.endmember_mol[sl] = [amt_a, amt_b]
+    st.hydrate_elements_ch[:] = 0.0
+    st.hydrate_elements_ch[csh] = amt_a * tob + amt_b * jen
+    # pools LARGER than the owned amounts -> covered == amount, pure ratios
+    pools = np.zeros((2, eng._n_em))
+    pools[a_lab, sl] = [total_csh, 0.0]        # A remembers pure TobH
+    pools[b_lab, sl] = [0.0, total_csh]        # B remembers pure JenD
+    st.cluster_endmember_mol = pools
+    st.cluster_inventory = np.zeros((2, len(ELEMENT_IDS)))
+    st.cluster_id = labels
+    vm_w = st.vm_vox(REG, "H2O")
+    st.water_free_mol = float(st.capillary_liquid.sum()) / vm_w
+    st.initial_water_mol = st.water_free_mol
+    st.water_gel_mol = st.water_bound_mol = 0.0
+    from tinn.registry import KINETIC_PHASE_IDS
+    st.phase_mol = np.zeros(len(KINETIC_PHASE_IDS))
+    st.phase_mol[KINETIC_PHASE_IDS.index("C3S")] = (
+        float(st.anhydrous_fraction[0].sum()) / st.vm_vox(REG, "C3S"))
+    st.initial_phase_mol = st.phase_mol.copy()
+    st.unmet_mol = np.zeros(len(KINETIC_PHASE_IDS))
+    st.injected_elements = np.zeros(len(ELEMENT_IDS))
+    st.initial_elements = ledger.current_elements(st, REG)
+    t2, rej, _ = eng.try_step(st, 2.0)
+    assert rej is None
+    fed = {kk["water"]: kk["solid_elements"] for kk in backend.calls}
+    w_a = max(fed)
+    w_b = min(fed)
+    # (a) each cluster was fed its OWN pool composition at its own amount
+    assert np.allclose(fed[w_a], amt_a * tob, rtol=1e-9, atol=1e-28)
+    assert np.allclose(fed[w_b], amt_b * jen, rtol=1e-9, atol=1e-28)
+    # (b)+(c) A's pool replaced by its parcels, B's untouched bit-for-bit
+    out = t2.cluster_endmember_mol
+    b_rows = [r for r in range(out.shape[0])
+              if np.array_equal(out[r], pools[b_lab])]
+    assert len(b_rows) == 1                    # frozen B survived unchanged
+    a_rows = [r for r in range(out.shape[0])
+              if np.allclose(out[r, sl], [2e-13, 0.0], rtol=1e-9, atol=1e-30)
+              and r not in b_rows]
+    assert len(a_rows) == 1                    # solved A = its own parcels
+    # (d) B's oversized CH assemblage was discarded, not placed
+    assert float(t2.hydrate_mol[HYDRATE_PHASE_IDS.index("CH")]) == 0.0
+
+
+def test_pool_remap_rides_the_inventory_remap(monkeypatch):
+    """E2 review mutant killer: the pool remap must see the IDENTICAL topology
+    transition as the inventory remap (same label/liquid arrays, same n_new)
+    and must carry pools with solved rows already replaced by parcels."""
+    from tinn import transport
+    cfg = _short_cfg()
+    b = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b)
+    seen = []
+    real = transport.remap_inventories
+
+    def spy(prev_labels, prev_liquid, new_labels, new_liquid, inv, n_new):
+        seen.append((prev_labels, prev_liquid, new_labels, new_liquid,
+                     np.asarray(inv).copy(), n_new))
+        return real(prev_labels, prev_liquid, new_labels, new_liquid, inv, n_new)
+
+    monkeypatch.setattr(transport, "remap_inventories", spy)
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None and len(seen) == 2
+    inv_call, pool_call = seen
+    for i in (0, 1, 2, 3):                     # argument identity, both calls
+        assert inv_call[i] is pool_call[i]
+    assert inv_call[5] == pool_call[5]
+    sl = _csh_slice(eng)
+    # the pool call's payload is pools_prev with the solved row = parcel split
+    assert pool_call[4].shape[1] == eng._n_em
+    tot = pool_call[4][:, sl].sum(axis=0)
+    assert tot[0] == pytest.approx(1.5e-12, rel=1e-12)
+    assert tot[1] == pytest.approx(1.5e-12, rel=1e-12)
+
+
+def test_pool_remap_dryout_ignored_inventory_dryout_rejects(monkeypatch):
+    """Design contract pin (E2 review): pools are compositional memory — a
+    dropped pool row must NOT reject the step, while the same dryout signal
+    from the INVENTORY remap must keep rejecting."""
+    import dataclasses
+    from tinn import transport
+    cfg = _short_cfg()
+    real = transport.remap_inventories
+
+    def run_with(dryout_on_call: int):
+        calls = {"n": 0}
+
+        def fake(prev_labels, prev_liquid, new_labels, new_liquid, inv, n_new):
+            res = real(prev_labels, prev_liquid, new_labels, new_liquid,
+                       inv, n_new)
+            calls["n"] += 1
+            if calls["n"] == dryout_on_call:
+                res = dataclasses.replace(res, dryout=[0])
+            return res
+
+        monkeypatch.setattr(transport, "remap_inventories", fake)
+        b = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+        eng = Engine(cfg, reaction_backend=b)
+        return eng.try_step(eng.initial_state(), 2.0)
+
+    trial, rej, _ = run_with(dryout_on_call=2)      # pools: ignored
+    assert rej is None and trial is not None
+    trial2, rej2, _ = run_with(dryout_on_call=1)    # inventory: rejects
+    assert trial2 is None and rej2 is not None
+    assert rej2.reason == "cluster_dryout"
+
+
+def test_ledger_flags_material_negative_endmember():
+    """E2 review: an overdraft moves BOTH sides of every closure identity, so
+    only the new non-negativity check (1b(c)) can witness it. Simulate the
+    exact silent-corruption signature: endmember/hydrate/element ledgers move
+    together, the phantom mass lands in the cluster inventory."""
+    cfg = _short_cfg()
+    state, _ = Engine(cfg).run()
+    state.endmember_mol = state.endmember_mol.copy()
+    state.hydrate_mol = state.hydrate_mol.copy()
+    state.hydrate_elements_ch = state.hydrate_elements_ch.copy()
+    state.cluster_inventory = state.cluster_inventory.copy()
+    j = int(np.argmax(state.endmember_mol))
+    h, _dc = state.endmember_ids[j]
+    ch = state.hydrate_ids.index(h)
+    delta = 2.0 * float(state.endmember_mol[j])
+    state.endmember_mol[j] -= delta            # now materially negative
+    state.hydrate_mol[ch] -= delta
+    state.hydrate_elements_ch[ch] -= delta * state.endmember_elements[j]
+    state.cluster_inventory[0] += delta * state.endmember_elements[j]
+    rep = ledger.check_all(state, REG)
+    neg = [v for v in rep.violations if v.startswith("balance_endmember_negative")]
+    assert neg and h in neg[0]
+    assert not any(v.startswith("balance_endmember:") for v in rep.violations)
+    assert not any(v.startswith("balance_element") for v in rep.violations)
+
+
+def test_report_emits_casi_only_for_pooled_runs(tmp_path):
+    """E2 review: report() integration was unasserted — a pooled (snapshot)
+    run must emit cluster_ca_si/casi_channel/casi_png rows and write the PNG;
+    a stoichiometric run must emit none of them."""
+    cfg = _short_cfg()
+    b = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.4)
+    out = tmp_path / "pooled"
+    Engine(cfg, reaction_backend=b).run(out_dir=str(out))
+    rep = analysis.report(str(out))
+    rows = [r for r in rep["outputs"] if "cluster_ca_si" in r]
+    assert rows
+    assert rows[-1]["casi_channel"] == "CSH"
+    assert (out / rows[-1]["casi_png"]).is_file()
+    out2 = tmp_path / "stoich"
+    Engine(cfg).run(out_dir=str(out2))
+    rep2 = analysis.report(str(out2))
+    assert all("cluster_ca_si" not in r and "casi_png" not in r
+               for r in rep2["outputs"])
 
 
 @needs_gems

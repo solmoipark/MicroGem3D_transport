@@ -117,29 +117,52 @@ def solid_solution_composition(state: SimulationState) -> Dict[str, Dict]:
     return out
 
 
-def cluster_ca_si(state: SimulationState) -> Dict[int, float]:
-    """E2 observable (PRD 4.5 v3.0): Ca/Si of each cluster's silicate
-    solid-solution holdings, from the per-cluster endmember pools — the
-    cluster-resolution composition map comparable to SEM-EDS element maps.
-    Diagnostics only; clusters whose silicate pool is dust are skipped."""
+def casi_channel(state: SimulationState) -> Optional[str]:
+    """The ONE channel the cluster Ca/Si observable reads: the multi-endmember
+    (solid solution) channel holding the largest pooled Si mass. Summing every
+    Si-bearing solid solution into one ratio would blend C-S-H with siliceous
+    hydrogarnet / straetlingite / M-S-H into a composition matching no actual
+    phase (E2 review finding), so exactly one channel is selected."""
     pools = state.cluster_endmember_mol
     if pools.shape[0] == 0 or not len(state.endmember_ids):
-        return {}
-    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+        return None
+    si_col = ELEMENT_IDS.index("Si")
     by_channel: Dict[str, List[int]] = {}
     for j, (h, _dc) in enumerate(state.endmember_ids):
         by_channel.setdefault(h, []).append(j)
-    sil_idx = [j for h, idxs in by_channel.items() if len(idxs) >= 2
-               for j in idxs
-               if state.endmember_elements[idxs][:, el["Si"]].sum() > 0.0]
-    if not sil_idx:
+    best, best_si = None, 0.0
+    for h in state.hydrate_ids:            # deterministic order
+        idxs = by_channel.get(h, [])
+        if len(idxs) < 2:
+            continue
+        rows_si = state.endmember_elements[idxs][:, si_col]
+        if not np.any(rows_si > 0.0):
+            continue
+        si_mass = float(np.clip(pools[:, idxs], 0.0, None).sum(axis=0) @ rows_si)
+        if si_mass > best_si:
+            best, best_si = h, si_mass
+    return best
+
+
+def cluster_ca_si(state: SimulationState) -> Dict[int, float]:
+    """E2 observable (PRD 4.5 v3.0): Ca/Si of each cluster's holdings in the
+    dominant silicate solid-solution channel (see casi_channel), from the
+    per-cluster endmember pools — the cluster-resolution composition map
+    comparable to SEM-EDS element maps. Diagnostics only; clusters whose
+    pool in that channel is dust are skipped."""
+    h = casi_channel(state)
+    if h is None:
         return {}
-    rows = state.endmember_elements[sil_idx]
-    global_scale = float(np.abs(pools).sum())
+    pools = state.cluster_endmember_mol
+    el = {e: i for i, e in enumerate(ELEMENT_IDS)}
+    idxs = [j for j, (hh, _dc) in enumerate(state.endmember_ids) if hh == h]
+    rows = state.endmember_elements[idxs]
+    ch_pools = np.clip(pools[:, idxs], 0.0, None)
+    global_scale = float(ch_pools.sum())
     out: Dict[int, float] = {}
     for c in range(pools.shape[0]):
-        mols = pools[c, sil_idx]
-        if float(np.abs(mols).sum()) <= 1e-9 * max(global_scale, 1e-300):
+        mols = ch_pools[c]
+        if float(mols.sum()) <= 1e-9 * max(global_scale, 1e-300):
             continue
         elems = mols @ rows
         si = float(elems[el["Si"]])
@@ -153,6 +176,8 @@ def casi_map_rgb(state: SimulationState, lo: float = 0.8, hi: float = 2.2
     """Central-slice Ca/Si map (E2): cluster-resolution ratios painted over
     the cluster label field, blue(lo) -> red(hi); non-cluster voxels dark,
     ratio-less clusters gray. Returns None when no ratios exist."""
+    if not hi > lo:
+        raise ValueError(f"casi_map_rgb requires hi > lo, got [{lo}, {hi}]")
     ratios = cluster_ca_si(state)
     if not ratios:
         return None
@@ -723,6 +748,7 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         casi = cluster_ca_si(state)
         if casi:
             row["cluster_ca_si"] = {int(k): float(v) for k, v in casi.items()}
+            row["casi_channel"] = casi_channel(state)
             rgb = casi_map_rgb(state)
             if rgb is not None:
                 casi_name = f"casi_{ck.name}.png"

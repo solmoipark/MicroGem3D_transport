@@ -269,23 +269,33 @@ class Engine:
                 share = b[1:] / tot
                 owned_mol[:, h] = share * trial.hydrate_mol[h]
                 # E2 (PRD 4.5 v3.0): the AMOUNT stays volume-share derived,
-                # but the endmember RATIOS come from the cluster's OWN pool —
-                # the average-composition approximation is gone wherever a
-                # pool exists. New/rewetted clusters without a material pool
-                # fall back to the global channel ratio (self-heals next
-                # step: solved pools are replaced by their own parcels).
+                # but the composition comes from the cluster's OWN pool — for
+                # exactly the COVERED portion, the mass the pool actually
+                # remembers. The uncovered remainder (rewetted or dry-region
+                # holdings the pool never saw, or a whole pool-less cluster)
+                # is fed at the global channel ratio (E1 behavior), so the
+                # per-endmember withdrawal is bounded by pool content plus a
+                # holdings-proportional term and can never invent composition
+                # at the full volume-share scale (E2 review finding: an
+                # unbounded pool-ratio feed could drive endmember_mol
+                # negative while every closure identity stayed green). Both
+                # ratio sources are clipped to the simplex: pools/holdings
+                # are physically non-negative, and dividing a MIXED-SIGN dust
+                # vector by its cancelled sum would amplify dust by up to
+                # 1/eps into the backend feed (review finding).
                 sl = self._em_slice[self.hydrate_ids[h]]
-                g = trial.endmember_mol[sl]
-                gsum = float(g.sum())
-                g_ratio = g / gsum if gsum > 0.0 else np.zeros(sl.stop - sl.start)
-                pool = em_pool_in[:, sl]
+                g_pos = np.clip(trial.endmember_mol[sl], 0.0, None)
+                gp = float(g_pos.sum())
+                g_ratio = (g_pos / gp if gp > 0.0
+                           else np.zeros(sl.stop - sl.start))
+                pool = np.clip(em_pool_in[:, sl], 0.0, None)
                 psum = pool.sum(axis=1)
                 amounts = owned_mol[:, h]
-                use_pool = psum > np.maximum(1e-9 * np.abs(amounts), 1e-300)
-                safe = np.where(use_pool, psum, 1.0)
-                ratios = np.where(use_pool[:, None], pool / safe[:, None],
-                                  g_ratio[None, :])
-                owned_em[:, sl] = amounts[:, None] * ratios
+                covered = np.minimum(psum, np.clip(amounts, 0.0, None))
+                safe = np.where(psum > 0.0, psum, 1.0)
+                owned_em[:, sl] = (pool * (covered / safe)[:, None]
+                                   + (amounts - covered)[:, None]
+                                   * g_ratio[None, :])
                 # fed elements follow the fed COMPOSITION exactly, so the
                 # global element/endmember ledgers stay mutually consistent
                 # by construction ("subtract what was fed")
