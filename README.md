@@ -1,8 +1,27 @@
-# TINN 시멘트 수화 4D 플랫폼 v2
+# TINN 시멘트 수화 4D 플랫폼 v2 — reactive-transport 분기 (rt-dev)
 
 배합(C3S, OPC 4상, SCM 블렌드), PSD, w/c, 온도, 시간 스케줄을 입력받아 질량 보존되는
 시간 의존 3D 미세구조(상 분포·물 분배·공극·수송 지표)를 결정론적·재시작 가능하게
 출력하는 시뮬레이션 플랫폼. 설계와 범위는 [PRD.md](PRD.md)가 유일한 기준 문서다.
+
+이 저장소는 플랫폼 v2(f7be88b)에서 분기한 **v4.0/RT 개발 트리**다 (PRD §1.4 v4.0/RT,
+§4.6): config `transport` 섹션으로 ① 속도제한 재평형(모드 B, `exchange_tau_h`) ②
+서브클러스터 평형 도메인 + 도메인 그래프 확산(모드 C, `domains`) ③ 경계 저수조
+(RT-W3, `boundary`)를 선택한다. `transport` 부재 시 현행 엔진과 비트 동일하게 동작한다.
+
+```jsonc
+// 예: 모드 B+C 합성 (RT-W2부터 유효 — 필드는 PRD §4.6)
+"transport": {
+  "exchange_tau_h": 2160.0,          // C-S-H 교환시간 90일; 생략 = 전평형
+  "domains": {
+    "tile_vox": 8,                   // 격자 크기의 약수; = 격자 크기 ⇒ 현행과 동일
+    "d0_m2_s": 1.0e-9,               // 공통 유효 확산계수 (필수 명시, 기본값 없음)
+    "dirty_rtol": 3.0e-3,            // 0 = 매 스텝 전 도메인 평형 (순수 C 기준)
+    "eq_max_age_steps": 16,
+    "max_gem_calls_per_step": 128
+  }
+}
+```
 
 ## 요구 사항
 
