@@ -112,6 +112,35 @@ def test_backend_react_element_closure(gems_backend):
 
 
 @needs_gems
+def test_reaction_result_reports_aqueous_diagnostics(gems_backend):
+    """RT-W0: read-only aqueous diagnostics ride every react() result.
+
+    aqueous_elements is the full aq_gen element vector (solvent H/O
+    included) back-scaled to cluster units; it must be finite,
+    non-negative, and consistent with the reported solvent split."""
+    inv = np.zeros(len(ELEMENT_IDS))
+    water = 6e-10
+    r = gems_backend.react(_release(), water, inv)
+    assert r.ionic_strength_status == "ok"
+    assert math.isfinite(r.ionic_strength) and r.ionic_strength > 0.0
+    assert math.isfinite(r.aqueous_h2o_mol) and 0.0 < r.aqueous_h2o_mol < water
+    aq = r.aqueous_elements
+    assert aq.shape == (len(ELEMENT_IDS),)
+    assert np.all(np.isfinite(aq)) and np.all(aq >= 0.0)
+    h = aq[ELEMENT_IDS.index("H")]
+    o = aq[ELEMENT_IDS.index("O")]
+    # solvent dominates the aqueous phase: H >= 2*h2o, O >= h2o
+    assert h >= 2.0 * r.aqueous_h2o_mol * (1.0 - 1e-9)
+    assert o >= r.aqueous_h2o_mol * (1.0 - 1e-9)
+    # solvent-subtracted aqueous solutes match the residual inventory up
+    # to the gas phase (residual = aq_gen + gas_gen + suppressed traces
+    # minus solvent; gas carries only O2-seed dust under sealed hydration)
+    h2o_vec = element_vector(REG.get("H2O").formula, r.aqueous_h2o_mol)
+    solutes = aq - h2o_vec
+    assert np.abs(solutes - r.residual_inventory).max() <= 1e-6 * aq.max()
+
+
+@needs_gems
 def test_backend_scaling_invariance(gems_backend):
     inv = np.zeros(len(ELEMENT_IDS))
     a = gems_backend.react(_release(), 6e-10, inv)

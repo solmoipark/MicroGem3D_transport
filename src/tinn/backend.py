@@ -56,6 +56,14 @@ class ReactionResult:
         default_factory=lambda: np.zeros(len(ELEMENT_IDS)))  # seeds/solver floors
     ph: float = math.nan
     ph_status: str = PH_NOT_AVAILABLE
+    # Read-only chemistry diagnostics carried through by backends that expose
+    # them.  The engine does not use these to advance state; they make the
+    # one-domain adapter directly auditable against standalone equilibrium.
+    ionic_strength: float = math.nan
+    ionic_strength_status: str = PH_NOT_AVAILABLE
+    aqueous_h2o_mol: float = math.nan
+    aqueous_elements: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(ELEMENT_IDS)))
 
 
 class ReactionBackend(Protocol):
