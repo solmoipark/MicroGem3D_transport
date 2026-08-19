@@ -51,8 +51,15 @@ def test_transport_config_validation():
     g = json.loads((EXAMPLES / "opc_cnash_32.json").read_text(encoding="utf-8"))
     for bad in ({"exchange_tau_h": 0.0},
                 {"exchange_tau_h": -5.0},
+                {"exchange_tau_h": float("inf")},
+                {"exchange_tau_h": True},
                 {"exchange_tau_h_per_phase": {}},
                 {"exchange_tau_h_per_phase": {"CSHQ": -1.0}},
+                {"exchange_tau_h_per_phase": {"CSHQ": float("nan")}},
+                {"exchange_tau_h_per_phase": {"CSHQ": True}},
+                # only-zero overrides with no global tau declare rate
+                # limiting but limit nothing - refused, not silently inert
+                {"exchange_tau_h_per_phase": {"CSHQ": 0.0}},
                 {"exchange_tau_h": 10.0, "unknown_knob": 1}):
         with pytest.raises(ValidationError):
             TinnConfig.model_validate({**g, "transport": bad})

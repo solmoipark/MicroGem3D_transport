@@ -11,7 +11,8 @@ import json
 import math
 from typing import Dict, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
+                      field_validator, model_validator)
 
 from .registry import (KINETIC_PHASE_IDS, SALT_PHASE_IDS, SCM_PHASE_IDS,
                        default_registry)
@@ -440,17 +441,44 @@ class TransportConfig(BaseModel):
     # it). 0.0 = always fully offered.
     exchange_tau_h_per_phase: Optional[Dict[str, float]] = None
 
+    @field_validator("exchange_tau_h", "exchange_tau_h_per_phase",
+                     mode="before")
+    @classmethod
+    def _no_boolean_taus(cls, v):
+        # lax coercion would turn a typo'd JSON true/false into 1.0/0.0 hours
+        # - a physical exchange time, silently orders of magnitude off
+        vals = v.values() if isinstance(v, dict) else (v,)
+        for item in vals:
+            if isinstance(item, bool):
+                raise ValueError(
+                    "boolean is not an exchange time - give hours")
+        return v
+
     @model_validator(mode="after")
     def _check(self) -> "TransportConfig":
+        if self.exchange_tau_h is not None and not math.isfinite(
+                self.exchange_tau_h):
+            raise ValueError("exchange_tau_h must be finite (an infinite "
+                             "exchange time is the tau -> inf limit; it is "
+                             "not representable in the config hash)")
         if self.exchange_tau_h_per_phase is not None:
             if not self.exchange_tau_h_per_phase:
                 raise ValueError(
                     "exchange_tau_h_per_phase must not be empty - omit it")
             for key, val in self.exchange_tau_h_per_phase.items():
-                if val < 0.0:
+                if not math.isfinite(val) or val < 0.0:
+                    # NaN passes a bare `< 0.0` check and would silently
+                    # disable the rate limit downstream (review finding)
                     raise ValueError(
-                        f"exchange_tau_h_per_phase[{key!r}] must be >= 0 "
-                        f"(0 = always fully offered), got {val}")
+                        f"exchange_tau_h_per_phase[{key!r}] must be a finite "
+                        f"number >= 0 (0 = always fully offered), got {val}")
+            if (self.exchange_tau_h is None
+                    and all(v == 0.0
+                            for v in self.exchange_tau_h_per_phase.values())):
+                raise ValueError(
+                    "exchange_tau_h_per_phase contains only 0.0 (= fully "
+                    "offered) and there is no global exchange_tau_h - the "
+                    "section declares rate limiting but limits nothing")
         return self
 
     def rate_limited(self) -> bool:
@@ -620,17 +648,17 @@ class TinnConfig(BaseModel):
         # the built-in glasses keeps its earlier hash
         if payload.get("scm_composition") is None:
             payload.pop("scm_composition", None)
-        # v4.0/RT transport section: None-valued fields pop so "transport":
-        # null, {}, and {"exchange_tau_h": null} all collapse to the legacy
-        # hash — a config without RT modes is the same physics it always was
+        # v4.0/RT transport section: EVERY None-valued field pops (generic on
+        # purpose — a hard-coded name tuple would silently change every
+        # mode-B hash the day RT-W2 adds `domains`, review finding), so
+        # "transport": null, {}, and {"exchange_tau_h": null} all collapse
+        # to the legacy hash — a config without RT modes is the same physics
+        # it always was
         tr = payload.get("transport")
         if isinstance(tr, dict):
-            for key in ("exchange_tau_h", "exchange_tau_h_per_phase"):
-                if tr.get(key) is None:
-                    tr.pop(key, None)
-            if not tr:
-                payload["transport"] = None
-        if payload.get("transport") is None:
+            for key in [k for k, v in tr.items() if v is None]:
+                tr.pop(key)
+        if not payload.get("transport"):
             payload.pop("transport", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its

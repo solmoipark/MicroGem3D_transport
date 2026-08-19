@@ -67,7 +67,13 @@ def _run(config_path: str, out_dir: str) -> int:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    engine = Engine(cfg)
+    try:
+        # bundle-dependent config errors (e.g. an unknown per-phase tau key)
+        # surface only when the engine meets the backend
+        engine = Engine(cfg)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     try:
         _, summary = engine.run(out_dir=out_dir)
     except EngineError as e:
@@ -91,7 +97,11 @@ def _restart(ckpt_path: str, out_dir: str) -> int:
     except StorageError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    engine = Engine(state.config)
+    try:
+        engine = Engine(state.config)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     try:
         _, summary = engine.run(state=state, out_dir=out_dir)
     except EngineError as e:

@@ -126,8 +126,19 @@ class Engine:
                         f"channel {name!r}; this bundle declares: "
                         f"{sorted(self.hydrate_ids)}")
                 tau[self.hydrate_ids.index(name)] = t
-            if np.any(tau > 0.0):
-                self._tau_ch = tau
+            if not np.any(tau > 0.0):
+                # the config DECLARED rate limiting (its hash records mode B)
+                # but no channel of this bundle ends up limited — running
+                # exact legacy physics under a mode-B label is the silent
+                # no-op the config validator refuses elsewhere (PRD 5)
+                raise ValueError(
+                    "transport declares rate limiting but no hydrate channel "
+                    "of this bundle gets a positive exchange time (a global "
+                    "exchange_tau_h needs at least one multi-endmember "
+                    "solid-solution channel; per-phase 0.0 disables its "
+                    "channel) - refusing a silent full-re-equilibration run "
+                    "under a mode-B config hash")
+            self._tau_ch = tau
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -360,7 +371,17 @@ class Engine:
                 pool = np.clip(em_pool_in[:, sl], 0.0, None)
                 psum = pool.sum(axis=1)
                 amounts = offered_mol[:, h]
-                covered = np.minimum(psum, np.clip(amounts, 0.0, None))
+                if f_ch is None:
+                    covered = np.minimum(psum, np.clip(amounts, 0.0, None))
+                else:
+                    # mode B: the offered feed draws only the AGED FRACTION
+                    # of the pool memory — f x the pool-covered portion of
+                    # the holdings. min(psum, offered) would let an under-
+                    # covering pool be consumed whole, destroying the stored
+                    # composition at up to twice the configured exchange
+                    # rate (review finding)
+                    covered = f_ch[h] * np.minimum(
+                        psum, np.clip(owned_mol[:, h], 0.0, None))
                 safe = np.where(psum > 0.0, psum, 1.0)
                 pool_part = pool * (covered / safe)[:, None]
                 owned_em[:, sl] = (pool_part
@@ -693,22 +714,28 @@ class Engine:
             if f_ch is None:
                 pools_prev[solved] = parcel_em[solved]
             else:
-                # mode B (PRD 4.6.1): the pool becomes a blend — the residual
-                # archive (pool memory minus the part actually fed) capped so
-                # the archive never exceeds the withheld owned mass, plus this
-                # step's parcels. Channels at f == 1.0 keep the absolute-
-                # replacement semantics; f -> 0 turns the pool into a
-                # deposition ledger (only new precipitates accumulate).
-                for c in np.flatnonzero(solved):
-                    new_row = parcel_em[c].copy()
-                    for h in np.flatnonzero(f_ch < 1.0):
-                        sl = self._em_slice[self.hydrate_ids[h]]
-                        resid = em_pool_in[c, sl] - pool_fed[c, sl]
-                        rsum = float(np.clip(resid, 0.0, None).sum())
-                        withheld = max(float(withheld_mol[c, h]), 0.0)
-                        cap = 1.0 if rsum <= 0.0 else min(1.0, withheld / rsum)
-                        new_row[sl] = resid * cap + parcel_em[c, sl]
-                    pools_prev[c] = new_row
+                # mode B (PRD 4.6.1): solved rows start from this step's
+                # parcels; each rate-limited channel adds its withheld
+                # archive — the un-fed pool memory, clipped to the physical
+                # simplex (stale negative dust dies here exactly as it died
+                # under absolute replacement — review finding) and capped so
+                # the archive never exceeds the withheld owned mass. f -> 0
+                # turns the pool into a deposition ledger. Channels at
+                # f == 1.0 keep the absolute-replacement semantics.
+                blended = parcel_em.copy()
+                for h in np.flatnonzero(f_ch < 1.0):
+                    sl = self._em_slice[self.hydrate_ids[h]]
+                    resid = np.clip(em_pool_in[:, sl] - pool_fed[:, sl],
+                                    0.0, None)
+                    rsum = resid.sum(axis=1)
+                    withheld = np.clip(withheld_mol[:, h], 0.0, None)
+                    cap = np.where(
+                        rsum > 0.0,
+                        np.minimum(1.0, withheld / np.where(rsum > 0.0,
+                                                            rsum, 1.0)),
+                        0.0)
+                    blended[:, sl] += resid * cap[:, None]
+                pools_prev[solved] = blended[solved]
         pool_remap = transport.remap_inventories(
             labels, prev_liquid, new_labels, trial.capillary_liquid,
             pools_prev, n_new)

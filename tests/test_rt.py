@@ -140,6 +140,40 @@ def test_unknown_per_phase_tau_is_refused():
             reaction_backend=TwoEndmemberSnapshotBackend(1e-12, 0.5))
 
 
+def test_tau_on_bundle_without_solid_solutions_is_refused():
+    """A global tau against a bundle whose hydrates are all single-endmember
+    would rate-limit nothing: exact legacy physics under a mode-B config
+    hash. Refused loudly, never silently degraded (review finding)."""
+    b = TwoEndmemberSnapshotBackend(1e-12, 0.5)
+    b.hydrate_endmembers = {h: (h,) for h in HYDRATE_PHASE_IDS}
+    with pytest.raises(ValueError, match="no hydrate channel"):
+        Engine(_fake_cfg(transport={"exchange_tau_h": 100.0}),
+               reaction_backend=b)
+
+
+def test_undercovered_pool_archives_at_one_minus_f():
+    """A pool that remembers less than the holdings must still be drawn at
+    the f rate — min(psum, offered) would consume it at up to 2x (review
+    finding). With the pool halved, the archive keeps (1-f) of the memory."""
+    b1 = TwoEndmemberSnapshotBackend(csh_mol=3e-12, tob_frac=0.5)
+    eng1 = Engine(_fake_cfg(), reaction_backend=b1)
+    t1, _, _ = eng1.try_step(eng1.initial_state(), 2.0)
+    sl = eng1._em_slice["CSH"]
+    # halve the pool memory: psum = 1.5e-12 < owned = 3e-12
+    t1.cluster_endmember_mol = t1.cluster_endmember_mol.copy()
+    t1.cluster_endmember_mol[:, sl] *= 0.5
+    psum_before = float(t1.cluster_endmember_mol[:, sl].sum())
+    b_tau = TwoEndmemberSnapshotBackend(csh_mol=2e-12, tob_frac=0.25)
+    eng_tau = Engine(_fake_cfg(transport={"exchange_tau_h": 4.0}),
+                     reaction_backend=b_tau)
+    t2, rej, _ = eng_tau.try_step(t1, 2.0)
+    assert rej is None
+    # fed pool part = f * psum -> archive = (1 - f) * psum survives, plus
+    # this step's 2e-12 of parcels
+    pool_after = float(t2.cluster_endmember_mol[:, sl].sum())
+    assert pool_after == pytest.approx(0.5 * psum_before + 2e-12, rel=1e-9)
+
+
 # ---------------- mode B: coupled GEMS gates ------------------------------
 
 @needs_gems
