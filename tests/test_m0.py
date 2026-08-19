@@ -29,6 +29,38 @@ def _opc_config(**overrides) -> dict:
 
 # ---------- config ----------
 
+def test_absent_transport_section_keeps_legacy_hash():
+    """v4.0/RT: "transport": null, {}, and all-None fields hash exactly like
+    the section's absence — a config without RT modes is unchanged physics."""
+    base = TinnConfig.model_validate(_base_config()).config_hash()
+    for form in (None, {}, {"exchange_tau_h": None},
+                 {"exchange_tau_h": None, "exchange_tau_h_per_phase": None}):
+        assert TinnConfig.model_validate(
+            _base_config(transport=form)).config_hash() == base
+    # an ACTIVE tau must change the hash (gems3k config: tau needs it)
+    g = json.loads((EXAMPLES / "opc_cnash_32.json").read_text(encoding="utf-8"))
+    g_base = TinnConfig.model_validate(g).config_hash()
+    g["transport"] = {"exchange_tau_h": 720.0}
+    assert TinnConfig.model_validate(g).config_hash() != g_base
+
+
+def test_transport_config_validation():
+    """v4.0/RT: tau must be positive, per-phase values non-negative and
+    non-empty, unknown keys refused, and the stoichiometric backend refused
+    (rate limiting its nonexistent re-equilibration would be a silent no-op)."""
+    g = json.loads((EXAMPLES / "opc_cnash_32.json").read_text(encoding="utf-8"))
+    for bad in ({"exchange_tau_h": 0.0},
+                {"exchange_tau_h": -5.0},
+                {"exchange_tau_h_per_phase": {}},
+                {"exchange_tau_h_per_phase": {"CSHQ": -1.0}},
+                {"exchange_tau_h": 10.0, "unknown_knob": 1}):
+        with pytest.raises(ValidationError):
+            TinnConfig.model_validate({**g, "transport": bad})
+    with pytest.raises(ValidationError, match="silent no-op"):
+        TinnConfig.model_validate(
+            _base_config(transport={"exchange_tau_h": 10.0}))
+
+
 def test_config_valid_and_hash_stable():
     a = TinnConfig.model_validate(_base_config())
     b = TinnConfig.from_json_file(str(EXAMPLES / "c3s_32.json"))

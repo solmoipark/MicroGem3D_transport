@@ -107,6 +107,27 @@ class Engine:
         # demand rule differs (cumulative, see try_step)
         self._salt_channels = np.array(
             [KINETIC_PHASE_IDS.index(p) for p in SALT_PHASE_IDS], dtype=np.intp)
+        # v4.0/RT mode B (PRD 4.6.1): per-channel exchange time in hours.
+        # Solid solutions (multi-endmember channels) take the global tau;
+        # single-endmember crystallines stay at 0 (always fully offered)
+        # unless overridden per phase. None = full re-equilibration.
+        self._tau_ch: Optional[np.ndarray] = None
+        tr = config.transport
+        if tr is not None and tr.rate_limited():
+            tau = np.zeros(len(self.hydrate_ids))
+            if tr.exchange_tau_h is not None:
+                for i, h in enumerate(self.hydrate_ids):
+                    if len(self._hydrate_endmembers[h]) > 1:
+                        tau[i] = tr.exchange_tau_h
+            for name, t in (tr.exchange_tau_h_per_phase or {}).items():
+                if name not in self.hydrate_ids:
+                    raise ValueError(
+                        f"exchange_tau_h_per_phase names unknown hydrate "
+                        f"channel {name!r}; this bundle declares: "
+                        f"{sorted(self.hydrate_ids)}")
+                tau[self.hydrate_ids.index(name)] = t
+            if np.any(tau > 0.0):
+                self._tau_ch = tau
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -272,10 +293,31 @@ class Engine:
         # recon partition splits each channel's dense volume; element/mol pools
         # are shared proportionally. The dry bin (recon == -1) keeps the exact
         # remainder untouched — dry hydrates are chemically frozen this step.
+        # v4.0/RT mode B (PRD 4.6.1): offered fraction per channel for THIS
+        # attempted dt — a halved retry offers half as much (f is a pure
+        # function of (config, dt), so restart determinism is free). None =
+        # every channel fully offered; the legacy path then uses the owned
+        # arrays as-is (aliases, zero extra arithmetic — bit-identical).
+        f_ch: Optional[np.ndarray] = None
+        if self._tau_ch is not None:
+            f = np.ones(n_h)
+            m = self._tau_ch > 0.0
+            f[m] = np.minimum(1.0, dt_h / self._tau_ch[m])
+            if np.any(f < 1.0):
+                f_ch = f
+
         own_vol = np.zeros((n_clusters, n_h))
         owned_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
         owned_mol = np.zeros((n_clusters, n_h))
         owned_em = np.zeros((n_clusters, self._n_em))
+        if f_ch is None:
+            offered_vol, offered_mol = own_vol, owned_mol
+            withheld_mol = pool_fed = None
+        else:
+            offered_vol = np.zeros((n_clusters, n_h))
+            offered_mol = np.zeros((n_clusters, n_h))
+            withheld_mol = np.zeros((n_clusters, n_h))
+            pool_fed = np.zeros((n_clusters, self._n_em))
         if snapshot and n_clusters > 0:
             recon_b = (recon + 1).ravel()
             for h in range(n_h):
@@ -288,6 +330,13 @@ class Engine:
                 own_vol[:, h] = b[1:]
                 share = b[1:] / tot
                 owned_mol[:, h] = share * trial.hydrate_mol[h]
+                if f_ch is not None:
+                    # mode B: only the aged fraction enters the transaction;
+                    # the withheld remainder stays in the dense field and the
+                    # global ledgers, chemically frozen this step
+                    offered_vol[:, h] = own_vol[:, h] * f_ch[h]
+                    offered_mol[:, h] = owned_mol[:, h] * f_ch[h]
+                    withheld_mol[:, h] = owned_mol[:, h] - offered_mol[:, h]
                 # E2 (PRD 4.5 v3.0): the AMOUNT stays volume-share derived,
                 # but the composition comes from the cluster's OWN pool — for
                 # exactly the COVERED portion, the mass the pool actually
@@ -310,23 +359,26 @@ class Engine:
                            else np.zeros(sl.stop - sl.start))
                 pool = np.clip(em_pool_in[:, sl], 0.0, None)
                 psum = pool.sum(axis=1)
-                amounts = owned_mol[:, h]
+                amounts = offered_mol[:, h]
                 covered = np.minimum(psum, np.clip(amounts, 0.0, None))
                 safe = np.where(psum > 0.0, psum, 1.0)
-                owned_em[:, sl] = (pool * (covered / safe)[:, None]
+                pool_part = pool * (covered / safe)[:, None]
+                owned_em[:, sl] = (pool_part
                                    + (amounts - covered)[:, None]
                                    * g_ratio[None, :])
+                if f_ch is not None:
+                    pool_fed[:, sl] = pool_part
                 # fed elements follow the fed COMPOSITION exactly, so the
                 # global element/endmember ledgers stay mutually consistent
                 # by construction ("subtract what was fed")
                 owned_elem[:, h, :] = owned_em[:, sl] @ trial.endmember_elements[sl]
-        owned_gel_c = (own_vol * gel_eps).sum(axis=1)
+        owned_gel_c = (offered_vol * gel_eps).sum(axis=1)
 
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
-            has_solids = snapshot and own_vol[c].sum() > 0.0
+            has_solids = snapshot and offered_vol[c].sum() > 0.0
             has_inventory = bool(np.any(inv_in[c] != 0.0))
             if not rel and not has_solids and not has_inventory:
                 residual[c] = inv_in[c]
@@ -395,7 +447,7 @@ class Engine:
                 env_new = np.zeros(n_h)
                 for pc in result.parcels:
                     env_new[h_index[pc.phase_id]] += _envelope_vox(pc)
-                delta_c = env_new - own_vol[c]
+                delta_c = env_new - offered_vol[c]
                 member_c = recon == c
                 grow_c = float(np.clip(delta_c, 0.0, None).sum())
                 vac_tot_c = (s * float(np.where(member_c, vacated, 0.0).sum())
@@ -496,7 +548,7 @@ class Engine:
         if snapshot:
             # deltas vs owned volume; NEGATIVES FIRST — re-dissolved hydrate
             # frees pore capacity before growth is placed (v1 pattern)
-            delta_env = np.where(solved[:, None], parcel_env - own_vol, 0.0)
+            delta_env = np.where(solved[:, None], parcel_env - offered_vol, 0.0)
             freed = np.zeros_like(vacated)
             for c in np.flatnonzero(solved):
                 member = recon == c
@@ -605,9 +657,9 @@ class Engine:
         if snapshot:
             sv = solved
             trial.hydrate_mol = trial.hydrate_mol + (
-                parcel_mol[sv].sum(axis=0) - owned_mol[sv].sum(axis=0))
+                parcel_mol[sv].sum(axis=0) - offered_mol[sv].sum(axis=0))
             trial.hydrate_env_vol_vox = trial.hydrate_env_vol_vox + (
-                parcel_env[sv].sum(axis=0) - own_vol[sv].sum(axis=0))
+                parcel_env[sv].sum(axis=0) - offered_vol[sv].sum(axis=0))
             trial.hydrate_elements_ch = trial.hydrate_elements_ch + (
                 parcel_elem[sv].sum(axis=0) - owned_elem[sv].sum(axis=0))
             trial.endmember_mol = trial.endmember_mol + (
@@ -638,7 +690,25 @@ class Engine:
         # ledgers carry conservation, so a stranded pool is not a dryout).
         pools_prev = em_pool_in.copy()
         if snapshot and bool(solved.any()):
-            pools_prev[solved] = parcel_em[solved]
+            if f_ch is None:
+                pools_prev[solved] = parcel_em[solved]
+            else:
+                # mode B (PRD 4.6.1): the pool becomes a blend — the residual
+                # archive (pool memory minus the part actually fed) capped so
+                # the archive never exceeds the withheld owned mass, plus this
+                # step's parcels. Channels at f == 1.0 keep the absolute-
+                # replacement semantics; f -> 0 turns the pool into a
+                # deposition ledger (only new precipitates accumulate).
+                for c in np.flatnonzero(solved):
+                    new_row = parcel_em[c].copy()
+                    for h in np.flatnonzero(f_ch < 1.0):
+                        sl = self._em_slice[self.hydrate_ids[h]]
+                        resid = em_pool_in[c, sl] - pool_fed[c, sl]
+                        rsum = float(np.clip(resid, 0.0, None).sum())
+                        withheld = max(float(withheld_mol[c, h]), 0.0)
+                        cap = 1.0 if rsum <= 0.0 else min(1.0, withheld / rsum)
+                        new_row[sl] = resid * cap + parcel_em[c, sl]
+                    pools_prev[c] = new_row
         pool_remap = transport.remap_inventories(
             labels, prev_liquid, new_labels, trial.capillary_liquid,
             pools_prev, n_new)

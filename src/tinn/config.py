@@ -420,6 +420,44 @@ class ScmComposition(BaseModel):
         return self
 
 
+class TransportConfig(BaseModel):
+    """v4.0/RT chemistry-transport modes (PRD 1.4/4.6). Absence of the
+    section — or None in every field — preserves the exact current engine,
+    bit for bit, and every earlier config hash."""
+    model_config = _STRICT
+    # Mode B: rate-limited re-equilibration (PRD 4.6.1). Per step, only the
+    # fraction f = min(1, dt/tau) of each domain's owned solid-solution
+    # inventory is offered to the equilibrium; the withheld remainder keeps
+    # its stored composition and is chemically inert that step (turnover
+    # n/tau — the declared C-S-H recrystallization/exchange time, literature
+    # months to years). Single-endmember crystalline channels default to
+    # tau = 0 (always fully offered: their dissolution/growth is
+    # surface-controlled, and withholding CH would silently break pH
+    # buffering). None => full re-equilibration (exact legacy code path).
+    exchange_tau_h: Optional[float] = Field(default=None, gt=0.0)
+    # Per-channel overrides in hours, keyed by bundle hydrate ids (validated
+    # against the actual bundle at Engine construction — config cannot know
+    # it). 0.0 = always fully offered.
+    exchange_tau_h_per_phase: Optional[Dict[str, float]] = None
+
+    @model_validator(mode="after")
+    def _check(self) -> "TransportConfig":
+        if self.exchange_tau_h_per_phase is not None:
+            if not self.exchange_tau_h_per_phase:
+                raise ValueError(
+                    "exchange_tau_h_per_phase must not be empty - omit it")
+            for key, val in self.exchange_tau_h_per_phase.items():
+                if val < 0.0:
+                    raise ValueError(
+                        f"exchange_tau_h_per_phase[{key!r}] must be >= 0 "
+                        f"(0 = always fully offered), got {val}")
+        return self
+
+    def rate_limited(self) -> bool:
+        return (self.exchange_tau_h is not None
+                or bool(self.exchange_tau_h_per_phase))
+
+
 class TinnConfig(BaseModel):
     model_config = _STRICT
     binder: BinderRecipe
@@ -442,6 +480,9 @@ class TinnConfig(BaseModel):
     rve: RVEConfig
     chemistry: ChemistryConfig
     schedule: ScheduleConfig
+    # v4.0/RT chemistry-transport modes (PRD 4.6). None keeps every earlier
+    # config hash (and the engine's exact legacy code path) unchanged.
+    transport: Optional[TransportConfig] = None
     # coarse-tail volume fraction removed per PSD by truncate_to_grid, keyed
     # "__shared__" (the top-level psd) or the material_psd key — diagnostics
     # for the geometry report, never part of the hash/serialized payload
@@ -546,6 +587,13 @@ class TinnConfig(BaseModel):
                     f"carriers dissolve into solution instead of precipitating a "
                     f"fixed product, so they require the gems3k backend"
                 )
+        if (self.transport is not None and self.transport.rate_limited()
+                and self.chemistry.backend != "gems3k"):
+            raise ValueError(
+                "transport.exchange_tau_h rate-limits the re-equilibration of "
+                "owned hydrates, which only the gems3k snapshot backend "
+                "performs - with the stoichiometric backend it would be a "
+                "silent no-op, so it is refused")
         return self
 
     def config_hash(self) -> str:
@@ -572,6 +620,18 @@ class TinnConfig(BaseModel):
         # the built-in glasses keeps its earlier hash
         if payload.get("scm_composition") is None:
             payload.pop("scm_composition", None)
+        # v4.0/RT transport section: None-valued fields pop so "transport":
+        # null, {}, and {"exchange_tau_h": null} all collapse to the legacy
+        # hash — a config without RT modes is the same physics it always was
+        tr = payload.get("transport")
+        if isinstance(tr, dict):
+            for key in ("exchange_tau_h", "exchange_tau_h_per_phase"):
+                if tr.get(key) is None:
+                    tr.pop(key, None)
+            if not tr:
+                payload["transport"] = None
+        if payload.get("transport") is None:
+            payload.pop("transport", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
         # TRUNCATED bins plus the original measured input — physics-faithful
