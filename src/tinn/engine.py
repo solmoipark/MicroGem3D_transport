@@ -168,6 +168,24 @@ class Engine:
                 for p in KINETIC_PHASE_IDS])
         else:
             self._economy = False
+        # v4.0/RT-W3 boundary reservoir (PRD 4.6.3): precompute the static
+        # parts; the coupling itself is rebuilt each step from the labeled
+        # liquid (pure function of state - restart determinism free)
+        self._boundary = (config.transport.boundary
+                          if config.transport is not None else None)
+        self._periodic_axes = (True, True, True)
+        if self._boundary is not None:
+            self._b_axis = {"z": 0, "y": 1, "x": 2}[self._boundary.axis]
+            self._b_low = self._boundary.side in ("low", "both")
+            self._b_high = self._boundary.side in ("high", "both")
+            self._periodic_axes = tuple(
+                i != self._b_axis for i in range(3))
+            # mol per m^3 of capillary water -> mol per vox^3 of liquid
+            vox_m3 = (config.rve.voxel_size_um * 1e-6) ** 3
+            c_res = np.zeros(len(ELEMENT_IDS))
+            for el, c in self._boundary.composition_mol_per_m3.items():
+                c_res[ELEMENT_IDS.index(el)] = c * vox_m3
+            self._c_res_vox = c_res
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -213,7 +231,8 @@ class Engine:
                 trial.phase_mol[s])
 
         prev_liquid = trial.capillary_liquid.copy()
-        cl_labels, n_cl = transport.label_clusters(prev_liquid)
+        cl_labels, n_cl = transport.label_clusters(prev_liquid,
+                                                   self._periodic_axes)
         # v4.0/RT mode C (PRD 4.6.2): the reactor key is the DOMAIN — cluster
         # intersected with a static tile. The degenerate tile == grid case
         # WITHOUT the economy takes the mode-full aliases outright, so the
@@ -222,7 +241,8 @@ class Engine:
         # economy on, tile == grid legitimately means cluster-level
         # deferral and keeps the domain machinery.
         dom_active = self._domains_cfg is not None and (
-            self._domains_cfg.tile_vox != trial.grid_size or self._economy)
+            self._domains_cfg.tile_vox != trial.grid_size or self._economy
+            or self._boundary is not None)
         if dom_active:
             labels, n_clusters, dom_to_cl = transport.label_domains(
                 cl_labels, n_cl, self._domains_cfg.tile_vox)
@@ -324,16 +344,31 @@ class Engine:
                 prev_liquid, trial.hydrate_fraction, gel_eps,
                 analysis.GEL_REL_DIFFUSIVITY)
             graph = transport.build_domain_graph(labels, n_clusters,
-                                                 g_field, prev_liquid)
+                                                 g_field, prev_liquid,
+                                                 self._periodic_axes)
+            bath = None
+            bnd_coupled = None
+            if self._boundary is not None:
+                g_ar = transport.boundary_coupling(
+                    labels, n_clusters, g_field, self._b_axis,
+                    self._b_low, self._b_high)
+                g_ar[graph.dust] = 0.0   # dust domains skip the bath too
+                bath = transport.BoundaryBath(g_bnd=g_ar,
+                                              c_res=self._c_res_vox)
+                bnd_coupled = g_ar > 0.0
             ex = transport.exchange_be(graph, inv_eff, dt_h,
                                        self._d0_vox2_h,
-                                       float(self._domains_cfg.tile_vox))
+                                       float(self._domains_cfg.tile_vox),
+                                       bath=bath)
             if ex.status != "ok":
                 return None, StepReject(REJECT_TRANSPORT_FAILURE), {}
             inv_eff = inv_eff + ex.delta
+            if bath is not None:
+                trial.boundary_exchanged_elements = (
+                    trial.boundary_exchanged_elements + ex.boundary_net)
             exchange_bal = ledger.ExchangeBalance(
                 applied_delta_elements=ex.delta.sum(axis=0),
-                boundary_net_elements=np.zeros(len(ELEMENT_IDS)),
+                boundary_net_elements=ex.boundary_net,
                 abs_flux_scale=float(np.abs(ex.delta).sum()))
             exchange_metrics = {
                 "n_domains": float(n_clusters),
@@ -341,6 +376,18 @@ class Engine:
                 "exchange_max_edge_flux_mol": ex.max_edge_flux_mol,
                 "exchange_repair_rel": ex.repair_rel,
             }
+            if bnd_coupled is not None:
+                # supply-limit witness (PRD 4.6.3 dt policy): per-step
+                # outflux over the bath-connected solution inventory
+                inv_pool = float(np.abs(inv_in[bnd_coupled]).sum())
+                out_mol = float(np.clip(-ex.boundary_net, 0.0, None).sum())
+                exchange_metrics.update({
+                    "n_boundary_coupled": float(bnd_coupled.sum()),
+                    "boundary_net_mol_max": float(
+                        np.abs(ex.boundary_net).max()),
+                    "boundary_supply_ratio": (out_mol / inv_pool
+                                              if inv_pool > 0.0 else 0.0),
+                })
         else:
             inv_eff = inv_in
 
@@ -384,6 +431,11 @@ class Engine:
             r = (drift / (1e-24 + water_mol_c)
                  + np.abs(water_mol_c - eq_w_in) / (1e-24 + eq_w_in))
             forced = (~valid) | salt_rel | (eq_age_in >= dcfg.eq_max_age_steps)
+            if bnd_coupled is not None:
+                # bath-coupled domains re-equilibrate every step: their
+                # assemblage sets the interface concentration that drives
+                # the boundary flux (PRD 4.6.2/4.6.3)
+                forced = forced | bnd_coupled
             dirty = valid & (r > dcfg.dirty_rtol)
             equilibrate = forced | dirty
             budget = dcfg.max_gem_calls_per_step
@@ -913,7 +965,8 @@ class Engine:
             exchange_metrics["n_frozen_domains"] = float(frozen.sum())
 
         # relabel + conservative inventory remap
-        new_cl_labels, n_new_cl = transport.label_clusters(trial.capillary_liquid)
+        new_cl_labels, n_new_cl = transport.label_clusters(
+            trial.capillary_liquid, self._periodic_axes)
         if dom_to_cl is None:
             new_labels, n_new = new_cl_labels, n_new_cl
         else:

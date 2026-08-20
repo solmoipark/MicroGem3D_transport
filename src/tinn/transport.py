@@ -25,19 +25,37 @@ _AXES = ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1))
 DUST_WATER_REL = 1e-6
 
 
-def label_clusters(liquid: np.ndarray) -> Tuple[np.ndarray, int]:
-    """Return (labels int64 with -1 for dry voxels, cluster count)."""
+def label_clusters(liquid: np.ndarray,
+                   periodic_axes: Tuple[bool, bool, bool] = (True, True, True)
+                   ) -> Tuple[np.ndarray, int]:
+    """Return (labels int64 with -1 for dry voxels, cluster count).
+
+    v4.0/RT-W3: a non-periodic axis (a declared exposed face de-periodizes
+    the WHOLE axis) suppresses the min-label flood across that seam — a
+    cluster must not share one well-mixed solution across the cut. The
+    all-periodic default path is byte-identical (branch only, zero extra
+    array ops)."""
     mask = liquid > LIQ_EPS
     n_vox = liquid.size
     labels = np.where(mask, np.arange(n_vox, dtype=np.int64).reshape(liquid.shape),
                       np.int64(n_vox))
+    seams = []          # per-(ax, shift): wrapped slice to blank, None = periodic
+    for ax, shift in _AXES:
+        if periodic_axes[ax]:
+            seams.append(None)
+        else:
+            idx: list = [slice(None)] * 3
+            idx[ax] = 0 if shift > 0 else -1   # np.roll(+1) wraps N-1 into 0
+            seams.append(tuple(idx))
     # min-label flooding advances >= 1 voxel per sweep along the longest geodesic,
     # which is bounded by the voxel count — never bail out on a legal topology
     for _ in range(n_vox + 1):
         prev = labels
         m = labels
-        for ax, shift in _AXES:
+        for (ax, shift), cut in zip(_AXES, seams):
             r = np.roll(labels, shift, axis=ax)
+            if cut is not None:
+                r[cut] = n_vox         # the wrapped face is not a neighbor
             m = np.minimum(m, np.where(mask, r, n_vox))
         labels = np.where(mask, np.minimum(labels, m), np.int64(n_vox))
         if np.array_equal(labels, prev):
@@ -155,12 +173,17 @@ class DomainGraph:
 
 
 def build_domain_graph(domain_id: np.ndarray, n_domains: int,
-                       g: np.ndarray, liquid: np.ndarray) -> DomainGraph:
+                       g: np.ndarray, liquid: np.ndarray,
+                       periodic_axes: Tuple[bool, bool, bool] = (True, True,
+                                                                 True)
+                       ) -> DomainGraph:
     """Edges between face-adjacent wet voxels of DIFFERENT domains (always
     domains of the same cluster, by construction of the 6-neighbor flood).
     Face conductance is the harmonic mean 2ab/(a+b) - the same rule as the
-    report's diffusivity network - summed over the interface. Fully
-    periodic (wrap faces included); deterministic edge order."""
+    report's diffusivity network - summed over the interface. Wrap faces
+    included on periodic axes; a non-periodic (exposed) axis drops its
+    seam pair — MANDATORY once labels are de-periodized, else the seam
+    edge would join different clusters (v4.0/RT-W3). Deterministic order."""
     water = np.zeros(n_domains)
     wet = domain_id >= 0
     if wet.any():
@@ -176,6 +199,10 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
         ga = g
         gb = np.roll(g, -1, axis=ax)
         m = (da >= 0) & (db >= 0) & (da != db)
+        if not periodic_axes[ax]:
+            cut: list = [slice(None)] * 3
+            cut[ax] = -1
+            m[tuple(cut)] = False      # exposed-axis wrap faces are walls
         if not m.any():
             continue
         a = da[m]
@@ -211,16 +238,53 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
 
 
 @dataclass
+class BoundaryBath:
+    """v4.0/RT-W3 fixed-composition ghost reservoir (PRD 4.6.3). g_bnd is
+    the per-domain half-cell conductance sum to the declared exposed
+    face(s) — Σ 2g over WET face-layer voxels, the network solver's
+    Dirichlet rule gin = 2·g_a; exchange_be scales it by d0/p exactly as
+    it scales edge_g (the factor 2 lives HERE, once). c_res is the bath
+    concentration per element in mol per vox^3 of liquid (c = n/W
+    units)."""
+    g_bnd: np.ndarray            # (D,) float64 >= 0; 0 = uncoupled
+    c_res: np.ndarray            # (E,) float64 >= 0
+
+
+def boundary_coupling(domain_id: np.ndarray, n_domains: int, g: np.ndarray,
+                      axis: int, low: bool, high: bool) -> np.ndarray:
+    """Half-cell conductance sum to the declared exposed face(s): Σ 2g over
+    WET (domain_id >= 0) voxels of the face layer (index 0 / N-1 along
+    axis), grouped by domain (bincount — deterministic). Dry face voxels
+    never couple (no domain; moisture flux is out of scope). The caller
+    zeroes dust domains, mirroring the internal edge exclusion."""
+    out = np.zeros(n_domains)
+    for idx, on in ((0, low), (-1, high)):
+        if not on:
+            continue
+        sl: list = [slice(None)] * 3
+        sl[axis] = idx
+        d = domain_id[tuple(sl)]
+        gv = g[tuple(sl)]
+        m = d >= 0
+        if m.any():
+            out += np.bincount(d[m], weights=2.0 * gv[m],
+                               minlength=n_domains)
+    return out
+
+
+@dataclass
 class ExchangeResult:
     delta: np.ndarray            # (D, E) antisymmetric inventory change
     status: str                  # "ok" | "not_converged"
     cg_iterations: int
     max_edge_flux_mol: float
     repair_rel: float            # largest relative negative-dust repair
+    boundary_net: np.ndarray     # (E,) net element flux INTO the system
 
 
 def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
                 d0_vox2_h: float, pitch_vox: float,
+                bath: Optional[BoundaryBath] = None,
                 tol: float = 1e-12, max_iter: int = 10000) -> ExchangeResult:
     """One backward-Euler diffusion step on the domain graph, in FLUX FORM
     (PRD 4.6.2): solve (diag(W) + dt L) c = n per element column with
@@ -232,24 +296,37 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     and charges the largest entry, asserting the magnitude stays dust."""
     n_dom, n_elem = inventory.shape
     delta = np.zeros_like(inventory)
-    if graph.edge_a.size == 0 or dt_h <= 0.0:
-        return ExchangeResult(delta, "ok", 0, 0.0, 0.0)
+    # RT-W3: a bath-coupled domain participates even with no internal
+    # edges (an isolated surface-connected pore physically leaches)
+    t_bnd = None
+    if bath is not None and np.any(bath.g_bnd > 0.0):
+        t_bnd = d0_vox2_h * bath.g_bnd / pitch_vox
+    if dt_h <= 0.0 or (graph.edge_a.size == 0 and t_bnd is None):
+        return ExchangeResult(delta, "ok", 0, 0.0, 0.0, np.zeros(n_elem))
     ea, eb = graph.edge_a, graph.edge_b
     t_e = d0_vox2_h * graph.edge_g / pitch_vox      # vox^3 / h
-    # only edge-connected domains participate; the diagonal floors at a tiny
-    # positive value on participating rows to stay invertible
+    # only edge-connected (or bath-coupled) domains participate; the
+    # diagonal floors at a tiny positive value on those rows
     act = np.zeros(n_dom, dtype=bool)
     act[ea] = True
     act[eb] = True
+    if t_bnd is not None:
+        act |= t_bnd > 0.0
     w_act = np.where(act, np.maximum(graph.water, 1e-300), 1.0)
     deg = np.zeros(n_dom)
     np.add.at(deg, ea, t_e)
     np.add.at(deg, eb, t_e)
-    diag = w_act + dt_h * deg
+    # bath term: known c_R eliminated to the RHS — diagonal gains dt*T_bnd
+    # (SPD/M-matrix preserved, diagonal dominance improves), RHS gains
+    # dt*T_bnd*c_res (PRD 4.6.3). The sealed path aliases w_eff = w_act.
+    w_eff = w_act if t_bnd is None else w_act + dt_h * t_bnd
+    diag = w_eff + dt_h * deg
     b = inventory * act[:, None]
+    if t_bnd is not None:
+        b = b + (dt_h * t_bnd)[:, None] * bath.c_res[None, :]
 
     def matvec(x):
-        y = w_act[:, None] * x
+        y = w_eff[:, None] * x
         d = x[ea] - x[eb]
         contrib = dt_h * t_e[:, None] * d
         np.add.at(y, ea, contrib)
@@ -277,12 +354,21 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         p = z + beta[None, :] * p
         rz = rz_new
     else:
-        return ExchangeResult(delta, "not_converged", iters, 0.0, 0.0)
+        return ExchangeResult(delta, "not_converged", iters, 0.0, 0.0,
+                              np.zeros(n_elem))
 
     flux = dt_h * t_e[:, None] * (x[ea] - x[eb])    # (n_edges, n_elem)
     np.add.at(delta, ea, -flux)
     np.add.at(delta, eb, flux)
     max_flux = float(np.abs(flux).max()) if flux.size else 0.0
+    boundary_net = np.zeros(n_elem)
+    if t_bnd is not None:
+        rows = np.flatnonzero(t_bnd > 0.0)           # ascending, deterministic
+        f_out = dt_h * t_bnd[rows, None] * (x[rows] - bath.c_res[None, :])
+        delta[rows] -= f_out                          # the same floats feed
+        boundary_net = -f_out.sum(axis=0)             # rows AND the ledger
+        if f_out.size:
+            max_flux = max(max_flux, float(np.abs(f_out).max()))
 
     # deterministic negative-dust repair: clip, charge the largest entry
     new = inventory + delta
@@ -304,4 +390,5 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         raise RuntimeError(
             f"exchange_be negative repair {repair_rel:.3e} exceeds dust - "
             f"logic error, not absorbable")
-    return ExchangeResult(delta, "ok", iters, max_flux, repair_rel)
+    return ExchangeResult(delta, "ok", iters, max_flux, repair_rel,
+                          boundary_net)

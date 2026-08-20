@@ -409,6 +409,232 @@ def test_economy_off_leaves_snapshots_empty(tmp_path):
     assert state.domain_eq_age.shape[0] == 0
 
 
+# ---------------- RT-W3: boundary reservoir -------------------------------
+
+def test_label_clusters_nonperiodic_axis_splits_wrap():
+    """A strip crossing the z seam is one periodic cluster but two under a
+    non-periodic z; transverse wraps stay; recomputation identical."""
+    liquid = np.zeros((6, 6, 6))
+    liquid[0, 2, 2] = 0.5
+    liquid[5, 2, 2] = 0.5              # touching only through the z seam
+    lp, np_cl = transport.label_clusters(liquid)
+    assert np_cl == 1
+    ln, nn = transport.label_clusters(liquid, (False, True, True))
+    assert nn == 2
+    assert ln[0, 2, 2] != ln[5, 2, 2]
+    # transverse (y) wrap still connects under non-periodic z
+    liquid2 = np.zeros((6, 6, 6))
+    liquid2[2, 0, 2] = 0.5
+    liquid2[2, 5, 2] = 0.5
+    _, n2 = transport.label_clusters(liquid2, (False, True, True))
+    assert n2 == 1
+    ln2, nn2 = transport.label_clusters(liquid, (False, True, True))
+    assert nn2 == nn and np.array_equal(ln, ln2)
+
+
+def test_label_clusters_all_periodic_default_identical():
+    rng = np.random.default_rng(11)
+    liquid = (rng.random((8, 8, 8)) > 0.5) * 0.4
+    a, na = transport.label_clusters(liquid)
+    b, nb = transport.label_clusters(liquid, (True, True, True))
+    assert na == nb and np.array_equal(a, b)
+    # a field with no seam-crossing pair labels identically either way
+    interior = np.zeros((8, 8, 8))
+    interior[2:6, 2:6, 2:6] = 0.5
+    c, ncc = transport.label_clusters(interior)
+    d, ndd = transport.label_clusters(interior, (False, True, True))
+    assert ncc == ndd and np.array_equal(c, d)
+
+
+def test_domain_graph_exposed_wrap_edge_excluded():
+    """Wet slabs at z=0 and z=N-1 in one cluster via an interior bridge:
+    periodic graph carries the seam edge, the exposed graph does not; a
+    zero-coupling bath degrades exchange_be to the bath-None result."""
+    liquid = np.zeros((6, 6, 6))
+    liquid[:, 2, 2] = 0.5              # a full z-column: bridge + both faces
+    labels, n_cl = transport.label_clusters(liquid, (False, True, True))
+    assert n_cl == 1
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 2)
+    g = np.where(liquid > 0, 0.5, 0.0)
+    g_per = transport.build_domain_graph(d_id, n_dom, g, liquid)
+    g_exp = transport.build_domain_graph(d_id, n_dom, g, liquid,
+                                         (False, True, True))
+    assert g_per.edge_a.size == g_exp.edge_a.size + 1   # exactly the seam
+    inv = np.linspace(1.0, 2.0, n_dom)[:, None] * np.ones((1, 11)) * 1e-10
+    r0 = transport.exchange_be(g_exp, inv, 1.0, 2.0, 2.0)
+    rz = transport.exchange_be(g_exp, inv, 1.0, 2.0, 2.0,
+                               bath=transport.BoundaryBath(
+                                   g_bnd=np.zeros(n_dom),
+                                   c_res=np.zeros(11)))
+    assert np.array_equal(r0.delta, rz.delta)
+    assert np.array_equal(rz.boundary_net, np.zeros(11))
+
+
+def test_boundary_coupling_halfcell_sum():
+    liquid = np.zeros((4, 4, 4))
+    liquid[0] = 0.5                     # wet low-z face
+    liquid[-1, :2] = 0.5                # partially wet high-z face
+    labels, n_cl = transport.label_clusters(liquid, (False, True, True))
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 4)
+    g = np.where(liquid > 0, 0.3, 0.7)  # dry voxels conduct via gel: ignored
+    low = transport.boundary_coupling(d_id, n_dom, g, 0, True, False)
+    high = transport.boundary_coupling(d_id, n_dom, g, 0, False, True)
+    both = transport.boundary_coupling(d_id, n_dom, g, 0, True, True)
+    assert low.sum() == pytest.approx(2.0 * 0.3 * 16)   # 16 wet face voxels
+    assert high.sum() == pytest.approx(2.0 * 0.3 * 8)   # 8 wet face voxels
+    assert np.allclose(both, low + high)
+    again = transport.boundary_coupling(d_id, n_dom, g, 0, True, True)
+    assert np.array_equal(both, again)
+
+
+def test_single_domain_bath_analytic_decay_and_ingress():
+    """RT analytic anchor 4 (PRD 6.2): (c+ - c_R) = (c - c_R)/(1 + dt*lam),
+    lam = D0*G_AR/(p*W), exactly; substeps -> exponential; ingress sign."""
+    w, g_ar, d0, p = 2.0, 0.6, 1.5, 4.0
+    lam = d0 * g_ar / (p * w)
+    graph = transport.DomainGraph(
+        n_domains=1, edge_a=np.empty(0, dtype=np.int64),
+        edge_b=np.empty(0, dtype=np.int64), edge_g=np.empty(0),
+        water=np.array([w]), dust=np.zeros(1, dtype=bool))
+    c_res = np.full(11, 0.25)
+    inv = np.full((1, 11), 3.0)         # c = 1.5 > c_res: leaches out
+    dt = 0.7
+    res = transport.exchange_be(graph, inv, dt, d0, p,
+                                bath=transport.BoundaryBath(
+                                    g_bnd=np.array([g_ar]), c_res=c_res))
+    assert res.status == "ok"
+    c0 = inv[0, 0] / w
+    c1 = (inv[0, 0] + res.delta[0, 0]) / w
+    assert c1 - 0.25 == pytest.approx((c0 - 0.25) / (1.0 + dt * lam),
+                                      rel=1e-12)
+    assert np.all(res.boundary_net < 0.0)          # out of the system
+    # substepping converges first-order to the exponential
+    cur = inv.copy()
+    for _ in range(64):
+        r = transport.exchange_be(graph, cur, dt / 64, d0, p,
+                                  bath=transport.BoundaryBath(
+                                      g_bnd=np.array([g_ar]), c_res=c_res))
+        cur = cur + r.delta
+    assert cur[0, 0] / w - 0.25 == pytest.approx(
+        (c0 - 0.25) * np.exp(-lam * dt), rel=0.01)
+    # ingress: bath above the domain concentration
+    rich = np.full(11, 5.0)
+    r_in = transport.exchange_be(graph, inv, dt, d0, p,
+                                 bath=transport.BoundaryBath(
+                                     g_bnd=np.array([g_ar]), c_res=rich))
+    assert np.all(r_in.boundary_net > 0.0)
+    # equilibrium bath: flux bounded by CG dust, not bitwise zero
+    eq = transport.exchange_be(graph, inv, dt, d0, p,
+                               bath=transport.BoundaryBath(
+                                   g_bnd=np.array([g_ar]),
+                                   c_res=np.full(11, c0)))
+    assert float(np.abs(eq.boundary_net).max()) <= 1e-24 + 1e-12 * 3.0
+
+
+def test_bath_flux_form_conservation_and_signs():
+    rng = np.random.default_rng(5)
+    k = 8
+    ea = np.arange(k - 1, dtype=np.int64)
+    eb = ea + 1
+    graph = transport.DomainGraph(
+        n_domains=k, edge_a=ea, edge_b=eb, edge_g=0.2 + rng.random(k - 1),
+        water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
+    g_bnd = np.zeros(k)
+    g_bnd[0] = 0.8                       # bath on one end
+    inv = rng.random((k, 11)) * 1e-9
+    res = transport.exchange_be(graph, inv, 2.0, 1.0, 2.0,
+                                bath=transport.BoundaryBath(
+                                    g_bnd=g_bnd, c_res=np.zeros(11)))
+    assert res.status == "ok"
+    new = inv + res.delta
+    assert np.all(new >= 0.0)
+    # domain loss equals the boundary accumulator (per element, to the
+    # exchange-gate tolerance - summation order dust only)
+    for e in range(11):
+        loss = float(res.delta[:, e].sum())
+        assert loss == pytest.approx(float(res.boundary_net[e]),
+                                     abs=1e-24 + 1e-12 * float(
+                                         np.abs(res.delta[:, e]).sum()))
+    assert np.all(res.boundary_net <= 0.0)   # pure-water bath only leaches
+    res2 = transport.exchange_be(graph, inv, 2.0, 1.0, 2.0,
+                                 bath=transport.BoundaryBath(
+                                     g_bnd=g_bnd, c_res=np.zeros(11)))
+    assert np.array_equal(res.delta, res2.delta)
+
+
+def test_boundary_config_refusals():
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    good_dom = {"tile_vox": 8, "d0_m2_s": 1e-9}
+    bath = {"axis": "z", "side": "low", "composition_mol_per_m3": {}}
+    for transport_cfg, err in (
+            ({"domains": good_dom,
+              "boundary": {**bath, "composition_mol_per_m3": {"Xx": 1.0}}},
+             "unknown bath elements"),
+            ({"domains": good_dom,
+              "boundary": {**bath,
+                           "composition_mol_per_m3": {"Na": -1.0}}},
+             "finite number"),
+            ({"boundary": bath}, "needs transport.domains"),
+            ({"domains": good_dom, "boundary": bath}, "gems3k")):
+        with pytest.raises(Exception, match=err):
+            TinnConfig.model_validate({**raw, "transport": transport_cfg})
+
+
+def test_boundary_engine_run_closes_forced_and_restarts(tmp_path):
+    """Fake snapshot backend, pure-water bath on z-low: elements leave with
+    the closure identity intact (zero ledger edits), bath-coupled domains
+    stay forced under a huge dirty threshold, and an interrupted run
+    restarts bit-identically (cumulative boundary ledger included)."""
+    # tile 16 (8 domains) and a small fixed parcel: the fake emits a
+    # constant assemblage PER CALL, so per-domain water must cover it
+    tr = {"domains": {"tile_vox": 16, "d0_m2_s": 1e-9, "dirty_rtol": 1e9,
+                      "eq_max_age_steps": 1000},
+          "boundary": {"axis": "z", "side": "low",
+                       "composition_mol_per_m3": {}}}
+    cfg = _fake_cfg(transport=tr)
+    b = TwoEndmemberSnapshotBackend(csh_mol=2e-13, tob_frac=0.5)
+    eng = Engine(cfg, reaction_backend=b)
+    s0 = eng.initial_state()
+    t1, rej, m1 = eng.try_step(s0, 2.0)
+    assert rej is None
+    t2, rej, m2 = eng.try_step(t1, 2.0)
+    assert rej is None
+    assert m2["n_boundary_coupled"] > 0.0
+    assert m2["n_gem_selected"] >= m2["n_boundary_coupled"]  # forced
+    assert 0.0 <= m2["boundary_supply_ratio"]
+    leached = t2.boundary_exchanged_elements
+    assert float(leached.sum()) < 0.0            # net out into pure water
+    rep = ledger.check_all(t2, REG)
+    assert rep.ok, rep.violations
+    # restart bit identity through run(): straight vs resumed
+    cfg2 = _fake_cfg(transport=tr)
+    straight, _ = Engine(cfg2, reaction_backend=TwoEndmemberSnapshotBackend(
+        2e-13, 0.5)).run(out_dir=str(tmp_path / "s"))
+    mid = load_checkpoint(str(tmp_path / "s" / "ckpt_000"), REG)
+    restarted, _ = Engine(mid.config,
+                          reaction_backend=TwoEndmemberSnapshotBackend(
+                              2e-13, 0.5)).run(state=mid)
+    assert restarted.full_hash() == straight.full_hash()
+
+
+@needs_gems
+def test_boundary_gems_leach_closes(rt_full, tmp_path):
+    """PC bundle, pure-water bath, short horizon: completes, closes, Ca
+    accumulator negative, trajectory differs from the sealed twin."""
+    full_state, _ = rt_full
+    cfg = _gems_cfg(transport={
+        "domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9},
+        "boundary": {"axis": "z", "side": "low",
+                     "composition_mol_per_m3": {}}})
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "leach"))
+    rep = ledger.check_all(state, REG)
+    assert rep.ok, rep.violations
+    from tinn.registry import ELEMENT_IDS
+    assert state.boundary_exchanged_elements[
+        ELEMENT_IDS.index("Ca")] < 0.0
+    assert state.full_hash() != full_state.full_hash()
+
+
 # ---------------- mode B: coupled GEMS gates ------------------------------
 
 @needs_gems

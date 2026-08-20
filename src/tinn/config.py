@@ -14,8 +14,8 @@ from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
-from .registry import (KINETIC_PHASE_IDS, SALT_PHASE_IDS, SCM_PHASE_IDS,
-                       default_registry)
+from .registry import (ELEMENT_IDS, KINETIC_PHASE_IDS, SALT_PHASE_IDS,
+                       SCM_PHASE_IDS, default_registry)
 
 # The rasterizer's periodic bounding box needs d/h + sqrt(3) + 2 voxels
 # (half-diagonal halo on each side plus floor granularity); keep in sync with
@@ -421,6 +421,39 @@ class ScmComposition(BaseModel):
         return self
 
 
+class BoundaryReservoirConfig(BaseModel):
+    """RT-W3 (PRD 4.6.3): fixed-composition bath on declared exposed
+    face(s) = a continuously-renewed reservoir imposed as a surface
+    boundary condition. Declaring ANY side de-periodizes labeling and the
+    domain graph along the whole axis (the seam is one identification;
+    an un-coupled face becomes a sealed no-flux wall). Solutes only —
+    boundary_water_mol stays 0."""
+    model_config = _STRICT
+    axis: Literal["z", "y", "x"]           # dense arrays are (z, y, x)
+    side: Literal["low", "high", "both"]   # low = index 0
+    # dissolved ELEMENT concentrations, mol per m^3 of capillary water
+    # (volumetric — the solver's c = n/W basis; ~molarity*1000 for dilute
+    # baths). {} = pure (deionized, continuously renewed) water. Compose
+    # ONLY from neutral formula units (NaOH c -> {Na: c, O: c, H: c};
+    # the element state has no charge coordinate, so Na alone would be
+    # metallic sodium). Solvent H/O are NOT part of the composition.
+    composition_mol_per_m3: Dict[str, float]
+
+    @model_validator(mode="after")
+    def _check(self) -> "BoundaryReservoirConfig":
+        unknown = set(self.composition_mol_per_m3) - set(ELEMENT_IDS)
+        if unknown:
+            raise ValueError(
+                f"unknown bath elements {sorted(unknown)}; allowed: "
+                f"{list(ELEMENT_IDS)}")
+        for el, c in self.composition_mol_per_m3.items():
+            if isinstance(c, bool) or not math.isfinite(c) or c < 0.0:
+                raise ValueError(
+                    f"bath concentration of {el} must be a finite number "
+                    f">= 0 mol/m^3, got {c!r}")
+        return self
+
+
 class DomainPartitionConfig(BaseModel):
     """Mode C (PRD 4.6.2): sub-cluster equilibration domains from a static
     axis-aligned tiling, coupled by implicit diffusion on the domain graph."""
@@ -461,6 +494,8 @@ class TransportConfig(BaseModel):
     # (per-domain dissolution/placement), which lets the partition gates
     # run GEMS-free.
     domains: Optional[DomainPartitionConfig] = None
+    # RT-W3 boundary reservoir (PRD 4.6.3). None => sealed periodic RVE.
+    boundary: Optional[BoundaryReservoirConfig] = None
     # Mode B: rate-limited re-equilibration (PRD 4.6.1). Per step, only the
     # fraction f = min(1, dt/tau) of each domain's owned solid-solution
     # inventory is offered to the equilibrium; the withheld remainder keeps
@@ -514,6 +549,11 @@ class TransportConfig(BaseModel):
                     "exchange_tau_h_per_phase contains only 0.0 (= fully "
                     "offered) and there is no global exchange_tau_h - the "
                     "section declares rate limiting but limits nothing")
+        if self.boundary is not None and self.domains is None:
+            raise ValueError(
+                "transport.boundary needs transport.domains - the bath "
+                "couples to the domain graph (tile_vox == grid_size gives "
+                "one reactor per cluster)")
         return self
 
     def rate_limited(self) -> bool:
@@ -686,6 +726,15 @@ class TinnConfig(BaseModel):
                 f"{self.transport.domains.tile_vox} does not divide the "
                 f"grid size {self.rve.grid_size} - tiles must wrap "
                 f"periodically")
+        if (self.transport is not None and self.transport.boundary is not None
+                and self.chemistry.backend != "gems3k"):
+            # the stoichiometric backend's solution ledger is identically
+            # empty (residual = inventory, initially zeros): a bath is a
+            # literal no-op or injects elements no chemistry can consume
+            raise ValueError(
+                "transport.boundary needs the gems3k backend - the "
+                "stoichiometric backend carries no solution inventory, so "
+                "a bath would be a silent no-op, which is refused")
         return self
 
     def config_hash(self) -> str:
