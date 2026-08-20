@@ -183,10 +183,10 @@ def test_label_domains_tiling_and_degenerate_limit():
     rng = np.random.default_rng(7)
     liquid = (rng.random((8, 8, 8)) > 0.4) * 0.5
     labels, n_cl = transport.label_clusters(liquid)
-    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, 8)
+    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, (8, 8, 8))
     assert d_id is labels and n_dom == n_cl
     assert np.array_equal(d2c, np.arange(n_cl))
-    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, 4)
+    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, (4, 4, 4))
     assert n_dom >= n_cl
     wet = labels >= 0
     assert np.all(d_id[wet] >= 0) and np.all(d_id[~wet] == -1)
@@ -195,17 +195,19 @@ def test_label_domains_tiling_and_degenerate_limit():
         cl = np.unique(labels[d_id == d])
         assert cl.size == 1 and cl[0] == d2c[d]
     # determinism across recomputation
-    d_id2, n2, d2c2 = transport.label_domains(labels, n_cl, 4)
+    d_id2, n2, d2c2 = transport.label_domains(labels, n_cl, (4, 4, 4))
     assert n2 == n_dom and np.array_equal(d_id, d_id2)
     assert np.array_equal(d2c, d2c2)
 
 
-def _two_domain_graph(w1, w2, g_edge):
+def _two_domain_graph(w1, w2, g_edge, pitch):
+    # edge_g carries geometric transmissibility G/p since the W4 per-axis
+    # pitch generalization
     return transport.DomainGraph(
         n_domains=2,
         edge_a=np.array([0], dtype=np.int64),
         edge_b=np.array([1], dtype=np.int64),
-        edge_g=np.array([g_edge]),
+        edge_g=np.array([g_edge / pitch]),
         water=np.array([w1, w2]),
         dust=np.zeros(2, dtype=bool))
 
@@ -218,8 +220,8 @@ def test_two_domain_exchange_matches_analytic_decay():
     lam = (d0 * g_edge / p) * (1.0 / w1 + 1.0 / w2)
     inv = np.array([[6.0], [0.0]])
     dt = 0.8
-    res = transport.exchange_be(_two_domain_graph(w1, w2, g_edge), inv, dt,
-                                d0, p)
+    res = transport.exchange_be(_two_domain_graph(w1, w2, g_edge, p),
+                                inv, dt, d0)
     assert res.status == "ok"
     new = inv + res.delta
     dc0 = inv[0, 0] / w1 - inv[1, 0] / w2
@@ -231,8 +233,8 @@ def test_two_domain_exchange_matches_analytic_decay():
     for n_sub, tol in ((8, 0.05), (64, 0.007)):
         cur = inv.copy()
         for _ in range(n_sub):
-            r = transport.exchange_be(_two_domain_graph(w1, w2, g_edge),
-                                      cur, dt / n_sub, d0, p)
+            r = transport.exchange_be(_two_domain_graph(w1, w2, g_edge, p),
+                                      cur, dt / n_sub, d0)
             cur = cur + r.delta
         dcn = cur[0, 0] / w1 - cur[1, 0] / w2
         assert dcn == pytest.approx(dc0 * np.exp(-lam * dt), rel=tol)
@@ -249,10 +251,10 @@ def test_ring_exchange_invariants():
     lo, hi = np.minimum(ea, eb), np.maximum(ea, eb)
     graph = transport.DomainGraph(
         n_domains=k, edge_a=lo, edge_b=hi,
-        edge_g=0.1 + rng.random(k),
+        edge_g=(0.1 + rng.random(k)) / 2.0,
         water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
     inv = rng.random((k, 11)) * 1e-9
-    res = transport.exchange_be(graph, inv, 5.0, 2.0, 2.0)
+    res = transport.exchange_be(graph, inv, 5.0, 2.0)
     assert res.status == "ok"
     new = inv + res.delta
     assert np.all(new >= 0.0)
@@ -261,10 +263,10 @@ def test_ring_exchange_invariants():
             float(inv[:, e].sum()), rel=1e-13)
     # uniform c stationary: n = W * const per element
     uni = np.outer(graph.water, np.linspace(0.5, 1.5, 11)) * 1e-8
-    res_u = transport.exchange_be(graph, uni, 5.0, 2.0, 2.0)
+    res_u = transport.exchange_be(graph, uni, 5.0, 2.0)
     assert float(np.abs(res_u.delta).max()) <= 1e-22
     # determinism
-    res2 = transport.exchange_be(graph, inv, 5.0, 2.0, 2.0)
+    res2 = transport.exchange_be(graph, inv, 5.0, 2.0)
     assert np.array_equal(res.delta, res2.delta)
 
 
@@ -314,7 +316,7 @@ def test_subdomain_stoich_run_closes_and_is_deterministic(tmp_path):
     rep = ledger.check_all(s1, REG)
     assert rep.ok, rep.violations
     labels, n_cl = transport.label_clusters(s1.capillary_liquid)
-    _, n_dom, _ = transport.label_domains(labels, n_cl, 8)
+    _, n_dom, _ = transport.label_domains(labels, n_cl, (8, 8, 8))
     assert s1.cluster_inventory.shape[0] == n_dom
     assert n_dom > n_cl
     s2, _ = Engine(cfg).run(out_dir=str(tmp_path / "b"))
@@ -454,15 +456,15 @@ def test_domain_graph_exposed_wrap_edge_excluded():
     liquid[:, 2, 2] = 0.5              # a full z-column: bridge + both faces
     labels, n_cl = transport.label_clusters(liquid, (False, True, True))
     assert n_cl == 1
-    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 2)
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, (2, 2, 2))
     g = np.where(liquid > 0, 0.5, 0.0)
     g_per = transport.build_domain_graph(d_id, n_dom, g, liquid)
     g_exp = transport.build_domain_graph(d_id, n_dom, g, liquid,
                                          (False, True, True))
     assert g_per.edge_a.size == g_exp.edge_a.size + 1   # exactly the seam
     inv = np.linspace(1.0, 2.0, n_dom)[:, None] * np.ones((1, 11)) * 1e-10
-    r0 = transport.exchange_be(g_exp, inv, 1.0, 2.0, 2.0)
-    rz = transport.exchange_be(g_exp, inv, 1.0, 2.0, 2.0,
+    r0 = transport.exchange_be(g_exp, inv, 1.0, 2.0)
+    rz = transport.exchange_be(g_exp, inv, 1.0, 2.0,
                                bath=transport.BoundaryBath(
                                    g_bnd=np.zeros(n_dom),
                                    c_res=np.zeros(11)))
@@ -475,7 +477,7 @@ def test_boundary_coupling_halfcell_sum():
     liquid[0] = 0.5                     # wet low-z face
     liquid[-1, :2] = 0.5                # partially wet high-z face
     labels, n_cl = transport.label_clusters(liquid, (False, True, True))
-    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 4)
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, (4, 4, 4))
     g = np.where(liquid > 0, 0.3, 0.7)  # dry voxels conduct via gel: ignored
     low = transport.boundary_coupling(d_id, n_dom, g, 0, True, False)
     high = transport.boundary_coupling(d_id, n_dom, g, 0, False, True)
@@ -499,9 +501,10 @@ def test_single_domain_bath_analytic_decay_and_ingress():
     c_res = np.full(11, 0.25)
     inv = np.full((1, 11), 3.0)         # c = 1.5 > c_res: leaches out
     dt = 0.7
-    res = transport.exchange_be(graph, inv, dt, d0, p,
+    res = transport.exchange_be(graph, inv, dt, d0,
                                 bath=transport.BoundaryBath(
-                                    g_bnd=np.array([g_ar]), c_res=c_res))
+                                    g_bnd=np.array([g_ar / p]),
+                                    c_res=c_res))
     assert res.status == "ok"
     c0 = inv[0, 0] / w
     c1 = (inv[0, 0] + res.delta[0, 0]) / w
@@ -511,22 +514,24 @@ def test_single_domain_bath_analytic_decay_and_ingress():
     # substepping converges first-order to the exponential
     cur = inv.copy()
     for _ in range(64):
-        r = transport.exchange_be(graph, cur, dt / 64, d0, p,
+        r = transport.exchange_be(graph, cur, dt / 64, d0,
                                   bath=transport.BoundaryBath(
-                                      g_bnd=np.array([g_ar]), c_res=c_res))
+                                      g_bnd=np.array([g_ar / p]),
+                                      c_res=c_res))
         cur = cur + r.delta
     assert cur[0, 0] / w - 0.25 == pytest.approx(
         (c0 - 0.25) * np.exp(-lam * dt), rel=0.01)
     # ingress: bath above the domain concentration
     rich = np.full(11, 5.0)
-    r_in = transport.exchange_be(graph, inv, dt, d0, p,
+    r_in = transport.exchange_be(graph, inv, dt, d0,
                                  bath=transport.BoundaryBath(
-                                     g_bnd=np.array([g_ar]), c_res=rich))
+                                     g_bnd=np.array([g_ar / p]),
+                                     c_res=rich))
     assert np.all(r_in.boundary_net > 0.0)
     # equilibrium bath: flux bounded by CG dust, not bitwise zero
-    eq = transport.exchange_be(graph, inv, dt, d0, p,
+    eq = transport.exchange_be(graph, inv, dt, d0,
                                bath=transport.BoundaryBath(
-                                   g_bnd=np.array([g_ar]),
+                                   g_bnd=np.array([g_ar / p]),
                                    c_res=np.full(11, c0)))
     assert float(np.abs(eq.boundary_net).max()) <= 1e-24 + 1e-12 * 3.0
 
@@ -537,14 +542,15 @@ def test_bath_flux_form_conservation_and_signs():
     ea = np.arange(k - 1, dtype=np.int64)
     eb = ea + 1
     graph = transport.DomainGraph(
-        n_domains=k, edge_a=ea, edge_b=eb, edge_g=0.2 + rng.random(k - 1),
+        n_domains=k, edge_a=ea, edge_b=eb,
+        edge_g=(0.2 + rng.random(k - 1)) / 2.0,
         water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
     g_bnd = np.zeros(k)
     g_bnd[0] = 0.8                       # bath on one end
     inv = rng.random((k, 11)) * 1e-9
-    res = transport.exchange_be(graph, inv, 2.0, 1.0, 2.0,
+    res = transport.exchange_be(graph, inv, 2.0, 1.0,
                                 bath=transport.BoundaryBath(
-                                    g_bnd=g_bnd, c_res=np.zeros(11)))
+                                    g_bnd=g_bnd / 2.0, c_res=np.zeros(11)))
     assert res.status == "ok"
     new = inv + res.delta
     assert np.all(new >= 0.0)
@@ -556,9 +562,9 @@ def test_bath_flux_form_conservation_and_signs():
                                      abs=1e-24 + 1e-12 * float(
                                          np.abs(res.delta[:, e]).sum()))
     assert np.all(res.boundary_net <= 0.0)   # pure-water bath only leaches
-    res2 = transport.exchange_be(graph, inv, 2.0, 1.0, 2.0,
+    res2 = transport.exchange_be(graph, inv, 2.0, 1.0,
                                  bath=transport.BoundaryBath(
-                                     g_bnd=g_bnd, c_res=np.zeros(11)))
+                                     g_bnd=g_bnd / 2.0, c_res=np.zeros(11)))
     assert np.array_equal(res.delta, res2.delta)
 
 
@@ -626,16 +632,16 @@ def test_boundary_mirror_symmetry():
     liquid = np.zeros((n, n, n))
     liquid[:, 3:5, 3:5] = 0.4           # a z-column, mirror-symmetric in z
     labels, n_cl = transport.label_clusters(liquid, (False, True, True))
-    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 2)
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, (2, 2, 2))
     g = np.where(liquid > 0, 0.5, 0.0)
     graph = transport.build_domain_graph(d_id, n_dom, g, liquid,
                                          (False, True, True))
     g_ar = transport.boundary_coupling(d_id, n_dom, g, 0, True, True)
     # z-symmetric inventory profile: n proportional to water, uniform c
     inv = np.outer(graph.water, np.ones(11)) * 2.5e-10
-    res = transport.exchange_be(graph, inv, 1.0, 2.0, 2.0,
+    res = transport.exchange_be(graph, inv, 1.0, 2.0,
                                 bath=transport.BoundaryBath(
-                                    g_bnd=g_ar, c_res=np.zeros(11)))
+                                    g_bnd=g_ar / 2.0, c_res=np.zeros(11)))
     assert res.status == "ok"
     # per-z-layer delta via domain -> layer map (tile 2 => 4 z-bands)
     layer_delta = np.zeros((n // 2, 11))
@@ -646,6 +652,112 @@ def test_boundary_mirror_symmetry():
     for b in range(n // 4):
         assert np.allclose(layer_delta[b], layer_delta[-1 - b],
                            rtol=1e-12, atol=1e-30)
+
+
+# ---------------- RT-W4 enablers ------------------------------------------
+
+def test_boundary_start_h_pre_window_is_bitwise_sealed(tmp_path):
+    """start_h delays the bath: up to that output boundary the run is fully
+    periodic and bit-identical to the same config WITHOUT the boundary -
+    the honest structural gate for the mature-paste protocol."""
+    dom = {"tile_vox": 16, "d0_m2_s": 1e-9}
+    sealed_cfg = _fake_cfg(transport={"domains": dom})
+    exposed_cfg = _fake_cfg(transport={
+        "domains": dom,
+        "boundary": {"axis": "z", "side": "low", "start_h": 2.0,
+                     "composition_mol_per_m3": {}}})
+    b = lambda: TwoEndmemberSnapshotBackend(csh_mol=2e-13, tob_frac=0.5)
+    s_sealed, _ = Engine(sealed_cfg, reaction_backend=b()).run(
+        out_dir=str(tmp_path / "sealed"))
+    s_exp, _ = Engine(exposed_cfg, reaction_backend=b()).run(
+        out_dir=str(tmp_path / "exposed"))
+    mid_sealed = load_checkpoint(str(tmp_path / "sealed" / "ckpt_000"), REG)
+    mid_exp = load_checkpoint(str(tmp_path / "exposed" / "ckpt_000"), REG)
+    assert mid_exp.dense_hash() == mid_sealed.dense_hash()   # t = 2 h
+    # after start_h the bath engages and the trajectories diverge
+    assert s_exp.full_hash() != s_sealed.full_hash()
+    assert float(s_exp.boundary_exchanged_elements.sum()) < 0.0
+    # start_h off an output boundary is refused
+    with pytest.raises(Exception, match="coincide with an output"):
+        _fake_cfg(transport={
+            "domains": dom,
+            "boundary": {"axis": "z", "side": "low", "start_h": 1.7,
+                         "composition_mol_per_m3": {}}})
+
+
+def test_banded_tiles_partition_and_hash():
+    """tile_zyx banded tiling (transverse = grid): bands along z only, the
+    W3-review cost lever; absent tile_zyx keeps the cubic hash."""
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    base = TinnConfig.model_validate({**raw, "transport": {
+        "domains": {"tile_vox": 8, "d0_m2_s": 1e-9}}}).config_hash()
+    with_none = TinnConfig.model_validate({**raw, "transport": {
+        "domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
+                    "tile_zyx": None}}}).config_hash()
+    assert with_none == base
+    banded = TinnConfig.model_validate({**raw, "transport": {
+        "domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
+                    "tile_zyx": (4, 32, 32)}}})
+    assert banded.config_hash() != base
+    with pytest.raises(Exception, match="does not divide"):
+        TinnConfig.model_validate({**raw, "transport": {
+            "domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
+                        "tile_zyx": (5, 32, 32)}}})
+    # banded labeling: domains = clusters x z-bands
+    rng = np.random.default_rng(9)
+    liquid = (rng.random((8, 8, 8)) > 0.35) * 0.5
+    labels, n_cl = transport.label_clusters(liquid)
+    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, (2, 8, 8))
+    assert n_dom >= n_cl
+    for d in range(n_dom):
+        zs = np.flatnonzero((d_id == d).any(axis=(1, 2)))
+        assert zs.max() - zs.min() <= 1          # confined to one 2-band
+        cl = np.unique(labels[d_id == d])
+        assert cl.size == 1 and cl[0] == d2c[d]
+
+
+def test_dt_windows_schedule_and_hash():
+    """Ported dt_windows (verbatim from platform WIP): validation matrix,
+    absent windows keep the legacy hash, and the engine honors the caps."""
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    base = TinnConfig.model_validate(raw).config_hash()
+    raw2 = json.loads(json.dumps(raw))
+    raw2["schedule"]["dt_windows"] = None
+    assert TinnConfig.model_validate(raw2).config_hash() == base
+    good = json.loads(json.dumps(raw))
+    good["schedule"] = {"output_times_h": [24.0, 168.0], "dt_initial_h": 6.0,
+                        "dt_min_h": 0.01,
+                        "dt_windows": [{"until_h": 24.0, "dt_h": 6.0},
+                                       {"until_h": 168.0, "dt_h": 12.0}]}
+    cfg = TinnConfig.model_validate(good)
+    assert cfg.schedule.dt_cap_at(1.0) == 6.0
+    assert cfg.schedule.dt_cap_at(30.0) == 12.0
+    assert cfg.schedule.next_window_end_after(1.0) == 24.0
+    for bad in ([{"until_h": 24.0, "dt_h": 5.0}],                # != initial
+                [{"until_h": 24.0, "dt_h": 6.0}],                # short cover
+                [{"until_h": 24.0, "dt_h": 6.0},
+                 {"until_h": 20.0, "dt_h": 1.0}],                # not increasing
+                [{"until_h": 168.0, "dt_h": 0.001}]):            # < dt_min
+        b2 = json.loads(json.dumps(good))
+        b2["schedule"]["dt_windows"] = bad
+        with pytest.raises(Exception):
+            TinnConfig.model_validate(b2)
+    # engine honors the caps: accepted dts never exceed the window cap
+    run_raw = json.loads(json.dumps(raw))
+    run_raw["schedule"] = {"output_times_h": [12.0, 24.0], "dt_initial_h": 3.0,
+                           "dt_min_h": 0.01,
+                           "dt_windows": [{"until_h": 12.0, "dt_h": 3.0},
+                                          {"until_h": 24.0, "dt_h": 6.0}]}
+    caps = []
+
+    def hook(ev):
+        if ev.get("event") == "step_accepted":
+            caps.append((ev["time_end_h"], ev["dt_accepted_h"],
+                         ev["scheduled_dt_cap_h"]))
+    Engine(TinnConfig.model_validate(run_raw)).run(audit_hook=hook)
+    assert all(dt <= cap + 1e-12 for _, dt, cap in caps)
+    assert any(cap == 6.0 for _, _, cap in caps)
+    assert any(cap == 3.0 for _, _, cap in caps)
 
 
 @needs_gems

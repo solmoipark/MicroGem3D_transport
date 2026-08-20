@@ -299,6 +299,45 @@ def casi_channel(state: SimulationState) -> Optional[str]:
     return best
 
 
+def boundary_profiles(state: SimulationState, axis: int) -> Dict:
+    """v4.0/RT-W4 (PRD 4.6.3): per-layer observables along the exposed
+    axis — the leaching-front diagnostics. Layer index 0 = the low face.
+    `ch_front_depth_vox` is the number of layers, counted from the low
+    face, whose portlandite volume has dropped below half the profile's
+    maximum (NaN-free: -1 when the bundle has no portlandite channel or
+    no CH exists). Read with the wrap guard of PRD 4.6.3: fits exclude
+    the first 4 layers and the back halo."""
+    other = tuple(a for a in range(3) if a != axis)
+    ch_idx = None
+    for name in ("Portlandite", "CH"):
+        if name in state.hydrate_ids:
+            ch_idx = state.hydrate_ids.index(name)
+            break
+    out: Dict = {
+        "layer_liquid_vol": state.capillary_liquid.sum(axis=other).tolist(),
+        "layer_hydrate_vol": state.hydrate_fraction.sum(
+            axis=0).sum(axis=other).tolist(),
+        "layer_anhydrous_vol": state.anhydrous_fraction.sum(
+            axis=0).sum(axis=other).tolist(),
+    }
+    if ch_idx is None:
+        out["layer_CH_vol"] = None
+        out["ch_front_depth_vox"] = -1
+        return out
+    prof = state.hydrate_fraction[ch_idx].sum(axis=other)
+    out["layer_CH_vol"] = prof.tolist()
+    peak = float(prof.max())
+    if peak <= 0.0:
+        out["ch_front_depth_vox"] = -1
+        return out
+    depleted = prof < 0.5 * peak
+    front = 0
+    while front < prof.size and depleted[front]:
+        front += 1
+    out["ch_front_depth_vox"] = int(front)
+    return out
+
+
 def cluster_ca_si(state: SimulationState) -> Dict[int, float]:
     """E2 observable (PRD 4.5 v3.0): Ca/Si of each cluster's holdings in the
     dominant silicate solid-solution channel (see casi_channel), from the

@@ -130,25 +130,32 @@ def conductance_field(capillary_liquid: np.ndarray,
     return g
 
 
-def label_domains(labels: np.ndarray, n_clusters: int, tile_vox: int
+def label_domains(labels: np.ndarray, n_clusters: int,
+                  tiles: Tuple[int, int, int]
                   ) -> Tuple[np.ndarray, int, np.ndarray]:
     """Equilibration domains = connected cluster INTERSECTED with a static
-    axis-aligned tiling (PRD 4.6.2). tile_vox == grid size returns the
-    cluster labels themselves - the literal legacy identity the 1-domain
-    bit-compare gate relies on. Ids are consecutive, ordered by
-    (cluster id, tile index): deterministic, restart-stable, periodic-aware
-    (tiles wrap because the grid size is a multiple of tile_vox).
+    axis-aligned tiling (PRD 4.6.2), per-axis tile edges (z, y, x) — banded
+    tilings (transverse = grid) are the planar-front cost lever of the W3
+    design review. All tiles == grid returns the cluster labels themselves,
+    the literal legacy identity the 1-domain bit-compare gate relies on.
+    Ids are consecutive, ordered by (cluster id, tile index): deterministic,
+    restart-stable, periodic-aware (each tile edge divides the grid).
 
     Returns (domain_id with -1 dry, n_domains, domain_to_cluster)."""
     n = labels.shape[0]
-    if tile_vox == n:
+    if all(t == n for t in tiles):
         return labels, n_clusters, np.arange(n_clusters, dtype=np.int64)
-    if n % tile_vox != 0:
-        raise ValueError(f"tile_vox {tile_vox} does not divide grid {n}")
-    t = n // tile_vox
-    az = np.arange(n, dtype=np.int64) // tile_vox
-    tile = (az[:, None, None] * t + az[None, :, None]) * t + az[None, None, :]
-    n_tiles = t * t * t
+    counts = []
+    idx = []
+    for ax, t in enumerate(tiles):
+        if n % t != 0:
+            raise ValueError(f"tile {t} (axis {ax}) does not divide grid {n}")
+        counts.append(n // t)
+        idx.append(np.arange(n, dtype=np.int64) // t)
+    nz, ny, nx = counts
+    tile = ((idx[0][:, None, None] * ny + idx[1][None, :, None]) * nx
+            + idx[2][None, None, :])
+    n_tiles = nz * ny * nx
     wet = labels >= 0
     key = np.where(wet, labels * n_tiles + tile, np.int64(-1))
     uniq = np.unique(key[wet]) if wet.any() else np.empty(0, dtype=np.int64)
@@ -161,9 +168,11 @@ def label_domains(labels: np.ndarray, n_clusters: int, tile_vox: int
 @dataclass
 class DomainGraph:
     """Face-adjacency graph of wet domains. edge_g carries the summed
-    harmonic face conductances of each interface; water is the liquid
-    volume per domain (vox^3). Dust domains (water below DUST_WATER_REL of
-    the mean wet-domain water) carry no edges - transport-frozen."""
+    harmonic face conductances of each interface divided by the TPFA
+    center distance (geometric transmissibility: T = d0 * edge_g); water
+    is the liquid volume per domain (vox^3). Dust domains (water below
+    DUST_WATER_REL of the mean wet-domain water) carry no edges -
+    transport-frozen."""
     n_domains: int
     edge_a: np.ndarray          # (E,) int64, edge_a < edge_b
     edge_b: np.ndarray          # (E,) int64
@@ -175,12 +184,17 @@ class DomainGraph:
 def build_domain_graph(domain_id: np.ndarray, n_domains: int,
                        g: np.ndarray, liquid: np.ndarray,
                        periodic_axes: Tuple[bool, bool, bool] = (True, True,
-                                                                 True)
+                                                                 True),
+                       pitch_zyx: Tuple[float, float, float] = (1.0, 1.0,
+                                                                1.0)
                        ) -> DomainGraph:
     """Edges between face-adjacent wet voxels of DIFFERENT domains (always
     domains of the same cluster, by construction of the 6-neighbor flood).
     Face conductance is the harmonic mean 2ab/(a+b) - the same rule as the
-    report's diffusivity network - summed over the interface. Wrap faces
+    report's diffusivity network - summed over the interface and DIVIDED by
+    that axis's TPFA center distance pitch_zyx[ax] (the tile edge along the
+    interface normal — per-axis since W4's anisotropic tiles). edge_g is
+    therefore geometric transmissibility: T = d0 * edge_g. Wrap faces
     included on periodic axes; a non-periodic (exposed) axis drops its
     seam pair — MANDATORY once labels are de-periodized, else the seam
     edge would join different clusters (v4.0/RT-W3). Deterministic order."""
@@ -219,7 +233,7 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
         face = np.where(s > 0.0, 2.0 * fa * fb / np.where(s > 0.0, s, 1.0),
                         0.0)
         keys.append(lo * np.int64(n_domains) + hi)
-        conds.append(face)
+        conds.append(face / float(pitch_zyx[ax]))
     if keys:
         key = np.concatenate(keys)
         cond = np.concatenate(conds)
@@ -240,11 +254,12 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
 @dataclass
 class BoundaryBath:
     """v4.0/RT-W3 fixed-composition ghost reservoir (PRD 4.6.3). g_bnd is
-    the per-domain half-cell conductance sum to the declared exposed
-    face(s) — Σ 2g over WET face-layer voxels, the network solver's
-    Dirichlet rule gin = 2·g_a; exchange_be scales it by d0/p exactly as
-    it scales edge_g (the factor 2 lives HERE, once). c_res is the bath
-    concentration per element in mol per vox^3 of liquid (c = n/W
+    the per-domain half-cell coupling ALREADY divided by the exposed
+    axis's tile pitch (geometric transmissibility, like edge_g): the
+    caller builds boundary_coupling(...) / pitch, where boundary_coupling
+    carries the network solver's Dirichlet factor Σ 2·g_a — each scaling
+    lives in exactly one place. exchange_be applies d0 only. c_res is the
+    bath concentration per element in mol per vox^3 of liquid (c = n/W
     units)."""
     g_bnd: np.ndarray            # (D,) float64 >= 0; 0 = uncoupled
     c_res: np.ndarray            # (E,) float64 >= 0
@@ -283,7 +298,7 @@ class ExchangeResult:
 
 
 def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
-                d0_vox2_h: float, pitch_vox: float,
+                d0_vox2_h: float,
                 bath: Optional[BoundaryBath] = None,
                 tol: float = 1e-12, max_iter: int = 10000) -> ExchangeResult:
     """One backward-Euler diffusion step on the domain graph, in FLUX FORM
@@ -300,11 +315,11 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     # edges (an isolated surface-connected pore physically leaches)
     t_bnd = None
     if bath is not None and np.any(bath.g_bnd > 0.0):
-        t_bnd = d0_vox2_h * bath.g_bnd / pitch_vox
+        t_bnd = d0_vox2_h * bath.g_bnd
     if dt_h <= 0.0 or (graph.edge_a.size == 0 and t_bnd is None):
         return ExchangeResult(delta, "ok", 0, 0.0, 0.0, np.zeros(n_elem))
     ea, eb = graph.edge_a, graph.edge_b
-    t_e = d0_vox2_h * graph.edge_g / pitch_vox      # vox^3 / h
+    t_e = d0_vox2_h * graph.edge_g                  # vox^3 / h
     # only edge-connected (or bath-coupled) domains participate; the
     # diagonal floors at a tiny positive value on those rows
     act = np.zeros(n_dom, dtype=bool)

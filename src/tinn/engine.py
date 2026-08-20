@@ -155,8 +155,10 @@ class Engine:
             if self._economy:
                 # deferred domains raise the memo pressure: quiescent
                 # inputs recur across steps (PRD 4.6.2)
-                n_tiles = (config.rve.grid_size
-                           // self._domains_cfg.tile_vox) ** 3
+                tz, ty, tx = self._domains_cfg.tiles(config.rve.grid_size)
+                n_tiles = ((config.rve.grid_size // tz)
+                           * (config.rve.grid_size // ty)
+                           * (config.rve.grid_size // tx))
                 cap = max(256, min(4 * n_tiles, 8192))
                 if hasattr(self.backend, "memo_cap"):
                     self.backend.memo_cap = cap
@@ -180,6 +182,7 @@ class Engine:
             self._b_high = self._boundary.side in ("high", "both")
             self._periodic_axes = tuple(
                 i != self._b_axis for i in range(3))
+            self._b_start = self._boundary.start_h or 0.0
             # mol per m^3 of capillary water -> mol per vox^3 of liquid
             vox_m3 = (config.rve.voxel_size_um * 1e-6) ** 3
             c_res = np.zeros(len(ELEMENT_IDS))
@@ -231,8 +234,14 @@ class Engine:
                 trial.phase_mol[s])
 
         prev_liquid = trial.capillary_liquid.copy()
-        cl_labels, n_cl = transport.label_clusters(prev_liquid,
-                                                   self._periodic_axes)
+        # RT-W4: a declared bath activates at start_h (an output boundary,
+        # validated) - before it the run is SEALED and fully periodic,
+        # bit-identical to a boundary-free config (mature-paste protocol:
+        # hydrate first, then expose)
+        bath_active = (self._boundary is not None
+                       and trial.time_h >= self._b_start - 1e-12)
+        axes_now = self._periodic_axes if bath_active else (True, True, True)
+        cl_labels, n_cl = transport.label_clusters(prev_liquid, axes_now)
         # v4.0/RT mode C (PRD 4.6.2): the reactor key is the DOMAIN — cluster
         # intersected with a static tile. The degenerate tile == grid case
         # WITHOUT the economy takes the mode-full aliases outright, so the
@@ -241,11 +250,13 @@ class Engine:
         # economy on, tile == grid legitimately means cluster-level
         # deferral and keeps the domain machinery.
         dom_active = self._domains_cfg is not None and (
-            self._domains_cfg.tile_vox != trial.grid_size or self._economy
-            or self._boundary is not None)
+            any(t != trial.grid_size
+                for t in self._domains_cfg.tiles(trial.grid_size))
+            or self._economy or bath_active)
         if dom_active:
             labels, n_clusters, dom_to_cl = transport.label_domains(
-                cl_labels, n_cl, self._domains_cfg.tile_vox)
+                cl_labels, n_cl,
+                self._domains_cfg.tiles(trial.grid_size))
         else:
             labels, n_clusters, dom_to_cl = cl_labels, n_cl, None
 
@@ -343,23 +354,25 @@ class Engine:
             g_field = transport.conductance_field(
                 prev_liquid, trial.hydrate_fraction, gel_eps,
                 analysis.GEL_REL_DIFFUSIVITY)
-            graph = transport.build_domain_graph(labels, n_clusters,
-                                                 g_field, prev_liquid,
-                                                 self._periodic_axes)
+            tiles = self._domains_cfg.tiles(trial.grid_size)
+            graph = transport.build_domain_graph(
+                labels, n_clusters, g_field, prev_liquid, axes_now,
+                tuple(float(t) for t in tiles))
             bath = None
             bnd_coupled = None
-            if self._boundary is not None:
+            if bath_active:
                 g_ar = transport.boundary_coupling(
                     labels, n_clusters, g_field, self._b_axis,
                     self._b_low, self._b_high)
                 g_ar[graph.dust] = 0.0   # dust domains skip the bath too
+                # ghost sits at half the exposed-axis pitch: the /pitch of
+                # the TPFA distance lives here, mirroring edge_g
+                g_ar = g_ar / float(tiles[self._b_axis])
                 bath = transport.BoundaryBath(g_bnd=g_ar,
                                               c_res=self._c_res_vox)
                 bnd_coupled = g_ar > 0.0
             ex = transport.exchange_be(graph, inv_eff, dt_h,
-                                       self._d0_vox2_h,
-                                       float(self._domains_cfg.tile_vox),
-                                       bath=bath)
+                                       self._d0_vox2_h, bath=bath)
             if ex.status != "ok":
                 return None, StepReject(REJECT_TRANSPORT_FAILURE), {}
             inv_eff = inv_eff + ex.delta
@@ -675,8 +688,7 @@ class Engine:
                     scale_c[c] = 0.0
                     residual[c] = inv_eff[c]
                     continue
-                if (self._boundary is not None
-                        and failure_reason == REJECT_BACKEND_FAILURE):
+                if bath_active and failure_reason == REJECT_BACKEND_FAILURE:
                     # RT-W3 (PRD 4.6.3): under an active bath, a drained
                     # domain (assemblage + near-pure water + solute dust)
                     # can sit on a genuine GEM/AIA knife edge that no
@@ -984,12 +996,13 @@ class Engine:
 
         # relabel + conservative inventory remap
         new_cl_labels, n_new_cl = transport.label_clusters(
-            trial.capillary_liquid, self._periodic_axes)
+            trial.capillary_liquid, axes_now)
         if dom_to_cl is None:
             new_labels, n_new = new_cl_labels, n_new_cl
         else:
             new_labels, n_new, _ = transport.label_domains(
-                new_cl_labels, n_new_cl, self._domains_cfg.tile_vox)
+                new_cl_labels, n_new_cl,
+                self._domains_cfg.tiles(trial.grid_size))
 
         def _fold_dry_rows(rows_prev, result_rows, dry):
             """v4.0/RT mode C (PRD 4.6.2 fold): a dry DOMAIN whose parent
@@ -1208,8 +1221,12 @@ class Engine:
         last_metrics: dict = {}
         for t_out in outputs:
             while state.time_h < t_out - 1e-12:
-                cruise = state.dt_h
+                dt_cap = sched.dt_cap_at(state.time_h)
+                cruise = min(state.dt_h, dt_cap)
+                window_end = sched.next_window_end_after(state.time_h)
                 dt_try = min(cruise, t_out - state.time_h)
+                if window_end is not None:
+                    dt_try = min(dt_try, window_end - state.time_h)
                 retries = 0
                 while True:
                     dense_before = (state.dense_hash()
@@ -1246,10 +1263,15 @@ class Engine:
                 trial.accept_count = state.accept_count + 1
                 # grow cruise dt; a sliver step clamped by the output boundary
                 # must not collapse an otherwise healthy step size
-                if retries == 0:
-                    trial.dt_h = min(max(dt_try * 2.0, cruise), sched.dt_initial_h)
+                next_cap = sched.dt_cap_at(trial.time_h)
+                if sched.dt_windows is not None and retries == 0:
+                    # A declared piecewise schedule is authoritative. Output
+                    # boundary slivers do not change its next prescribed cap.
+                    trial.dt_h = next_cap
+                elif retries == 0:
+                    trial.dt_h = min(max(dt_try * 2.0, cruise), next_cap)
                 else:
-                    trial.dt_h = min(dt_try * 2.0, sched.dt_initial_h)
+                    trial.dt_h = min(dt_try * 2.0, next_cap)
                 state = trial
                 last_metrics = metrics
                 if audit_hook is not None:
@@ -1258,6 +1280,7 @@ class Engine:
                         "time_start_h": float(state.time_h - dt_try),
                         "time_end_h": float(state.time_h),
                         "dt_accepted_h": float(dt_try),
+                        "scheduled_dt_cap_h": float(dt_cap),
                         "retries": int(retries),
                         "metrics": dict(metrics),
                         "injected_delta_mol": (

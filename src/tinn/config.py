@@ -353,12 +353,20 @@ class RVEConfig(BaseModel):
     seed: int = Field(ge=0)
 
 
+class TimeStepWindow(BaseModel):
+    """Piecewise-constant external timestep cap up to ``until_h``."""
+    model_config = _STRICT
+    until_h: float = Field(gt=0.0)
+    dt_h: float = Field(gt=0.0)
+
+
 class ScheduleConfig(BaseModel):
     model_config = _STRICT
     output_times_h: List[float] = Field(min_length=1)
     dt_initial_h: float = Field(default=0.01, gt=0.0)
     dt_min_h: float = Field(default=1e-4, gt=0.0)
     max_retries: int = Field(default=8, ge=1)
+    dt_windows: Optional[List[TimeStepWindow]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "ScheduleConfig":
@@ -369,7 +377,37 @@ class ScheduleConfig(BaseModel):
                 raise ValueError("output_times_h must be strictly increasing")
         if self.dt_min_h > self.dt_initial_h:
             raise ValueError("dt_min_h must be <= dt_initial_h")
+        if self.dt_windows is not None:
+            if not self.dt_windows:
+                raise ValueError("dt_windows must be non-empty when provided")
+            for a, b in zip(self.dt_windows, self.dt_windows[1:]):
+                if b.until_h <= a.until_h:
+                    raise ValueError("dt_windows until_h values must increase")
+            if self.dt_windows[-1].until_h < self.output_times_h[-1] - 1e-12:
+                raise ValueError(
+                    "last dt_window must cover the last output time")
+            if any(w.dt_h < self.dt_min_h for w in self.dt_windows):
+                raise ValueError("every dt_window dt_h must be >= dt_min_h")
+            if self.dt_windows[0].dt_h != self.dt_initial_h:
+                raise ValueError(
+                    "dt_initial_h must equal the first dt_window dt_h")
         return self
+
+    def dt_cap_at(self, time_h: float) -> float:
+        if self.dt_windows is None:
+            return self.dt_initial_h
+        for window in self.dt_windows:
+            if time_h < window.until_h - 1e-12:
+                return window.dt_h
+        return self.dt_windows[-1].dt_h
+
+    def next_window_end_after(self, time_h: float) -> Optional[float]:
+        if self.dt_windows is None:
+            return None
+        for window in self.dt_windows:
+            if window.until_h > time_h + 1e-12:
+                return window.until_h
+        return None
 
 
 class ParticleShape(BaseModel):
@@ -431,6 +469,12 @@ class BoundaryReservoirConfig(BaseModel):
     model_config = _STRICT
     axis: Literal["z", "y", "x"]           # dense arrays are (z, y, x)
     side: Literal["low", "high", "both"]   # low = index 0
+    # exposure start time. None = 0 (bath active from mixing). A positive
+    # value runs SEALED (fully periodic, bit-identical to a boundary-free
+    # config) until then - the mature-paste protocol: hydrate first, then
+    # expose. Must coincide with an output time so no step straddles the
+    # switch (validated cross-section).
+    start_h: Optional[float] = Field(default=None, ge=0.0)
     # dissolved ELEMENT concentrations, mol per m^3 of capillary water
     # (volumetric — the solver's c = n/W basis; ~molarity*1000 for dilute
     # baths). {} = pure (deionized, continuously renewed) water. Compose
@@ -461,6 +505,12 @@ class DomainPartitionConfig(BaseModel):
     # tile edge in voxels; must divide rve.grid_size. == grid_size is the
     # degenerate 1-domain-per-cluster limit (bit-identical to mode full).
     tile_vox: int = Field(ge=2)
+    # per-axis tile edges (z, y, x), overriding the cubic tile_vox (W3
+    # design review: a planar leaching front is transverse-uniform, so
+    # BANDED tiles - transverse = grid, axial 2-4 - are the dominant cost
+    # lever AND better physics per GEM call). Each entry divides the grid.
+    # None keeps the cubic tiling (and every earlier config hash).
+    tile_zyx: Optional[Tuple[int, int, int]] = None
     # common effective free-solution diffusivity for all elements. REQUIRED
     # and explicit - no invented default. Bulk ionic self-diffusivities at
     # 25 C span 0.8e-9 (Ca2+) to 5.3e-9 (OH-) m2/s; 1e-9 is the
@@ -480,7 +530,14 @@ class DomainPartitionConfig(BaseModel):
             raise ValueError("d0_m2_s must be finite")
         if not math.isfinite(self.dirty_rtol):
             raise ValueError("dirty_rtol must be finite")
+        if self.tile_zyx is not None and any(t < 1 for t in self.tile_zyx):
+            raise ValueError("tile_zyx entries must be >= 1")
         return self
+
+    def tiles(self, grid_size: int) -> Tuple[int, int, int]:
+        if self.tile_zyx is not None:
+            return self.tile_zyx
+        return (self.tile_vox, self.tile_vox, self.tile_vox)
 
 
 class TransportConfig(BaseModel):
@@ -719,13 +776,27 @@ class TinnConfig(BaseModel):
                         f"schedule.dt_min_h {floor} h keeps that channel at "
                         f"f = 1 always (use 0.0 for an explicit fully-"
                         f"offered channel)")
-        if (self.transport is not None and self.transport.domains is not None
-                and self.rve.grid_size % self.transport.domains.tile_vox != 0):
+        if self.transport is not None and self.transport.domains is not None:
+            for name, t in zip(("tile_zyx[z]", "tile_zyx[y]", "tile_zyx[x]"),
+                               self.transport.domains.tiles(
+                                   self.rve.grid_size)):
+                if self.rve.grid_size % t != 0:
+                    raise ValueError(
+                        f"transport.domains {name if self.transport.domains.tile_zyx else 'tile_vox'} "
+                        f"= {t} does not divide the grid size "
+                        f"{self.rve.grid_size} - tiles must wrap "
+                        f"periodically")
+        if (self.transport is not None
+                and self.transport.boundary is not None
+                and self.transport.boundary.start_h is not None
+                and self.transport.boundary.start_h > 0.0
+                and not any(abs(t - self.transport.boundary.start_h) <= 1e-9
+                            for t in self.schedule.output_times_h)):
             raise ValueError(
-                f"transport.domains.tile_vox "
-                f"{self.transport.domains.tile_vox} does not divide the "
-                f"grid size {self.rve.grid_size} - tiles must wrap "
-                f"periodically")
+                f"transport.boundary.start_h "
+                f"{self.transport.boundary.start_h} must coincide with an "
+                f"output time so no step straddles the sealed->exposed "
+                f"switch")
         if (self.transport is not None and self.transport.boundary is not None
                 and self.chemistry.backend != "gems3k"):
             # the stoichiometric backend's solution ledger is identically
@@ -761,6 +832,10 @@ class TinnConfig(BaseModel):
         # the built-in glasses keeps its earlier hash
         if payload.get("scm_composition") is None:
             payload.pop("scm_composition", None)
+        # Piecewise timesteps were added after checkpoint format v3. An absent
+        # schedule keeps every legacy config/checkpoint hash unchanged.
+        if payload.get("schedule", {}).get("dt_windows") is None:
+            payload["schedule"].pop("dt_windows", None)
         # v4.0/RT transport section: EVERY None-valued field pops (generic on
         # purpose — a hard-coded name tuple would silently change every
         # mode-B hash the day RT-W2 adds `domains`, review finding), so
@@ -771,6 +846,14 @@ class TinnConfig(BaseModel):
         if isinstance(tr, dict):
             for key in [k for k, v in tr.items() if v is None]:
                 tr.pop(key)
+            # nested RT sections follow the same rule: every None-valued
+            # field pops, so later Optional additions (start_h, tile_zyx,
+            # ...) never shift the hash of a config that does not use them
+            for sub in ("domains", "boundary"):
+                d = tr.get(sub)
+                if isinstance(d, dict):
+                    for key in [k for k, v in d.items() if v is None]:
+                        d.pop(key)
         if not payload.get("transport"):
             payload.pop("transport", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
