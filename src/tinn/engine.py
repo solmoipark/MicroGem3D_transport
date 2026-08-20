@@ -27,6 +27,16 @@ REJECT_BACKEND_FAILURE = "backend_failure"
 REJECT_CLUSTER_DRYOUT = "cluster_dryout"
 REJECT_TRANSPORT_FAILURE = "transport_failure"
 
+# PRD 4.6.3 dryout surrender: both witnesses (solute row vs the aqueous
+# pool, parent-cluster water vs total water) must sit below this fraction
+# for a whole-cluster death to surrender its row to the boundary ledger
+# instead of rejecting. W4.1 measured margins (leach OPC 32^3): dust rows
+# of dying orphan pockets 1e-7..1e-6 of pool with water 7e-7 of total;
+# the smallest MATERIAL rows (percolated-cluster bands, which cannot die
+# whole) start at 6e-5 with water ratio 1.0 - three-plus decades of
+# separation on each side of 1e-3.
+DRYOUT_SURRENDER_REL = 1e-3
+
 
 class EngineError(RuntimeError):
     def __init__(self, message: str, reason: str):
@@ -37,6 +47,31 @@ class EngineError(RuntimeError):
 @dataclass
 class StepReject:
     reason: str
+
+
+def _dryout_surrender(rows: np.ndarray, hard: List[int],
+                      dom_to_cl: np.ndarray, cl_labels: np.ndarray,
+                      prev_liquid: np.ndarray) -> Optional[List[int]]:
+    """v4.0/RT (PRD 4.6.3): disposition of whole-cluster deaths under an
+    ACTIVE bath. The sealed->exposed switch orphans wrap-connected pocket
+    clusters; they self-desiccate (their own equilibrium binds the last
+    water) and vanish from the labeling in the same step - a real,
+    dt-independent event, not a defect. A dead cluster whose row is float
+    dust surrenders it to the boundary ledger (exact floats, closure
+    identity untouched - the flush precedent); a dead cluster carrying
+    MATERIAL solutes or water keeps the v2 hard reject. Returns the
+    surrendered domain ids, or None if any death is material."""
+    pool = float(np.abs(rows).sum())
+    tot_liq = float(prev_liquid[prev_liquid > 0.0].sum())
+    out: List[int] = []
+    for pd in hard:
+        row_sum = float(np.abs(rows[pd]).sum())
+        cl_liq = float(prev_liquid[cl_labels == int(dom_to_cl[pd])].sum())
+        if (row_sum >= DRYOUT_SURRENDER_REL * pool
+                or cl_liq >= DRYOUT_SURRENDER_REL * tot_liq):
+            return None
+        out.append(int(pd))
+    return out
 
 
 def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray,
@@ -1251,7 +1286,21 @@ class Engine:
             hard, fold_events = _fold_dry_rows(residual, remap.inventory,
                                                remap.dryout)
             if hard:
-                return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                surrendered = (_dryout_surrender(residual, hard, dom_to_cl,
+                                                 cl_labels, prev_liquid)
+                               if bath_active else None)
+                if surrendered is None:
+                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                for pd in surrendered:
+                    trial.boundary_exchanged_elements = (
+                        trial.boundary_exchanged_elements - residual[pd])
+                exchange_metrics["dryout_surrendered_domains"] = (
+                    exchange_metrics.get("dryout_surrendered_domains", 0.0)
+                    + float(len(surrendered)))
+                exchange_metrics["dryout_surrendered_mol"] = (
+                    exchange_metrics.get("dryout_surrendered_mol", 0.0)
+                    + float(sum(np.abs(residual[pd]).sum()
+                                for pd in surrendered)))
         trial.cluster_inventory = remap.inventory
         # E2: pools follow the assemblage — a solved cluster's pool IS its own
         # parcels (absolute replacement, non-compounding); frozen clusters

@@ -710,6 +710,30 @@ def test_start_h_snaps_to_matching_output_time():
     assert eng._b_start == 2.0
 
 
+def test_dryout_surrender_witnesses():
+    """W4.1 measured: the sealed->exposed switch orphans wrap-connected
+    pocket clusters, which self-desiccate carrying ~1e-20 mol float dust;
+    under an ACTIVE bath the dead cluster's row surrenders to the boundary
+    ledger (exact floats). MATERIAL solutes or water keep the v2 reject."""
+    from tinn.engine import _dryout_surrender
+    cl_labels = np.array([[[0, 0, 1]]])
+    prev_liquid = np.array([[[3.0, 4.0, 1e-4]]])
+    dom_to_cl = np.array([0, 0, 1])
+    rows = np.zeros((3, 11))
+    rows[0, 0] = 1.0
+    rows[1, 1] = 0.5
+    rows[2, :3] = 1e-9                       # dust row, trace water
+    assert _dryout_surrender(rows, [2], dom_to_cl, cl_labels,
+                             prev_liquid) == [2]
+    rows[2, :3] = 1e-3                       # material solutes -> reject
+    assert _dryout_surrender(rows, [2], dom_to_cl, cl_labels,
+                             prev_liquid) is None
+    rows[2, :3] = 1e-9
+    wet = prev_liquid.copy()
+    wet[0, 0, 2] = 5.0                       # material water -> reject
+    assert _dryout_surrender(rows, [2], dom_to_cl, cl_labels, wet) is None
+
+
 # ---------------- RT-W4 enablers ------------------------------------------
 
 def test_boundary_start_h_pre_window_is_bitwise_sealed(tmp_path):

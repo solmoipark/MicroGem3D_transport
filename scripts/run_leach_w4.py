@@ -28,13 +28,20 @@ START_H = 168.0
 GUARD_LO_VOX = 4                 # exposed-face halo (PRD 4.6.3)
 TILE_Z = 2
 
-def run_case(d0: float, out_dir: Path) -> dict:
+def run_case(d0: float, out_dir: Path, dt_s: float = None) -> dict:
     raw = json.loads(BASE.read_text(encoding="utf-8"))
     raw["transport"]["domains"]["d0_m2_s"] = d0
+    if dt_s is not None:
+        # W4.1 dt ladder: replace the leach window's step (seconds)
+        dt_h = dt_s / 3600.0
+        raw["schedule"]["dt_windows"][-1]["dt_h"] = dt_h
+        raw["schedule"]["dt_min_h"] = min(raw["schedule"]["dt_min_h"],
+                                          dt_h / 4.0)
     cfg = TinnConfig.model_validate(raw)
     supply = []
 
-    frozen = {"nonconv": 0.0, "water": 0.0}
+    frozen = {"nonconv": 0.0, "water": 0.0, "surrendered": 0.0,
+              "surrendered_mol": 0.0}
 
     def hook(ev):
         if ev.get("event") == "step_accepted":
@@ -43,6 +50,8 @@ def run_case(d0: float, out_dir: Path) -> dict:
                 supply.append(m["boundary_supply_ratio"])
             frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
             frozen["water"] += m.get("water_frozen_domains", 0.0)
+            frozen["surrendered"] += m.get("dryout_surrendered_domains", 0.0)
+            frozen["surrendered_mol"] += m.get("dryout_surrendered_mol", 0.0)
 
     if out_dir.exists():
         # storage refuses checkpoint overwrites; a rerun after an aborted
@@ -87,6 +96,8 @@ def run_case(d0: float, out_dir: Path) -> dict:
         "supply_ratio_max": max(supply) if supply else None,
         "nonconv_frozen_total": frozen["nonconv"],
         "water_frozen_total": frozen["water"],
+        "dryout_surrendered_total": frozen["surrendered"],
+        "dryout_surrendered_mol": frozen["surrendered_mol"],
         "supply_ratio_mean": (sum(supply) / len(supply)) if supply else None,
         "rows": rows,
         "a_um_per_sqrt_day": a_um_sqrt_day,
@@ -96,13 +107,20 @@ def run_case(d0: float, out_dir: Path) -> dict:
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
-    ladder = [float(x) for x in sys.argv[1:]] or [0.8e-9, 2.0e-9, 5.3e-9]
+    args = sys.argv[1:]
+    dt_s = None
+    if args and args[0].startswith("dt="):
+        dt_s = float(args[0][3:])
+        args = args[1:]
+    ladder = [float(x) for x in args] or [0.8e-9, 2.0e-9, 5.3e-9]
     results = {}
     for d0 in ladder:
         tag = f"d0_{d0:.1e}".replace("-", "m").replace("+", "")
+        if dt_s is not None:
+            tag = f"dt{dt_s:g}s_{tag}"
         out = REPO / "runs" / f"leach_w4_{tag}"
         print(f"== {tag} ==", flush=True)
-        results[tag] = run_case(d0, out)
+        results[tag] = run_case(d0, out, dt_s)
         r = results[tag]
         print(f"  wall {r['wall_s']} s, a = {r['a_um_per_sqrt_day']} "
               f"um/sqrt(day) ({r['n_fit_points']} pts), supply "
@@ -110,7 +128,8 @@ def main() -> None:
               flush=True)
         fronts = [(row['t_leach_h'], row['front_vox']) for row in r['rows']]
         print(f"  fronts: {fronts}", flush=True)
-    out_json = REPO / "runs" / "leach_w4_results.json"
+    suffix = f"_dt{dt_s:g}s" if dt_s is not None else ""
+    out_json = REPO / "runs" / f"leach_w4_results{suffix}.json"
     out_json.write_text(json.dumps(results, indent=1), encoding="utf-8")
     print(f"saved {out_json}")
 
