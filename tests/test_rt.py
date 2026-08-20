@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tinn import ledger
+from tinn import ledger, transport
 from tinn.config import TinnConfig
 from tinn.engine import Engine
 from tinn.registry import HYDRATE_PHASE_IDS, default_registry
@@ -174,6 +174,173 @@ def test_undercovered_pool_archives_at_one_minus_f():
     assert pool_after == pytest.approx(0.5 * psum_before + 2e-12, rel=1e-9)
 
 
+# ---------------- mode C: domain partition and exchange operator ----------
+
+def test_label_domains_tiling_and_degenerate_limit():
+    """tile == grid returns the literal cluster labels (legacy identity);
+    a finer tile refines every cluster, ids ordered by (cluster, tile),
+    every domain inside exactly one cluster."""
+    rng = np.random.default_rng(7)
+    liquid = (rng.random((8, 8, 8)) > 0.4) * 0.5
+    labels, n_cl = transport.label_clusters(liquid)
+    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, 8)
+    assert d_id is labels and n_dom == n_cl
+    assert np.array_equal(d2c, np.arange(n_cl))
+    d_id, n_dom, d2c = transport.label_domains(labels, n_cl, 4)
+    assert n_dom >= n_cl
+    wet = labels >= 0
+    assert np.all(d_id[wet] >= 0) and np.all(d_id[~wet] == -1)
+    # refinement: every domain's voxels lie in exactly one cluster
+    for d in range(n_dom):
+        cl = np.unique(labels[d_id == d])
+        assert cl.size == 1 and cl[0] == d2c[d]
+    # determinism across recomputation
+    d_id2, n2, d2c2 = transport.label_domains(labels, n_cl, 4)
+    assert n2 == n_dom and np.array_equal(d_id, d_id2)
+    assert np.array_equal(d2c, d2c2)
+
+
+def _two_domain_graph(w1, w2, g_edge):
+    return transport.DomainGraph(
+        n_domains=2,
+        edge_a=np.array([0], dtype=np.int64),
+        edge_b=np.array([1], dtype=np.int64),
+        edge_g=np.array([g_edge]),
+        water=np.array([w1, w2]),
+        dust=np.zeros(2, dtype=bool))
+
+
+def test_two_domain_exchange_matches_analytic_decay():
+    """RT analytic anchor 1 (PRD 6.2): a single BE step obeys
+    dc+ = dc / (1 + dt*lambda), lambda = (D0 G / p)(1/W1 + 1/W2), exactly;
+    substepping converges first-order to the exponential."""
+    w1, w2, g_edge, d0, p = 2.0, 1.0, 0.3, 1.5, 4.0
+    lam = (d0 * g_edge / p) * (1.0 / w1 + 1.0 / w2)
+    inv = np.array([[6.0], [0.0]])
+    dt = 0.8
+    res = transport.exchange_be(_two_domain_graph(w1, w2, g_edge), inv, dt,
+                                d0, p)
+    assert res.status == "ok"
+    new = inv + res.delta
+    dc0 = inv[0, 0] / w1 - inv[1, 0] / w2
+    dc1 = new[0, 0] / w1 - new[1, 0] / w2
+    assert dc1 == pytest.approx(dc0 / (1.0 + dt * lam), rel=1e-12)
+    # conservation is exact by flux form
+    assert new.sum() == pytest.approx(6.0, abs=0.0)
+    # n substeps -> exponential, first order in dt
+    for n_sub, tol in ((8, 0.05), (64, 0.007)):
+        cur = inv.copy()
+        for _ in range(n_sub):
+            r = transport.exchange_be(_two_domain_graph(w1, w2, g_edge),
+                                      cur, dt / n_sub, d0, p)
+            cur = cur + r.delta
+        dcn = cur[0, 0] / w1 - cur[1, 0] / w2
+        assert dcn == pytest.approx(dc0 * np.exp(-lam * dt), rel=tol)
+
+
+def test_ring_exchange_invariants():
+    """RT ring invariants: exact per-element totals, positivity after
+    repair, uniform concentration is a stationary point, and bitwise
+    determinism across repeated calls."""
+    rng = np.random.default_rng(3)
+    k = 12
+    ea = np.arange(k, dtype=np.int64)
+    eb = np.roll(ea, -1)
+    lo, hi = np.minimum(ea, eb), np.maximum(ea, eb)
+    graph = transport.DomainGraph(
+        n_domains=k, edge_a=lo, edge_b=hi,
+        edge_g=0.1 + rng.random(k),
+        water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
+    inv = rng.random((k, 11)) * 1e-9
+    res = transport.exchange_be(graph, inv, 5.0, 2.0, 2.0)
+    assert res.status == "ok"
+    new = inv + res.delta
+    assert np.all(new >= 0.0)
+    for e in range(11):
+        assert float(new[:, e].sum()) == pytest.approx(
+            float(inv[:, e].sum()), rel=1e-13)
+    # uniform c stationary: n = W * const per element
+    uni = np.outer(graph.water, np.linspace(0.5, 1.5, 11)) * 1e-8
+    res_u = transport.exchange_be(graph, uni, 5.0, 2.0, 2.0)
+    assert float(np.abs(res_u.delta).max()) <= 1e-22
+    # determinism
+    res2 = transport.exchange_be(graph, inv, 5.0, 2.0, 2.0)
+    assert np.array_equal(res.delta, res2.delta)
+
+
+def test_conductance_field_matches_report_network_rule():
+    """RT analytic anchor 2 precursor: the shared helper reproduces the
+    report solver's cell rule (liquid + 0.0025 * gel hydrates), floorless."""
+    liquid = np.zeros((4, 4, 4))
+    liquid[0] = 0.7
+    hyd = np.zeros((2, 4, 4, 4))
+    hyd[0, 1] = 0.5      # gel-bearing
+    hyd[1, 2] = 0.5      # crystalline
+    g = transport.conductance_field(liquid, hyd, np.array([0.28, 0.0]),
+                                    0.0025)
+    assert g[0, 0, 0] == pytest.approx(0.7)
+    assert g[1, 0, 0] == pytest.approx(0.0025 * 0.5)
+    assert g[2, 0, 0] == 0.0 and g[3, 0, 0] == 0.0
+
+
+# ---------------- mode C: engine integration ------------------------------
+
+def test_one_domain_limit_is_bitwise_full_mode_stoich(tmp_path):
+    """tile_vox == grid_size makes label_domains return the cluster labels
+    themselves - the whole trajectory must be bit-identical to mode full
+    (the key cheap gate: runs without xGEMS)."""
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    raw["schedule"] = {"output_times_h": [24.0, 72.0], "dt_initial_h": 6.0,
+                       "dt_min_h": 0.01}
+    full_cfg = TinnConfig.model_validate(raw)
+    dom_cfg = TinnConfig.model_validate(
+        {**raw, "transport": {"domains": {"tile_vox": 32,
+                                          "d0_m2_s": 1.0e-9}}})
+    s_full, _ = Engine(full_cfg).run(out_dir=str(tmp_path / "full"))
+    s_dom, _ = Engine(dom_cfg).run(out_dir=str(tmp_path / "dom"))
+    assert s_dom.full_hash() == s_full.full_hash()
+
+
+def test_subdomain_stoich_run_closes_and_is_deterministic(tmp_path):
+    """A genuinely partitioned run (tile 8 on 32^3): completes, keeps every
+    blocking gate green, keys the inventory rows on domains, and reproduces
+    itself bitwise on a second run."""
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    raw["schedule"] = {"output_times_h": [24.0, 72.0], "dt_initial_h": 6.0,
+                       "dt_min_h": 0.01}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    cfg = TinnConfig.model_validate(raw)
+    s1, _ = Engine(cfg).run(out_dir=str(tmp_path / "a"))
+    rep = ledger.check_all(s1, REG)
+    assert rep.ok, rep.violations
+    labels, n_cl = transport.label_clusters(s1.capillary_liquid)
+    _, n_dom, _ = transport.label_domains(labels, n_cl, 8)
+    assert s1.cluster_inventory.shape[0] == n_dom
+    assert n_dom > n_cl
+    s2, _ = Engine(cfg).run(out_dir=str(tmp_path / "b"))
+    assert s2.full_hash() == s1.full_hash()
+
+
+def test_subdomain_restart_bit_identity(tmp_path):
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    raw["schedule"] = {"output_times_h": [24.0, 72.0], "dt_initial_h": 6.0,
+                       "dt_min_h": 0.01}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    cfg = TinnConfig.model_validate(raw)
+    straight, _ = Engine(cfg).run(out_dir=str(tmp_path / "run"))
+    mid = load_checkpoint(str(tmp_path / "run" / "ckpt_000"), REG)
+    restarted, _ = Engine(mid.config).run(state=mid)
+    assert restarted.full_hash() == straight.full_hash()
+
+
+def test_domain_economy_knobs_not_implemented_yet():
+    raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
+                                    "dirty_rtol": 1e-3}}
+    with pytest.raises(ValueError, match="RT-W2b"):
+        Engine(TinnConfig.model_validate(raw))
+
+
 # ---------------- mode B: coupled GEMS gates ------------------------------
 
 @needs_gems
@@ -206,3 +373,28 @@ def test_restart_bit_identity_rate_limited(rt_tau):
     restarted, _ = Engine(mid.config).run(state=mid)
     assert restarted.dense_hash() == tau_state.dense_hash()
     assert restarted.full_hash() == tau_state.full_hash()
+
+
+@needs_gems
+def test_one_domain_limit_is_bitwise_full_mode_gems(rt_full, tmp_path):
+    full_state, _ = rt_full
+    cfg = _gems_cfg(transport={"domains": {"tile_vox": 32,
+                                           "d0_m2_s": 1.0e-9}})
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "dom1"))
+    assert state.full_hash() == full_state.full_hash()
+
+
+@needs_gems
+def test_combined_modes_run_and_close(rt_full, tmp_path):
+    """B + C composed on a real coupled run: rate-limited feed inside
+    diffusively coupled sub-domains - completes, closes, and diverges from
+    the full-mode trajectory."""
+    full_state, _ = rt_full
+    cfg = _gems_cfg(transport={
+        "exchange_tau_h": 100.0,
+        "domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}})
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "bc"))
+    rep = ledger.check_all(state, REG)
+    assert rep.ok, rep.violations
+    assert state.time_h == full_state.time_h
+    assert state.full_hash() != full_state.full_hash()

@@ -25,6 +25,7 @@ from .state import SimulationState, code_version
 
 REJECT_BACKEND_FAILURE = "backend_failure"
 REJECT_CLUSTER_DRYOUT = "cluster_dryout"
+REJECT_TRANSPORT_FAILURE = "transport_failure"
 
 
 class EngineError(RuntimeError):
@@ -139,6 +140,22 @@ class Engine:
                     "channel) - refusing a silent full-re-equilibration run "
                     "under a mode-B config hash")
             self._tau_ch = tau
+        # v4.0/RT mode C (PRD 4.6.2): sub-cluster equilibration domains
+        self._domains_cfg = (config.transport.domains
+                             if config.transport is not None else None)
+        if self._domains_cfg is not None:
+            h_m = config.rve.voxel_size_um * 1e-6
+            self._d0_vox2_h = (self._domains_cfg.d0_m2_s * 3600.0
+                               / (h_m * h_m))
+            if (self._domains_cfg.dirty_rtol > 0.0
+                    or self._domains_cfg.max_gem_calls_per_step is not None):
+                # the GEM-call economy lands at RT-W2b; accepting the knobs
+                # while ignoring them would be a silent no-op (PRD 5)
+                raise ValueError(
+                    "transport.domains.dirty_rtol > 0 / "
+                    "max_gem_calls_per_step are the RT-W2b GEM-call economy "
+                    "- not implemented yet; use dirty_rtol = 0.0 (every wet "
+                    "domain equilibrates every step)")
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -184,7 +201,16 @@ class Engine:
                 trial.phase_mol[s])
 
         prev_liquid = trial.capillary_liquid.copy()
-        labels, n_clusters = transport.label_clusters(prev_liquid)
+        cl_labels, n_cl = transport.label_clusters(prev_liquid)
+        # v4.0/RT mode C (PRD 4.6.2): the reactor key is the DOMAIN — cluster
+        # intersected with a static tile. Mode-full aliases the cluster
+        # labels (the literal identity), so every downstream use is
+        # bit-identical to the pre-RT engine.
+        if self._domains_cfg is not None:
+            labels, n_clusters, dom_to_cl = transport.label_domains(
+                cl_labels, n_cl, self._domains_cfg.tile_vox)
+        else:
+            labels, n_clusters, dom_to_cl = cl_labels, n_cl, None
 
         dis = dissolution.dissolve(trial, reg, dn)
         vacated = dis.removed_vol.sum(axis=0)
@@ -269,6 +295,38 @@ class Engine:
                 f"({n_clusters}, {self._n_em}) was expected - state is "
                 f"corrupted (no fallback)")
 
+        # ---- transport phase (v4.0/RT mode C, Lie split T -> R) -------------
+        # implicit solute diffusion between the domains of each cluster on
+        # the step-start frozen snapshot; reactors then consume the
+        # post-transport inventories. Full mode: no partition, no exchange.
+        exchange_bal = None
+        exchange_metrics: Dict[str, float] = {}
+        if self._domains_cfg is not None:
+            inv_eff = inv_in.copy()
+            g_field = transport.conductance_field(
+                prev_liquid, trial.hydrate_fraction, gel_eps,
+                analysis.GEL_REL_DIFFUSIVITY)
+            graph = transport.build_domain_graph(labels, n_clusters,
+                                                 g_field, prev_liquid)
+            ex = transport.exchange_be(graph, inv_eff, dt_h,
+                                       self._d0_vox2_h,
+                                       float(self._domains_cfg.tile_vox))
+            if ex.status != "ok":
+                return None, StepReject(REJECT_TRANSPORT_FAILURE), {}
+            inv_eff = inv_eff + ex.delta
+            exchange_bal = ledger.ExchangeBalance(
+                applied_delta_elements=ex.delta.sum(axis=0),
+                boundary_net_elements=np.zeros(len(ELEMENT_IDS)),
+                abs_flux_scale=float(np.abs(ex.delta).sum()))
+            exchange_metrics = {
+                "n_domains": float(n_clusters),
+                "exchange_cg_iterations": float(ex.cg_iterations),
+                "exchange_max_edge_flux_mol": ex.max_edge_flux_mol,
+                "exchange_repair_rel": ex.repair_rel,
+            }
+        else:
+            inv_eff = inv_in
+
         # ---- reaction phase (mode-dependent) --------------------------------
         # incremental (stoichiometric): parcels are NEW precipitates appended.
         # snapshot (gems3k, PRD v2.2): each cluster's owned hydrates + solution
@@ -277,6 +335,22 @@ class Engine:
         # CH consumption and phase rearrangement emerge from equilibrium).
         recon = np.where(labels >= 0, labels, site_cluster)
         snapshot = self.backend.mode == "snapshot"
+        # cluster-scope views (v4.0/RT): placement overflow and the water
+        # ledger stay hydraulically cluster-wide; domains partition solute
+        # mixing and chemistry only. Mode-full aliases are bit-identical.
+        if dom_to_cl is None:
+            recon_cl = recon
+            site_cluster_cl = site_cluster
+        else:
+            recon_cl = np.where(recon >= 0,
+                                dom_to_cl[np.clip(recon, 0, None)],
+                                np.int64(-1))
+            site_cluster_cl = np.where(site_cluster >= 0,
+                                       dom_to_cl[np.clip(site_cluster, 0,
+                                                         None)],
+                                       np.int64(-1))
+            claimed_vol = np.zeros(n_cl)
+            claimed_gas = np.zeros(n_cl)
 
         chem_mol_c = np.zeros(n_clusters)
         gel_mol_c = np.zeros(n_clusters)
@@ -400,12 +474,21 @@ class Engine:
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
             has_solids = snapshot and offered_vol[c].sum() > 0.0
-            has_inventory = bool(np.any(inv_in[c] != 0.0))
+            has_inventory = bool(np.any(inv_eff[c] != 0.0))
             if not rel and not has_solids and not has_inventory:
-                residual[c] = inv_in[c]
+                residual[c] = inv_eff[c]
                 continue
             water_c = float(water_mol_c[c])
-            trace_water = water_c < 1e-3 * total_water_mol
+            if dom_to_cl is None:
+                trace_water = water_c < 1e-3 * total_water_mol
+            else:
+                # mode C rescope (PRD 4.6.2): against the MEAN wet-domain
+                # water, not the global total — the literal rule would
+                # classify every domain as trace at fine partitions and
+                # stall hydration globally
+                n_wet = int((water_mol_c > 0.0).sum())
+                trace_water = water_c < 1e-3 * (total_water_mol
+                                                / max(n_wet, 1))
             # a nearly-dry pocket fails identically at every release scale —
             # give it exactly one attempt instead of burning retries every step
             max_transient = 0 if trace_water else 4
@@ -418,10 +501,10 @@ class Engine:
                 scaled = {p: v * s for p, v in rel.items()}
                 try:
                     if snapshot:
-                        result = self.backend.react(scaled, water_c, inv_in[c],
+                        result = self.backend.react(scaled, water_c, inv_eff[c],
                                                     solid_elements=solid_elem_c)
                     else:
-                        result = self.backend.react(scaled, water_c, inv_in[c])
+                        result = self.backend.react(scaled, water_c, inv_eff[c])
                 except backend_mod.BackendTransientError:
                     # nonconvergence may be release-size dependent — scale down a
                     # few times before giving up on this cluster
@@ -454,7 +537,7 @@ class Engine:
                 # a materially wet cluster failing this way rejects the trial.
                 if trace_water:
                     scale_c[c] = 0.0
-                    residual[c] = inv_in[c]
+                    residual[c] = inv_eff[c]
                     continue
                 return None, StepReject(failure_reason), {}
             if snapshot:
@@ -473,8 +556,22 @@ class Engine:
                 grow_c = float(np.clip(delta_c, 0.0, None).sum())
                 vac_tot_c = (s * float(np.where(member_c, vacated, 0.0).sum())
                              + float(np.clip(-delta_c, 0.0, None).sum()))
-                cap_c = (float(np.where(member_c, trial.capillary_liquid, 0.0).sum())
-                         + vac_tot_c)
+                if dom_to_cl is None:
+                    cap_c = (float(np.where(member_c, trial.capillary_liquid,
+                                            0.0).sum())
+                             + vac_tot_c)
+                else:
+                    # mode C sequential capacity claim (PRD 4.6.2): growth
+                    # places domain-locally but overflow resolves cluster-
+                    # wide, so each solved domain claims against the CLUSTER
+                    # capacity minus earlier claims (domain-id order —
+                    # deterministic; one domain per cluster reduces to the
+                    # legacy gate exactly)
+                    cl_c = int(dom_to_cl[c])
+                    cap_c = (float(np.where(recon_cl == cl_c,
+                                            trial.capillary_liquid,
+                                            0.0).sum())
+                             + vac_tot_c - claimed_vol[cl_c])
                 # 1e-9 relative margin: the placement layers recompute this
                 # capacity through different float chains (give-back, remove
                 # clamps, per-voxel mutation) — a near-exact fit must freeze
@@ -493,8 +590,16 @@ class Engine:
                     # EVERY dt (snapshot deltas are not dt-scaled). Freeze
                     # instead: a pocket with nowhere to push its water stops
                     # hydrating, which is the same space-filling physics.
-                    gas_c_vol = float(np.where(member_c, trial.capillary_gas,
-                                               0.0).sum())
+                    if dom_to_cl is None:
+                        gas_c_vol = float(np.where(member_c,
+                                                   trial.capillary_gas,
+                                                   0.0).sum())
+                    else:
+                        cl_c = int(dom_to_cl[c])
+                        gas_c_vol = (float(np.where(recon_cl == cl_c,
+                                                    trial.capillary_gas,
+                                                    0.0).sum())
+                                     - claimed_gas[cl_c])
                     water_out_vol = (result.water_consumed_mol * vm_w
                                      + float((env_new * gel_eps).sum())
                                      - owned_gel_c[c])
@@ -502,8 +607,12 @@ class Engine:
                     freeze = deficit_est > gas_c_vol - 1e-12 * max(1.0, gas_c_vol)
                 if freeze:
                     scale_c[c] = 0.0
-                    residual[c] = inv_in[c]
+                    residual[c] = inv_eff[c]
                     continue
+                if dom_to_cl is not None:
+                    cl_c = int(dom_to_cl[c])
+                    claimed_vol[cl_c] += max(grow_c - vac_tot_c, 0.0)
+                    claimed_gas[cl_c] += max(deficit_est, 0.0)
             solved[c] = True
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
@@ -624,8 +733,8 @@ class Engine:
             return None, StepReject(backend_mod.STATUS_INSUFFICIENT_WATER), {}
 
         outcome = morphology.place(trial.hydrate_fraction, trial.capillary_liquid,
-                                   vacated, demand, recon,
-                                   recon if snapshot else site_cluster)
+                                   vacated, demand, recon_cl,
+                                   recon_cl if snapshot else site_cluster_cl)
         if outcome.status != morphology.STATUS_OK:
             return None, StepReject(outcome.status), {}
         # water flows into leftover vacated/freed space (same connected liquid)
@@ -634,22 +743,31 @@ class Engine:
         # cluster water reconciliation: excess liquid volume becomes capillary gas.
         # The reference volume uses the same recon partition as the current volume
         # so sub-threshold liquid at site voxels cancels on both sides.
-        cur_vol_c = np.bincount(recon[recon >= 0],
-                                weights=trial.capillary_liquid[recon >= 0],
-                                minlength=n_clusters)
-        prev_vol_recon_c = np.bincount(recon[recon >= 0],
-                                       weights=prev_liquid[recon >= 0],
-                                       minlength=n_clusters)
-        target_vol_c = prev_vol_recon_c - (chem_mol_c + gel_mol_c) * vm_w
+        if dom_to_cl is None:
+            chem_cl, gel_cl = chem_mol_c, gel_mol_c
+        else:
+            # water is hydraulically cluster-wide (PRD 4.6.2): aggregate the
+            # per-domain consumption to the parent clusters
+            chem_cl = np.bincount(dom_to_cl, weights=chem_mol_c,
+                                  minlength=n_cl)
+            gel_cl = np.bincount(dom_to_cl, weights=gel_mol_c,
+                                 minlength=n_cl)
+        cur_vol_c = np.bincount(recon_cl[recon_cl >= 0],
+                                weights=trial.capillary_liquid[recon_cl >= 0],
+                                minlength=n_cl)
+        prev_vol_recon_c = np.bincount(recon_cl[recon_cl >= 0],
+                                       weights=prev_liquid[recon_cl >= 0],
+                                       minlength=n_cl)
+        target_vol_c = prev_vol_recon_c - (chem_cl + gel_cl) * vm_w
         diff_c = cur_vol_c - target_vol_c
-        if n_clusters > 0:
+        if n_cl > 0:
             # negative diff: water returned to solution (re-dissolution, solute
             # water re-emerging as solvent) refills capillary liquid from the
             # cluster's own gas space; without enough local gas the returned
             # volume has nowhere to appear
-            gas_vol_c = np.bincount(recon[recon >= 0],
-                                    weights=trial.capillary_gas[recon >= 0],
-                                    minlength=n_clusters)
+            gas_vol_c = np.bincount(recon_cl[recon_cl >= 0],
+                                    weights=trial.capillary_gas[recon_cl >= 0],
+                                    minlength=n_cl)
             deficit = np.clip(-diff_c, 0.0, None)
             tol_c = 1e-12 * (1.0 + np.abs(target_vol_c))
             if np.any((deficit > tol_c) & (deficit > gas_vol_c + tol_c)):
@@ -659,11 +777,13 @@ class Engine:
                                   deficit / gas_vol_c, 0.0)
                 factor = np.where(cur_vol_c > 0.0,
                                   np.clip(diff_c, 0.0, None) / cur_vol_c, 0.0)
-            refill_vox = np.where(recon >= 0, refill[np.clip(recon, 0, None)], 0.0)
+            refill_vox = np.where(recon_cl >= 0,
+                                  refill[np.clip(recon_cl, 0, None)], 0.0)
             added_liq = trial.capillary_gas * refill_vox
             trial.capillary_gas -= added_liq
             trial.capillary_liquid += added_liq
-            fac_vox = np.where(recon >= 0, factor[np.clip(recon, 0, None)], 0.0)
+            fac_vox = np.where(recon_cl >= 0,
+                               factor[np.clip(recon_cl, 0, None)], 0.0)
             removed_liq = trial.capillary_liquid * fac_vox
             trial.capillary_liquid -= removed_liq
             trial.capillary_gas += removed_liq
@@ -698,11 +818,50 @@ class Engine:
         trial.water_bound_mol += chem_total
 
         # relabel + conservative inventory remap
-        new_labels, n_new = transport.label_clusters(trial.capillary_liquid)
+        new_cl_labels, n_new_cl = transport.label_clusters(trial.capillary_liquid)
+        if dom_to_cl is None:
+            new_labels, n_new = new_cl_labels, n_new_cl
+        else:
+            new_labels, n_new, _ = transport.label_domains(
+                new_cl_labels, n_new_cl, self._domains_cfg.tile_vox)
+
+        def _fold_dry_rows(rows_prev, result_rows, dry):
+            """v4.0/RT mode C (PRD 4.6.2 fold): a dry DOMAIN whose parent
+            cluster still has wet overlap redistributes its row over the new
+            domains overlapping that cluster's previous liquid, weighted by
+            liquid overlap. A domain whose whole cluster died keeps the
+            legacy semantics (inventory: reject; pool: drop)."""
+            hard = []
+            fold_rows = []
+            liq_min = np.minimum(prev_liquid, trial.capillary_liquid)
+            for pd in dry:
+                pc = int(dom_to_cl[pd])
+                m = (cl_labels == pc) & (new_labels >= 0)
+                if not m.any():
+                    hard.append(pd)
+                    continue
+                dist = np.bincount(new_labels[m], weights=liq_min[m],
+                                   minlength=n_new)
+                tot = float(dist.sum())
+                if tot <= 0.0:
+                    hard.append(pd)
+                    continue
+                frac = dist / tot
+                result_rows += rows_prev[pd][None, :] * frac[:, None]
+                for nd in np.flatnonzero(dist > 0.0):
+                    fold_rows.append((int(pd), int(nd), float(dist[nd])))
+            return hard, fold_rows
+
         remap = transport.remap_inventories(labels, prev_liquid, new_labels,
                                             trial.capillary_liquid, residual, n_new)
+        fold_events: List[tuple] = []
         if remap.dryout:
-            return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+            if dom_to_cl is None:
+                return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+            hard, fold_events = _fold_dry_rows(residual, remap.inventory,
+                                               remap.dryout)
+            if hard:
+                return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
         trial.cluster_inventory = remap.inventory
         # E2: pools follow the assemblage — a solved cluster's pool IS its own
         # parcels (absolute replacement, non-compounding); frozen clusters
@@ -739,9 +898,17 @@ class Engine:
         pool_remap = transport.remap_inventories(
             labels, prev_liquid, new_labels, trial.capillary_liquid,
             pools_prev, n_new)
+        if dom_to_cl is not None and pool_remap.dryout:
+            # pools fold with the same weights; a dead cluster's pool drops
+            # (legacy semantics — conservation lives in the global ledgers)
+            _, pool_folds = _fold_dry_rows(pools_prev, pool_remap.inventory,
+                                           pool_remap.dryout)
+            fold_events.extend(pool_folds)
         trial.cluster_endmember_mol = pool_remap.inventory
-        trial.cluster_id = new_labels
-        for prev_c, new_c, ov in remap.events:
+        # cluster_id persists CLUSTER labels in every mode — the domain
+        # partition is a derived function of the liquid field, never stored
+        trial.cluster_id = new_cl_labels
+        for prev_c, new_c, ov in (*remap.events, *fold_events):
             trial.remap_events["time_h"].append(trial.time_h + dt_h)
             trial.remap_events["prev"].append(prev_c)
             trial.remap_events["new"].append(new_c)
@@ -759,10 +926,18 @@ class Engine:
             placed_bulk_vol_vox=outcome.placed_vol_vox,
             backend_removal_vol_vox=backend_removal_vol,
             removed_vol_vox=removed_total)
-        report = ledger.check_all(trial, reg, placement)
+        partition_check = None
+        if dom_to_cl is not None:
+            partition_check = ledger.DomainPartition(
+                labels=cl_labels, domain_id=labels,
+                domain_to_cluster=dom_to_cl)
+        report = ledger.check_all(trial, reg, placement,
+                                  exchange=exchange_bal,
+                                  partition=partition_check)
         if not report.ok:
             return None, StepReject(report.violations[0]), report.metrics
         metrics = dict(report.metrics)
+        metrics.update(exchange_metrics)
         if cluster_ph:
             metrics["cluster_ph"] = {int(k): float(v) for k, v in cluster_ph.items()}
             # liquid share per pH-carrying cluster: lets the sanity band judge

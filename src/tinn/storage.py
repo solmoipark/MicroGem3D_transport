@@ -28,14 +28,17 @@ from .state import SimulationState, _DENSE_FIELDS, code_version
 # explicitly incompatible (no migration, PRD rule). E2's per-cluster pool
 # array (cluster_endmember_mol) rides the SAME version: no external v3
 # checkpoints existed when it landed, so no second break.
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4  # v4.0/RT (PRD 2.3): domain-keyed rows + boundary_water_mol
+                    # + economy snapshots; v3 checkpoints predate equilibration
+                    # domains - rerun from the config (no migration, PRD 0.3)
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
                    "hydrate_env_vol_vox", "injected_elements",
                    "initial_elements", "endmember_mol",
                    "boundary_exchanged_elements")
 _LEDGER_SCALARS = ("time_h", "dt_h", "water_free_mol", "water_gel_mol",
-                   "water_bound_mol", "initial_water_mol", "inert_volume_vox",
+                   "water_bound_mol", "initial_water_mol",
+                   "boundary_water_mol", "inert_volume_vox",
                    "accept_count", "config_hash", "backend_id")
 _TABLE_SCHEMAS: Dict[str, Dict[str, str]] = {
     "particles": {"id": "<i8", "tier": "|i1", "material": "|i1",
@@ -159,8 +162,9 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     if header["format_version"] != FORMAT_VERSION:
         raise StorageError(
             f"checkpoint format {header['format_version']} is not supported by "
-            f"this build (current {FORMAT_VERSION}); v2 checkpoints predate "
-            f"the endmember ledger (E1) and earlier ones reversible chemistry "
+            f"this build (current {FORMAT_VERSION}); v3 checkpoints predate "
+            f"the equilibration domains and boundary water ledger (v4.0/RT), "
+            f"v2 the endmember ledger (E1), earlier ones reversible chemistry "
             f"- rerun from the config (no migration code, PRD 0.3)")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
@@ -235,6 +239,7 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         water_gel_mol=header["water_gel_mol"],
         water_bound_mol=header["water_bound_mol"],
         initial_water_mol=header["initial_water_mol"],
+        boundary_water_mol=header["boundary_water_mol"],
         inert_volume_vox=header["inert_volume_vox"],
         initial_elements=np.asarray(header["initial_elements"]),
         accept_count=header["accept_count"],

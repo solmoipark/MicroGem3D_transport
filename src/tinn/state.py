@@ -90,7 +90,7 @@ class SimulationState:
                                      # per run, from the backend's own source
                                      # (bundle DCH / registry), stored so
                                      # checkpoint re-checks need no re-probe
-    boundary_exchanged_elements: np.ndarray  # (E,) RESERVED for RT-W2 boundary
+    boundary_exchanged_elements: np.ndarray  # (E,) RESERVED for RT-W3 boundary
                                      # reservoirs (always zeros until then);
                                      # closure reads initial+injected+boundary
     injected_elements: np.ndarray    # (E,) backend-injected seeds/solver floors
@@ -105,6 +105,12 @@ class SimulationState:
     rng_state: dict
     config_hash: str
     backend_id: str
+    boundary_water_mol: float = 0.0  # v4.0/RT (FORMAT_VERSION 4): net solvent
+                                     # exchanged through boundary reservoirs
+                                     # (RT-W3; zero until then). The water
+                                     # identity reads initial + boundary.
+                                     # Trails the field list so pre-RT
+                                     # construction sites stay valid.
 
     # --- derived helpers ---
     @property
@@ -149,6 +155,7 @@ class SimulationState:
         h.update(repr(self.endmember_ids).encode())
         for x in (self.time_h, self.dt_h, self.water_free_mol, self.water_gel_mol,
                   self.water_bound_mol, self.initial_water_mol,
+                  self.boundary_water_mol,
                   self.inert_volume_vox, self.accept_count):
             h.update(repr(x).encode())
         h.update(repr(sorted(self.reject_counts.items())).encode())
@@ -255,6 +262,7 @@ class SimulationState:
             water_gel_mol=0.0,
             water_bound_mol=0.0,
             initial_water_mol=water_mol,
+            boundary_water_mol=0.0,
             inert_volume_vox=inert_vol,
             initial_elements=initial_elements,
             accept_count=0,

@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from . import ledger
+from . import ledger, transport
 from .config import TinnConfig
 from .registry import (CLINKER_PHASE_IDS, ELEMENT_IDS, KINETIC_PHASE_IDS,
                        Registry, SALT_PHASE_IDS, SCM_PHASE_IDS,
@@ -611,10 +611,12 @@ def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
     (deterministic: fixed operation order, fixed tolerance)."""
     if face_mixing_beta is None:
         face_mixing_beta = FACE_MIXING_BETA
-    g = state.capillary_liquid.astype(np.float64).copy()
-    for i in range(state.hydrate_fraction.shape[0]):
-        if gel_eps[i] > 0.0:
-            g += gel_rel_diffusivity * state.hydrate_fraction[i]
+    # shared cell-conductance rule (PRD 1.3: same calculation as RT's field);
+    # the floor stays HERE - it is a CG-conditioning/reporting device, not
+    # physics (v4.0/RT)
+    g = transport.conductance_field(state.capillary_liquid,
+                                    state.hydrate_fraction, gel_eps,
+                                    gel_rel_diffusivity)
     g = np.maximum(np.clip(g, 0.0, None), NETWORK_FLOOR)
     # partiality of the capillary filling: 1 wherever the voxel is genuinely
     # partial (a sub-voxel throat), 0 for resolved full/empty voxels — the

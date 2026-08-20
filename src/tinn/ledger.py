@@ -35,6 +35,27 @@ class PlacementBalance:
 
 
 @dataclass
+class ExchangeBalance:
+    """v4.0/RT mode C (PRD §6.1 교환 수지): the summed inventory change the
+    transport operator applied must equal the net boundary exchange (zero
+    while sealed). Edges are applied antisymmetrically, so a violation is
+    bookkeeping corruption, not discretization error."""
+    applied_delta_elements: np.ndarray   # (E,) sum over domains
+    boundary_net_elements: np.ndarray    # (E,) + = into the system
+    abs_flux_scale: float                # sum |q| for the relative tolerance
+
+
+@dataclass
+class DomainPartition:
+    """v4.0/RT mode C (PRD §6.1 도메인 분할 정합): the domain map must refine
+    the cluster map — every wet voxel in a domain, every domain inside
+    exactly one cluster (integer-exact check)."""
+    labels: np.ndarray                   # (N,N,N) cluster labels
+    domain_id: np.ndarray                # (N,N,N)
+    domain_to_cluster: np.ndarray        # (D,)
+
+
+@dataclass
 class LedgerReport:
     violations: List[str] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -61,14 +82,16 @@ def current_elements(state: SimulationState, registry: Registry) -> np.ndarray:
 
 
 def check_all(state: SimulationState, registry: Registry,
-              placement: Optional[PlacementBalance] = None) -> LedgerReport:
+              placement: Optional[PlacementBalance] = None,
+              exchange: Optional[ExchangeBalance] = None,
+              partition: Optional[DomainPartition] = None) -> LedgerReport:
     rep = LedgerReport()
 
     # 1. element balance (expected = initial + anything the backend injected:
     # redox seeds and solver floors, both tracked exactly)
     cur = current_elements(state, registry)
-    # boundary_exchanged_elements is the RT-W2 reservation (FORMAT_VERSION 3):
-    # zeros today, so this is a no-op until boundary reservoirs exist
+    # boundary_exchanged_elements is the RT-W3 reservation: zeros until
+    # boundary reservoirs exist, so this is a no-op while sealed
     expected = (state.initial_elements + state.injected_elements
                 + state.boundary_exchanged_elements)
     err = np.abs(cur - expected)
@@ -149,12 +172,37 @@ def check_all(state: SimulationState, registry: Registry,
     if min_channel < -VOXEL_IDENTITY_TOL:
         rep.violations.append("balance_voxel:negative")
 
-    # 3. water partition: free + gel + bound = initial total
+    # 3. water partition: free + gel + bound = initial + boundary-exchanged
+    # solvent (v4.0/RT: the boundary term is zero until RT-W3 reservoirs)
+    w_expected = state.initial_water_mol + state.boundary_water_mol
     w_err = abs(state.water_free_mol + state.water_gel_mol + state.water_bound_mol
-                - state.initial_water_mol)
+                - w_expected)
     rep.metrics["water_partition_err_mol"] = w_err
-    if w_err > ELEMENT_ATOL_MOL + ELEMENT_RTOL * abs(state.initial_water_mol):
+    if w_err > ELEMENT_ATOL_MOL + ELEMENT_RTOL * abs(w_expected):
         rep.violations.append("balance_water:partition")
+
+    # v4.0/RT mode C gates (PRD 6.1)
+    if partition is not None:
+        d_id = partition.domain_id
+        wet_cl = partition.labels >= 0
+        wet_dom = d_id >= 0
+        bad_cover = bool(np.any(wet_cl != wet_dom))
+        bad_parent = False
+        if not bad_cover and partition.domain_to_cluster.size:
+            mapped = np.where(wet_dom,
+                              partition.domain_to_cluster[
+                                  np.clip(d_id, 0, None)], -1)
+            bad_parent = bool(np.any(mapped[wet_dom]
+                                     != partition.labels[wet_dom]))
+        if bad_cover or bad_parent:
+            rep.violations.append("balance_domain:partition")
+    if exchange is not None:
+        ex_err = np.abs(exchange.applied_delta_elements
+                        - exchange.boundary_net_elements)
+        ex_bound = ELEMENT_ATOL_MOL + 1e-12 * exchange.abs_flux_scale
+        rep.metrics["exchange_net_err_mol"] = float(ex_err.max())
+        if np.any(ex_err > ex_bound):
+            rep.violations.append("balance_exchange")
 
     # 4. dense arrays vs mol ledger (volumes in voxel units)
     max_rel = 0.0

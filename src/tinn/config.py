@@ -421,11 +421,46 @@ class ScmComposition(BaseModel):
         return self
 
 
+class DomainPartitionConfig(BaseModel):
+    """Mode C (PRD 4.6.2): sub-cluster equilibration domains from a static
+    axis-aligned tiling, coupled by implicit diffusion on the domain graph."""
+    model_config = _STRICT
+    # tile edge in voxels; must divide rve.grid_size. == grid_size is the
+    # degenerate 1-domain-per-cluster limit (bit-identical to mode full).
+    tile_vox: int = Field(ge=2)
+    # common effective free-solution diffusivity for all elements. REQUIRED
+    # and explicit - no invented default. Bulk ionic self-diffusivities at
+    # 25 C span 0.8e-9 (Ca2+) to 5.3e-9 (OH-) m2/s; 1e-9 is the
+    # conventional single-D compromise (PRD 4.6.2: the elemental state
+    # carries no speciation, so a per-element D would be an invented
+    # speciation; the graph carries the geometry, D0 is the bulk scale).
+    d0_m2_s: float = Field(gt=0.0)
+    # GEM-call economy (PRD 4.6.2). dirty_rtol = 0.0 equilibrates every
+    # wet domain every step - the pure mode-C reference.
+    dirty_rtol: float = Field(default=0.0, ge=0.0)
+    eq_max_age_steps: int = Field(default=16, ge=1)
+    max_gem_calls_per_step: Optional[int] = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> "DomainPartitionConfig":
+        if not math.isfinite(self.d0_m2_s):
+            raise ValueError("d0_m2_s must be finite")
+        if not math.isfinite(self.dirty_rtol):
+            raise ValueError("dirty_rtol must be finite")
+        return self
+
+
 class TransportConfig(BaseModel):
     """v4.0/RT chemistry-transport modes (PRD 1.4/4.6). Absence of the
     section — or None in every field — preserves the exact current engine,
     bit for bit, and every earlier config hash."""
     model_config = _STRICT
+    # Mode C: sub-cluster equilibration domains (PRD 4.6.2). None => one
+    # well-mixed reactor per connected cluster (exact legacy path). Allowed
+    # with BOTH backends: with stoichiometric it still changes real physics
+    # (per-domain dissolution/placement), which lets the partition gates
+    # run GEMS-free.
+    domains: Optional[DomainPartitionConfig] = None
     # Mode B: rate-limited re-equilibration (PRD 4.6.1). Per step, only the
     # fraction f = min(1, dt/tau) of each domain's owned solid-solution
     # inventory is offered to the equilibrium; the withheld remainder keeps
@@ -483,7 +518,7 @@ class TransportConfig(BaseModel):
 
     def rate_limited(self) -> bool:
         return (self.exchange_tau_h is not None
-                or bool(self.exchange_tau_h_per_phase))
+                or self.exchange_tau_h_per_phase is not None)
 
 
 class TinnConfig(BaseModel):
@@ -622,6 +657,13 @@ class TinnConfig(BaseModel):
                 "owned hydrates, which only the gems3k snapshot backend "
                 "performs - with the stoichiometric backend it would be a "
                 "silent no-op, so it is refused")
+        if (self.transport is not None and self.transport.domains is not None
+                and self.rve.grid_size % self.transport.domains.tile_vox != 0):
+            raise ValueError(
+                f"transport.domains.tile_vox "
+                f"{self.transport.domains.tile_vox} does not divide the "
+                f"grid size {self.rve.grid_size} - tiles must wrap "
+                f"periodically")
         return self
 
     def config_hash(self) -> str:

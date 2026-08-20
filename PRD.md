@@ -656,8 +656,8 @@ alpha 슬롯은 항상 0이고, 방출량은 엔진이 접근성에서 직접 �
 | C3S 픽스처 | 1.0 g C3S, w/C3S 0.50, 293.15 K, 표면 스케일링 중립(1.0) | 최소 스모크 조건 |
 | RT 해석 앵커 1 (v4.0) | 2-도메인 교환: Δc(t)=Δc(0)·e^(−λt), λ=(D₀G/p)(1/W₁+1/W₂); BE 1스텝은 Δc⁺=Δc/(1+Δt·λ) 대수 정확 | exchange_be 단위 테스트 |
 | RT 해석 앵커 2 (v4.0) | 타일별 상수 슬래브 체인: 도메인 그래프 정상 플럭스 = 미세 격자 `relative_diffusivity_network` 플럭스 (CG 공차 내 — TPFA는 타일별 상수장에서 정확) | 전달률 p-나눗셈·공용 전도 규칙 고정 |
-| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): full_hash 1c7d2a107d44c4b9bc95942c4ea40330f9ee549ba3fa739e5faf64a5b8906596, dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df | 합성 경로 기본값 불변 감시 (GEMS 불요) |
-| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): full_hash 84751b8b29eb095110b0ab15bf066174fb36362f024c708efa2363a7cf0fc3d7, dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
+| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df (버전 불변 권위), full_hash v3 원기록 1c7d2a10…, **v4 재고정(RT-W2, boundary_water_mol이 해시에 편입) fe100126c8a0fa1b5e59181433237776bfc58bc83cecffe18acecf0ae9f85572** — dense 동일 실측으로 물리 불변 입증 | 합성 경로 기본값 불변 감시 (GEMS 불요) |
+| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 (버전 불변 권위), full_hash v3 원기록 84751b8b…, **v4 재고정(RT-W2) b30c6f1a3102b2cbdb853496b9b2cf19dd6b2c1cc6bbb985eb4b73323ecf2f9c** — dense 동일 실측 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
 
 ### 6.3 Sanity band (비블로킹 — 리포트에 pass/warn/info만 기록; info = 해당 배합에 밴드 전제가 비적용, 값만 표시 — rev.2)
 

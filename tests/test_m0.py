@@ -68,6 +68,26 @@ def test_transport_config_validation():
             _base_config(transport={"exchange_tau_h": 10.0}))
 
 
+def test_domain_partition_config_validation_and_hash():
+    """v4.0/RT mode C knobs: tile must divide the grid, d0 is required and
+    finite; an absent/None domains key keeps the legacy hash."""
+    base = TinnConfig.model_validate(_base_config()).config_hash()
+    assert TinnConfig.model_validate(
+        _base_config(transport={"domains": None})).config_hash() == base
+    ok = TinnConfig.model_validate(_base_config(
+        transport={"domains": {"tile_vox": 8, "d0_m2_s": 1e-9}}))
+    assert ok.config_hash() != base
+    for bad in ({"tile_vox": 7, "d0_m2_s": 1e-9},      # does not divide 32
+                {"tile_vox": 8},                        # d0 required
+                {"tile_vox": 8, "d0_m2_s": 0.0},
+                {"tile_vox": 8, "d0_m2_s": float("inf")},
+                {"tile_vox": 8, "d0_m2_s": 1e-9, "dirty_rtol": -1.0},
+                {"tile_vox": 8, "d0_m2_s": 1e-9, "unknown": 1}):
+        with pytest.raises(ValidationError):
+            TinnConfig.model_validate(_base_config(
+                transport={"domains": bad}))
+
+
 def test_config_valid_and_hash_stable():
     a = TinnConfig.model_validate(_base_config())
     b = TinnConfig.from_json_file(str(EXAMPLES / "c3s_32.json"))
