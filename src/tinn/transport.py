@@ -348,15 +348,20 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         np.add.at(y, eb, -contrib)
         return y
 
+    # per-column normalization: repeated bath drains push inventories to
+    # denormal scale (measured 1e-155), where rz underflows, beta blows up
+    # and CG overflows to NaN. The system is linear - solve in O(1) scale
+    # and rescale the solution (deterministic, columnwise).
+    col_scale = np.maximum(np.abs(b).sum(axis=0), 1e-300)
+    b = b / col_scale[None, :]
     x = b / diag[:, None]
     r = b - matvec(x)
     z = r / diag[:, None]
     p = z.copy()
     rz = (r * z).sum(axis=0)
-    bnorm = np.maximum(np.abs(b).sum(axis=0), 1e-300)
     iters = 0
     for iters in range(1, max_iter + 1):
-        if np.all(np.abs(r).sum(axis=0) <= tol * bnorm):
+        if np.all(np.abs(r).sum(axis=0) <= tol):
             break
         ap = matvec(p)
         pap = (p * ap).sum(axis=0)
@@ -371,6 +376,7 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     else:
         return ExchangeResult(delta, "not_converged", iters, 0.0, 0.0,
                               np.zeros(n_elem))
+    x = x * col_scale[None, :]
 
     flux = dt_h * t_e[:, None] * (x[ea] - x[eb])    # (n_edges, n_elem)
     np.add.at(delta, ea, -flux)

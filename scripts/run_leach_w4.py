@@ -35,11 +35,15 @@ def run_case(d0: float, out_dir: Path) -> dict:
     cfg = TinnConfig.model_validate(raw)
     supply = []
 
+    frozen = {"nonconv": 0.0, "water": 0.0}
+
     def hook(ev):
         if ev.get("event") == "step_accepted":
             m = ev.get("metrics", {})
             if "boundary_supply_ratio" in m:
                 supply.append(m["boundary_supply_ratio"])
+            frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
+            frozen["water"] += m.get("water_frozen_domains", 0.0)
 
     t0 = time.perf_counter()
     state, summary = Engine(cfg).run(out_dir=str(out_dir), audit_hook=hook)
@@ -77,6 +81,8 @@ def run_case(d0: float, out_dir: Path) -> dict:
     return {
         "d0_m2_s": d0, "wall_s": round(wall, 1),
         "supply_ratio_max": max(supply) if supply else None,
+        "nonconv_frozen_total": frozen["nonconv"],
+        "water_frozen_total": frozen["water"],
         "supply_ratio_mean": (sum(supply) / len(supply)) if supply else None,
         "rows": [{k: v for k, v in r.items() if k != "layer_CH"}
                  for r in rows],

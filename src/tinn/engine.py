@@ -322,24 +322,57 @@ class Engine:
                                 minlength=n_clusters)
         water_mol_c = liq_vol_c / vm_w
 
-        if state.cluster_inventory.shape[0] == n_clusters:
-            inv_in = state.cluster_inventory
-        elif state.cluster_inventory.shape[0] == 0:
+        # RT-W4 sealed -> exposed switch (start_h): the stored rows were
+        # keyed on the fully periodic partition; the first bath-active
+        # step de-periodizes the exposed axis, splitting clusters that
+        # were connected ONLY through the seam. Remap the rows onto the
+        # new partition conservatively - identical liquid on both sides,
+        # so the transfer is an exact liquid-volume split and a dryout is
+        # impossible. Pure function of (config, state): restart-safe.
+        inv_rows = state.cluster_inventory
+        pool_rows = state.cluster_endmember_mol
+        eq_rows_ok = True
+        if (bath_active and self._b_start > 0.0
+                and abs(trial.time_h - self._b_start) <= 1e-9
+                and inv_rows.shape[0] not in (0, n_clusters)):
+            old_cl, old_ncl = transport.label_clusters(prev_liquid)
+            if dom_to_cl is not None:
+                old_labels, old_n, _ = transport.label_domains(
+                    old_cl, old_ncl, self._domains_cfg.tiles(trial.grid_size))
+            else:
+                old_labels, old_n = old_cl, old_ncl
+            if inv_rows.shape[0] == old_n:
+                sw = transport.remap_inventories(
+                    old_labels, prev_liquid, labels, prev_liquid,
+                    inv_rows, n_clusters)
+                assert not sw.dryout
+                inv_rows = sw.inventory
+                if pool_rows.shape[0] == old_n:
+                    pool_rows = transport.remap_inventories(
+                        old_labels, prev_liquid, labels, prev_liquid,
+                        pool_rows, n_clusters).inventory
+                # economy snapshots do not survive a repartition (the 1:1
+                # inheritance rule) - treat as absent: all domains forced
+                eq_rows_ok = False
+
+        if inv_rows.shape[0] == n_clusters:
+            inv_in = inv_rows
+        elif inv_rows.shape[0] == 0:
             inv_in = np.zeros((n_clusters, len(ELEMENT_IDS)))
         else:
             raise RuntimeError(
-                f"cluster inventory has {state.cluster_inventory.shape[0]} rows but "
+                f"cluster inventory has {inv_rows.shape[0]} rows but "
                 f"{n_clusters} clusters were labeled - state is corrupted (no fallback)")
         # E2: per-cluster endmember pools ride the same labeling contract
-        if state.cluster_endmember_mol.shape[0] == n_clusters \
-                and state.cluster_endmember_mol.shape[1] == self._n_em:
-            em_pool_in = state.cluster_endmember_mol
-        elif state.cluster_endmember_mol.shape[0] == 0:
+        if pool_rows.shape[0] == n_clusters \
+                and pool_rows.shape[1] == self._n_em:
+            em_pool_in = pool_rows
+        elif pool_rows.shape[0] == 0:
             em_pool_in = np.zeros((n_clusters, self._n_em))
         else:
             raise RuntimeError(
                 f"cluster endmember pool has shape "
-                f"{state.cluster_endmember_mol.shape} but "
+                f"{pool_rows.shape} but "
                 f"({n_clusters}, {self._n_em}) was expected - state is "
                 f"corrupted (no fallback)")
 
@@ -349,11 +382,17 @@ class Engine:
         # post-transport inventories. Full mode: no partition, no exchange.
         exchange_bal = None
         exchange_metrics: Dict[str, float] = {}
+        bath_cluster_domain = None
         if dom_to_cl is not None:
             inv_eff = inv_in.copy()
-            g_field = transport.conductance_field(
+            # clip like the report solver (analysis.py): placement dust can
+            # leave ~-1e-19 in a voxel, and a negative face conductance
+            # breaks the M-matrix property the BE solve relies on (measured:
+            # CG stall -> transport_failure at a leached face). The report's
+            # FLOOR stays out - only the clip is physics.
+            g_field = np.clip(transport.conductance_field(
                 prev_liquid, trial.hydrate_fraction, gel_eps,
-                analysis.GEL_REL_DIFFUSIVITY)
+                analysis.GEL_REL_DIFFUSIVITY), 0.0, None)
             tiles = self._domains_cfg.tiles(trial.grid_size)
             graph = transport.build_domain_graph(
                 labels, n_clusters, g_field, prev_liquid, axes_now,
@@ -379,20 +418,53 @@ class Engine:
             if bath is not None:
                 trial.boundary_exchanged_elements = (
                     trial.boundary_exchanged_elements + ex.boundary_net)
+                # bath-sweep floor (W4 measured): the BE drain leaves solute
+                # traces four-plus decades below their step-start cluster
+                # amounts, and feeding those to GEM sits on the AIA knife
+                # edge - measured as near-total per-step nonconvergence
+                # freezing, which stalls the front. Physically the RENEWED
+                # bath carries the last traces away: flush sub-threshold
+                # entries of bath-connected clusters to the boundary
+                # ledger (same floats - closure exact; the exchange gate
+                # compares only the operator's own fluxes).
+                bath_cl = np.unique(dom_to_cl[bnd_coupled])
+                in_bath_cl = np.isin(dom_to_cl, bath_cl)
+                bath_cluster_domain = in_bath_cl
+                # molality floor: 1e-8 mol solute per mol water (~6e-7
+                # mol/L) - negligible against any cement pore solution
+                # (autoprotolysis itself is 1e-7 mol/L) and far below the
+                # post-equilibration resupply (~1e-2 mol/L), yet well
+                # above the measured drain residue. Water-based, so it is
+                # state-independent and bootstrap-safe.
+                sweep = ((inv_eff > 0.0)
+                         & (inv_eff < 1e-8 * water_mol_c[:, None])
+                         & in_bath_cl[:, None])
+                if sweep.any():
+                    moved = np.where(sweep, inv_eff, 0.0)
+                    inv_eff = inv_eff - moved
+                    swept = moved.sum(axis=0)
+                    trial.boundary_exchanged_elements = (
+                        trial.boundary_exchanged_elements - swept)
+                    exchange_metrics["bath_swept_mol"] = float(swept.sum())
             exchange_bal = ledger.ExchangeBalance(
                 applied_delta_elements=ex.delta.sum(axis=0),
                 boundary_net_elements=ex.boundary_net,
                 abs_flux_scale=float(np.abs(ex.delta).sum()))
-            exchange_metrics = {
+            exchange_metrics.update({
                 "n_domains": float(n_clusters),
                 "exchange_cg_iterations": float(ex.cg_iterations),
                 "exchange_max_edge_flux_mol": ex.max_edge_flux_mol,
                 "exchange_repair_rel": ex.repair_rel,
-            }
+            })
             if bnd_coupled is not None:
                 # supply-limit witness (PRD 4.6.3 dt policy): per-step
-                # outflux over the bath-connected solution inventory
-                inv_pool = float(np.abs(inv_in[bnd_coupled]).sum())
+                # outflux over the BATH-CONNECTED CLUSTERS' solution
+                # inventory (the implicit step draws through the face
+                # bands from the whole cluster, so the face-row inventory
+                # alone is not the supply)
+                bath_cl = np.unique(dom_to_cl[bnd_coupled])
+                pool_mask = np.isin(dom_to_cl, bath_cl)
+                inv_pool = float(np.abs(inv_in[pool_mask]).sum())
                 out_mol = float(np.clip(-ex.boundary_net, 0.0, None).sum())
                 exchange_metrics.update({
                     "n_boundary_coupled": float(bnd_coupled.sum()),
@@ -417,7 +489,11 @@ class Engine:
         eq_inv_in = eq_w_in = eq_age_in = None
         if self._economy and dom_to_cl is not None:
             dcfg = self._domains_cfg
-            if state.domain_eq_inventory.shape[0] == n_clusters:
+            if not eq_rows_ok:
+                eq_inv_in = np.zeros((n_clusters, len(ELEMENT_IDS)))
+                eq_w_in = np.zeros(n_clusters)
+                eq_age_in = np.full(n_clusters, -1, dtype=np.int64)
+            elif state.domain_eq_inventory.shape[0] == n_clusters:
                 eq_inv_in = state.domain_eq_inventory
                 eq_w_in = state.domain_eq_water
                 eq_age_in = state.domain_eq_age
@@ -610,6 +686,49 @@ class Engine:
                 # global element/endmember ledgers stay mutually consistent
                 # by construction ("subtract what was fed")
                 owned_elem[:, h, :] = owned_em[:, sl] @ trial.endmember_elements[sl]
+        if snapshot and dom_to_cl is not None and n_clusters > 0:
+            # Cross-domain overdraft guard (W4 measured: leaching's sharp
+            # AFm OH/SO4 redistribution drove the summed per-endmember feed
+            # past the global holdings -> balance_endmember_negative abort,
+            # the residual risk the E2 review named). If the summed feed
+            # would overdraw an endmember, scale the offending domains'
+            # WHOLE-CHANNEL feed by one scalar (mol, volume, endmembers and
+            # elements together - every closure identity stays consistent)
+            # in domain-id order, deterministic. Mode full is untouched;
+            # the no-overdraw fast path does no arithmetic.
+            avail = np.clip(trial.endmember_mol, 0.0, None)
+            if np.any(np.clip(owned_em, 0.0, None).sum(axis=0)
+                      > avail + 1e-30):
+                if offered_vol is own_vol:
+                    offered_vol = own_vol.copy()
+                    offered_mol = owned_mol.copy()
+                remaining = avail.copy()
+                clamped = 0.0
+                for c in range(n_clusters):
+                    for h in range(n_h):
+                        sl = self._em_slice[self.hydrate_ids[h]]
+                        need = np.clip(owned_em[c, sl], 0.0, None)
+                        if not need.any():
+                            remaining[sl] -= np.clip(owned_em[c, sl], 0.0,
+                                                     None)
+                            continue
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            ratios = np.where(need > 0.0,
+                                              remaining[sl] / np.where(
+                                                  need > 0.0, need, 1.0),
+                                              np.inf)
+                        k = float(min(1.0, max(0.0, ratios.min())))
+                        if k < 1.0:
+                            clamped += float(need.sum() * (1.0 - k))
+                            owned_em[c, sl] *= k
+                            owned_elem[c, h, :] = (owned_em[c, sl]
+                                                   @ trial
+                                                   .endmember_elements[sl])
+                            offered_mol[c, h] *= k
+                            offered_vol[c, h] *= k
+                        remaining[sl] -= np.clip(owned_em[c, sl], 0.0, None)
+                if clamped > 0.0:
+                    exchange_metrics["endmember_feed_clamped_mol"] = clamped
         owned_gel_c = (offered_vol * gel_eps).sum(axis=1)
 
         total_water_mol = float(water_mol_c.sum())
@@ -628,6 +747,7 @@ class Engine:
                 residual[c] = inv_eff[c]
                 continue
             water_c = float(water_mol_c[c])
+            inv_flushed = False
             if dom_to_cl is None:
                 trace_water = water_c < 1e-3 * total_water_mol
             else:
@@ -655,6 +775,26 @@ class Engine:
                     else:
                         result = self.backend.react(scaled, water_c, inv_eff[c])
                 except backend_mod.BackendTransientError:
+                    if (bath_cluster_domain is not None
+                            and bath_cluster_domain[c]
+                            and not inv_flushed
+                            and np.any(inv_eff[c] != 0.0)):
+                        # W4 measured: drained-solution inventories (traces
+                        # to ~1/100 of equilibrium, ratio-distorted) sit on
+                        # a STOCHASTIC GEM/AIA knife edge, while the same
+                        # call with the inventory exactly zero converges.
+                        # The renewed bath takes the remainder: flush the
+                        # domain's solutes to the boundary ledger (exact
+                        # floats - closure holds) and retry once before
+                        # the scale-down path.
+                        trial.boundary_exchanged_elements = (
+                            trial.boundary_exchanged_elements - inv_eff[c])
+                        inv_eff[c] = 0.0
+                        inv_flushed = True
+                        exchange_metrics["bath_flushed_domains"] = (
+                            exchange_metrics.get("bath_flushed_domains",
+                                                 0.0) + 1.0)
+                        continue
                     # nonconvergence may be release-size dependent — scale down a
                     # few times before giving up on this cluster
                     transient_failures += 1
@@ -688,17 +828,35 @@ class Engine:
                     scale_c[c] = 0.0
                     residual[c] = inv_eff[c]
                     continue
-                if bath_active and failure_reason == REJECT_BACKEND_FAILURE:
-                    # RT-W3 (PRD 4.6.3): under an active bath, a drained
-                    # domain (assemblage + near-pure water + solute dust)
-                    # can sit on a genuine GEM/AIA knife edge that no
-                    # release scale or dt fixes - the composition is a
-                    # boundary-regime state, not a bug. Freeze it exactly
-                    # like the space-filling impossibility (release ->
-                    # unmet, assemblage and inventory kept); the next
-                    # step's releases re-regularize it. Sealed runs keep
-                    # the hard reject - there this failure signals a
-                    # defect. Visible via nonconv_frozen_domains.
+                if (dom_to_cl is not None and failure_reason
+                        == backend_mod.STATUS_INSUFFICIENT_WATER):
+                    # mode C (PRD 4.6.2): a DOMAIN whose equilibrium needs
+                    # more water than the domain holds at every release
+                    # scale is a local water-starved pocket - the snapshot
+                    # delta is dt-independent, so rejecting could only
+                    # abort the run (the space-filling argument). Full mode
+                    # keeps the hard reject: there the whole cluster's
+                    # water pooled, and failing it signals a defect.
+                    exchange_metrics["water_frozen_domains"] = (
+                        exchange_metrics.get("water_frozen_domains", 0.0)
+                        + 1.0)
+                    scale_c[c] = 0.0
+                    residual[c] = inv_eff[c]
+                    continue
+                if (dom_to_cl is not None
+                        and failure_reason == REJECT_BACKEND_FAILURE):
+                    # RT-W3/W4 (PRD 4.6.3): a PARTITIONED domain can reach
+                    # local compositions the pooled cluster never sees -
+                    # bath-drained solutions (assemblage + near-pure water
+                    # + dust) and late-age water-starved bands both sit on
+                    # genuine GEM/AIA knife edges that no release scale or
+                    # dt fixes (measured: a 1e-8 relative perturbation
+                    # flips convergence). Freeze the domain exactly like
+                    # the space-filling impossibility (release -> unmet,
+                    # assemblage and inventory kept); later steps
+                    # re-regularize it. FULL mode keeps the hard reject -
+                    # there the failure signals a defect. Visible via
+                    # nonconv_frozen_domains.
                     exchange_metrics["nonconv_frozen_domains"] = (
                         exchange_metrics.get("nonconv_frozen_domains", 0.0)
                         + 1.0)

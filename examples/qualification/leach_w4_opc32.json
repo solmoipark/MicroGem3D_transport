@@ -41,7 +41,7 @@
       "axis": "z",
       "side": "low",
       "start_h": 168.0,
-      "composition_mol_per_m3": {}
+      "composition_mol_per_m3": {"O": 0.5}
     }
   }
 }
