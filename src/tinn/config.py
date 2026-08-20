@@ -657,6 +657,28 @@ class TinnConfig(BaseModel):
                 "owned hydrates, which only the gems3k snapshot backend "
                 "performs - with the stoichiometric backend it would be a "
                 "silent no-op, so it is refused")
+        if self.transport is not None:
+            # scientific-review recommendation 1 (2026-08-20): a tau at or
+            # below dt_min guarantees f = 1 at EVERY reachable dt - mode B
+            # declared but permanently reverted to full re-equilibration.
+            # Same silent-no-op class as above, refused. (tau between
+            # dt_min and the cruise dt engages on halved retries and is a
+            # legitimate, if unusual, configuration.)
+            floor = self.schedule.dt_min_h
+            tau_g = self.transport.exchange_tau_h
+            if tau_g is not None and tau_g <= floor:
+                raise ValueError(
+                    f"exchange_tau_h {tau_g} h <= schedule.dt_min_h {floor} "
+                    f"h keeps f = 1 at every reachable dt - mode B would "
+                    f"silently run full re-equilibration")
+            for key, val in (self.transport.exchange_tau_h_per_phase
+                             or {}).items():
+                if 0.0 < val <= floor:
+                    raise ValueError(
+                        f"exchange_tau_h_per_phase[{key!r}] = {val} h <= "
+                        f"schedule.dt_min_h {floor} h keeps that channel at "
+                        f"f = 1 always (use 0.0 for an explicit fully-"
+                        f"offered channel)")
         if (self.transport is not None and self.transport.domains is not None
                 and self.rve.grid_size % self.transport.domains.tile_vox != 0):
             raise ValueError(

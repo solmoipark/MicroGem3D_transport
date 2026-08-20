@@ -333,23 +333,94 @@ def test_subdomain_restart_bit_identity(tmp_path):
     assert restarted.full_hash() == straight.full_hash()
 
 
-def test_domain_economy_knobs_not_implemented_yet():
+# ---------------- RT-W2b: GEM-call economy --------------------------------
+
+def _econ_cfg(**dom):
     raw = json.loads((EXAMPLES / "c3s_32.json").read_text(encoding="utf-8"))
-    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
-                                    "dirty_rtol": 1e-3}}
-    with pytest.raises(ValueError, match="RT-W2b"):
-        Engine(TinnConfig.model_validate(raw))
+    raw["kinetics"] = {"kind": "tabulated",
+                       "table": {"times_h": [0.0, 24.0],
+                                 "alpha": {"C3S": [0.0, 0.12]}}}
+    raw["schedule"] = {"output_times_h": [6.0, 12.0, 18.0, 24.0],
+                       "dt_initial_h": 6.0, "dt_min_h": 0.01}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1e-9, **dom}}
+    return TinnConfig.model_validate(raw)
+
+
+def test_economy_defers_element_exactly_and_age_forces():
+    """With an unreachable dirty threshold, every domain equilibrates on
+    first touch, then defers (releases accumulate in the inventory,
+    element-exactly) until the age bound forces a re-equilibration."""
+    cfg = _econ_cfg(dirty_rtol=1e9, eq_max_age_steps=2)
+    eng = Engine(cfg)
+    s0 = eng.initial_state()
+    t1, rej, m1 = eng.try_step(s0, 6.0)
+    assert rej is None
+    assert m1["n_deferred"] == 0.0          # first touch: all forced
+    assert np.all(t1.domain_eq_age >= 0)
+    t2, rej, m2 = eng.try_step(t1, 6.0)
+    assert rej is None
+    assert m2["n_deferred"] > 0.0           # age 1 < 2, drift below 1e9
+    # deferred releases sit in the inventory, element-exactly
+    assert float(np.abs(t2.cluster_inventory).sum()) > \
+        float(np.abs(t1.cluster_inventory).sum())
+    assert ledger.check_all(t2, REG).ok
+    t3, rej, m3 = eng.try_step(t2, 6.0)
+    assert rej is None
+    assert m3["n_deferred"] > 0.0           # ages at 1, bound is 2
+    t4, rej, m4 = eng.try_step(t3, 6.0)
+    assert rej is None
+    assert m4["max_eq_age"] >= 2.0          # the age bound fires here:
+    assert m4["n_gem_selected"] > 0.0       # aged domains re-equilibrate
+    assert np.all(t4.domain_eq_age <= 2)
+    assert ledger.check_all(t4, REG).ok
+
+
+def test_economy_budget_caps_calls_deterministically():
+    cfg = _econ_cfg(dirty_rtol=0.0, max_gem_calls_per_step=1,
+                    eq_max_age_steps=1000)
+    eng = Engine(cfg)
+    s0 = eng.initial_state()
+    t1, rej, _ = eng.try_step(s0, 6.0)      # first touch: forced, uncapped
+    assert rej is None
+    t2, rej, m2 = eng.try_step(t1, 6.0)
+    assert rej is None
+    # dirty candidates capped at 1; no forced categories fire here (no
+    # salts, ages far below the bound, labels stable step-to-step)
+    assert m2["n_gem_selected"] <= 1.0
+    assert m2["n_deferred"] > 0.0
+    t2b, _, m2b = eng.try_step(t1, 6.0)
+    assert m2b["n_gem_selected"] == m2["n_gem_selected"]
+    assert t2b.full_hash() == t2.full_hash()
+
+
+def test_economy_restart_bit_identity(tmp_path):
+    cfg = _econ_cfg(dirty_rtol=1e9, eq_max_age_steps=3)
+    straight, _ = Engine(cfg).run(out_dir=str(tmp_path / "run"))
+    mid = load_checkpoint(str(tmp_path / "run" / "ckpt_001"), REG)
+    assert mid.domain_eq_age.shape[0] > 0   # snapshots rode the checkpoint
+    restarted, _ = Engine(mid.config).run(state=mid)
+    assert restarted.full_hash() == straight.full_hash()
+
+
+def test_economy_off_leaves_snapshots_empty(tmp_path):
+    cfg = _econ_cfg()                        # dirty_rtol 0.0, no budget
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "pure"))
+    assert state.domain_eq_inventory.shape[0] == 0
+    assert state.domain_eq_age.shape[0] == 0
 
 
 # ---------------- mode B: coupled GEMS gates ------------------------------
 
 @needs_gems
 def test_tau_below_dt_is_bitwise_full_mode(rt_full, tmp_path):
-    """tau <= dt_min => f == 1.0 exactly at every attempted dt => the engine
-    takes the aliased legacy arrays — the trajectory is bit-identical."""
+    """tau <= every ATTEMPTED dt => f == 1.0 exactly => the engine takes the
+    aliased legacy arrays — the trajectory is bit-identical. tau = 1.0 h
+    against the 2.0 h cruise dt (this run accepts every step; even one
+    halving to 1.0 h still gives f = min(1, 1.0/1.0) = 1.0 exactly).
+    tau <= dt_min itself is refused at config time (review rec. 1)."""
     full_state, _ = rt_full
-    cfg = _gems_cfg(transport={"exchange_tau_h": 1e-4})
-    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "tau_tiny"))
+    cfg = _gems_cfg(transport={"exchange_tau_h": 1.0})
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "tau_small"))
     assert state.full_hash() == full_state.full_hash()
 
 

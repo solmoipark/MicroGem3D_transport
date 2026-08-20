@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import subprocess
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -111,6 +111,18 @@ class SimulationState:
                                      # identity reads initial + boundary.
                                      # Trails the field list so pre-RT
                                      # construction sites stay valid.
+    # v4.0/RT-W2b GEM-call economy snapshots (PRD 4.6.2): the last
+    # equilibrated inventory/water per domain and the steps since. Rows
+    # follow the cluster_inventory contract (n_domains or 0 = no records);
+    # age -1 = no valid record (forced equilibration). Persisted because the
+    # post-restart call pattern - hence the trajectory - depends on them.
+    # Empty (rows 0) whenever the economy is off, so W2a-era checkpoints and
+    # hashes are unchanged by their existence.
+    domain_eq_inventory: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, len(ELEMENT_IDS))))
+    domain_eq_water: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    domain_eq_age: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64))
 
     # --- derived helpers ---
     @property
@@ -149,7 +161,8 @@ class SimulationState:
                     self.endmember_elements, self.boundary_exchanged_elements,
                     self.injected_elements,
                     self.initial_elements, self.cluster_inventory,
-                    self.cluster_endmember_mol):
+                    self.cluster_endmember_mol, self.domain_eq_inventory,
+                    self.domain_eq_water, self.domain_eq_age):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(repr(self.hydrate_ids).encode())
         h.update(repr(self.endmember_ids).encode())

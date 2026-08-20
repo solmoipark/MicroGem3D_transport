@@ -94,6 +94,12 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
         _write_zarr_array(tmp / "arrays" / "cluster_inventory", state.cluster_inventory)
         _write_zarr_array(tmp / "arrays" / "cluster_endmember_mol",
                           state.cluster_endmember_mol)
+        _write_zarr_array(tmp / "arrays" / "domain_eq_inventory",
+                          state.domain_eq_inventory)
+        _write_zarr_array(tmp / "arrays" / "domain_eq_water",
+                          state.domain_eq_water)
+        _write_zarr_array(tmp / "arrays" / "domain_eq_age",
+                          state.domain_eq_age)
 
         header = {
             "format_version": FORMAT_VERSION,
@@ -196,6 +202,11 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     cluster_inventory = _read_zarr_array(root / "arrays" / "cluster_inventory")
     cluster_endmember_mol = _read_zarr_array(
         root / "arrays" / "cluster_endmember_mol")
+    domain_eq_inventory = _read_zarr_array(
+        root / "arrays" / "domain_eq_inventory")
+    domain_eq_water = _read_zarr_array(root / "arrays" / "domain_eq_water")
+    domain_eq_age = _read_zarr_array(
+        root / "arrays" / "domain_eq_age").astype(np.int64)
 
     tables = json.loads((root / "tables.json").read_text(encoding="utf-8"))
 
@@ -218,6 +229,9 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         parcels=tables["parcels"],
         remap_events=tables["remap_events"],
         cluster_inventory=cluster_inventory,
+        domain_eq_inventory=domain_eq_inventory,
+        domain_eq_water=domain_eq_water,
+        domain_eq_age=domain_eq_age,
         cluster_endmember_mol=cluster_endmember_mol,
         time_h=header["time_h"],
         dt_h=header["dt_h"],

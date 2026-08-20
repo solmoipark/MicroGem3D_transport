@@ -147,15 +147,27 @@ class Engine:
             h_m = config.rve.voxel_size_um * 1e-6
             self._d0_vox2_h = (self._domains_cfg.d0_m2_s * 3600.0
                                / (h_m * h_m))
-            if (self._domains_cfg.dirty_rtol > 0.0
-                    or self._domains_cfg.max_gem_calls_per_step is not None):
-                # the GEM-call economy lands at RT-W2b; accepting the knobs
-                # while ignoring them would be a silent no-op (PRD 5)
-                raise ValueError(
-                    "transport.domains.dirty_rtol > 0 / "
-                    "max_gem_calls_per_step are the RT-W2b GEM-call economy "
-                    "- not implemented yet; use dirty_rtol = 0.0 (every wet "
-                    "domain equilibrates every step)")
+            # RT-W2b GEM-call economy active iff either knob departs from
+            # the equilibrate-everything default
+            self._economy = (self._domains_cfg.dirty_rtol > 0.0
+                             or self._domains_cfg.max_gem_calls_per_step
+                             is not None)
+            if self._economy:
+                # deferred domains raise the memo pressure: quiescent
+                # inputs recur across steps (PRD 4.6.2)
+                n_tiles = (config.rve.grid_size
+                           // self._domains_cfg.tile_vox) ** 3
+                cap = max(256, min(4 * n_tiles, 8192))
+                if hasattr(self.backend, "memo_cap"):
+                    self.backend.memo_cap = cap
+            # per-kinetic-phase element rows for booking skipped releases
+            # into the inventory element-exactly
+            from .registry import element_vector
+            self._kin_elements = np.stack([
+                element_vector(self.registry.get(p).formula, 1.0)
+                for p in KINETIC_PHASE_IDS])
+        else:
+            self._economy = False
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -203,10 +215,15 @@ class Engine:
         prev_liquid = trial.capillary_liquid.copy()
         cl_labels, n_cl = transport.label_clusters(prev_liquid)
         # v4.0/RT mode C (PRD 4.6.2): the reactor key is the DOMAIN — cluster
-        # intersected with a static tile. Mode-full aliases the cluster
-        # labels (the literal identity), so every downstream use is
-        # bit-identical to the pre-RT engine.
-        if self._domains_cfg is not None:
+        # intersected with a static tile. The degenerate tile == grid case
+        # WITHOUT the economy takes the mode-full aliases outright, so the
+        # 1-domain bit-identity gate holds structurally (every mode-C branch
+        # keys on dom_to_cl is None), not by numerical luck; with the
+        # economy on, tile == grid legitimately means cluster-level
+        # deferral and keeps the domain machinery.
+        dom_active = self._domains_cfg is not None and (
+            self._domains_cfg.tile_vox != trial.grid_size or self._economy)
+        if dom_active:
             labels, n_clusters, dom_to_cl = transport.label_domains(
                 cl_labels, n_cl, self._domains_cfg.tile_vox)
         else:
@@ -301,7 +318,7 @@ class Engine:
         # post-transport inventories. Full mode: no partition, no exchange.
         exchange_bal = None
         exchange_metrics: Dict[str, float] = {}
-        if self._domains_cfg is not None:
+        if dom_to_cl is not None:
             inv_eff = inv_in.copy()
             g_field = transport.conductance_field(
                 prev_liquid, trial.hydrate_fraction, gel_eps,
@@ -326,6 +343,67 @@ class Engine:
             }
         else:
             inv_eff = inv_in
+
+        # ---- RT-W2b GEM-call economy: pick the domains to equilibrate -------
+        # A skipped domain is ELEMENT-EXACT: its releases enter its inventory
+        # unchanged and its assemblage stays frozen this step — the only
+        # approximation is the timing of the phase-assemblage update
+        # (PRD 4.6.2). Salt-releasing domains are always forced: their
+        # dissolution is solubility-controlled and booking the whole
+        # accessible carrier into solution without an equilibrium would
+        # bypass the solubility product (E3b).
+        equilibrate: Optional[np.ndarray] = None
+        released_elem: Optional[np.ndarray] = None
+        eq_inv_in = eq_w_in = eq_age_in = None
+        if self._economy and dom_to_cl is not None:
+            dcfg = self._domains_cfg
+            if state.domain_eq_inventory.shape[0] == n_clusters:
+                eq_inv_in = state.domain_eq_inventory
+                eq_w_in = state.domain_eq_water
+                eq_age_in = state.domain_eq_age
+            elif state.domain_eq_inventory.shape[0] == 0:
+                eq_inv_in = np.zeros((n_clusters, len(ELEMENT_IDS)))
+                eq_w_in = np.zeros(n_clusters)
+                eq_age_in = np.full(n_clusters, -1, dtype=np.int64)
+            else:
+                raise RuntimeError(
+                    f"economy snapshots have "
+                    f"{state.domain_eq_inventory.shape[0]} rows but "
+                    f"{n_clusters} domains were labeled - state is "
+                    f"corrupted (no fallback)")
+            released_elem = released @ self._kin_elements
+            salt_rel = released[:, self._salt_channels].sum(axis=1) > 0.0
+            valid = eq_age_in >= 0
+            drift = (np.abs(inv_eff - eq_inv_in).sum(axis=1)
+                     + np.abs(released_elem).sum(axis=1))
+            # normalize element drift by the domain's SOLVENT mols, not the
+            # last equilibrated inventory: fresh water has a near-zero
+            # inventory and an inventory-relative scale would explode there,
+            # making every threshold unreachable. dirty_rtol therefore reads
+            # as a molality-scale tolerance (mol solute drift per mol water).
+            r = (drift / (1e-24 + water_mol_c)
+                 + np.abs(water_mol_c - eq_w_in) / (1e-24 + eq_w_in))
+            forced = (~valid) | salt_rel | (eq_age_in >= dcfg.eq_max_age_steps)
+            dirty = valid & (r > dcfg.dirty_rtol)
+            equilibrate = forced | dirty
+            budget = dcfg.max_gem_calls_per_step
+            if budget is not None:
+                cand = np.flatnonzero(dirty & ~forced)
+                if cand.size > budget:
+                    # top-B by accumulated drift, id as the deterministic
+                    # tie-break; deferred drift keeps growing, so priority
+                    # is monotone and no domain starves
+                    order = np.lexsort((cand, -r[cand]))
+                    equilibrate = forced.copy()
+                    equilibrate[cand[order[:budget]]] = True
+            deferred = ~equilibrate
+            exchange_metrics.update({
+                "n_gem_selected": float(equilibrate.sum()),
+                "n_deferred": float(deferred.sum()),
+                "max_r_deferred": (float(r[deferred].max())
+                                   if deferred.any() else 0.0),
+                "max_eq_age": float(eq_age_in.max(initial=0)),
+            })
 
         # ---- reaction phase (mode-dependent) --------------------------------
         # incremental (stoichiometric): parcels are NEW precipitates appended.
@@ -473,6 +551,12 @@ class Engine:
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
                    if released[c, k] > 0.0}
+            if equilibrate is not None and not equilibrate[c]:
+                # economy deferral: element-exact, assemblage frozen, no
+                # water consumed; supersaturation accumulates in the
+                # inventory until the dirty trigger or age bound fires
+                residual[c] = inv_eff[c] + released_elem[c]
+                continue
             has_solids = snapshot and offered_vol[c].sum() > 0.0
             has_inventory = bool(np.any(inv_eff[c] != 0.0))
             if not rel and not has_solids and not has_inventory:
@@ -817,6 +901,17 @@ class Engine:
         trial.water_gel_mol += gel_total
         trial.water_bound_mol += chem_total
 
+        # RT-W2b: refresh the economy snapshots on the pre-remap indexing
+        if self._economy and dom_to_cl is not None:
+            eq_inv_new = eq_inv_in.copy()
+            eq_w_new = eq_w_in.copy()
+            eq_age_new = np.where(eq_age_in >= 0, eq_age_in + 1, eq_age_in)
+            eq_inv_new[solved] = residual[solved]
+            eq_w_new[solved] = water_mol_c[solved]
+            eq_age_new[solved] = 0
+            frozen = equilibrate & ~solved & (scale_c == 0.0)
+            exchange_metrics["n_frozen_domains"] = float(frozen.sum())
+
         # relabel + conservative inventory remap
         new_cl_labels, n_new_cl = transport.label_clusters(trial.capillary_liquid)
         if dom_to_cl is None:
@@ -905,6 +1000,29 @@ class Engine:
                                            pool_remap.dryout)
             fold_events.extend(pool_folds)
         trial.cluster_endmember_mol = pool_remap.inventory
+        # RT-W2b: economy snapshots survive relabeling only through pure
+        # 1:1 transfers (one source, one target); merges, splits and folds
+        # invalidate the record — merging equilibration snapshots is not
+        # meaningful, and a forced re-equilibration is always safe
+        if self._economy and dom_to_cl is not None:
+            src_cnt = np.zeros(n_clusters, dtype=np.int64)
+            tgt_cnt = np.zeros(n_new, dtype=np.int64)
+            for pa, pb, _ov in remap.events:
+                src_cnt[pa] += 1
+                tgt_cnt[pb] += 1
+            inv2 = np.zeros((n_new, len(ELEMENT_IDS)))
+            w2 = np.zeros(n_new)
+            age2 = np.full(n_new, -1, dtype=np.int64)
+            for pa, pb, _ov in remap.events:
+                if src_cnt[pa] == 1 and tgt_cnt[pb] == 1:
+                    inv2[pb] = eq_inv_new[pa]
+                    w2[pb] = eq_w_new[pa]
+                    age2[pb] = eq_age_new[pa]
+            for _pd, nd, _w in fold_events:
+                age2[nd] = -1
+            trial.domain_eq_inventory = inv2
+            trial.domain_eq_water = w2
+            trial.domain_eq_age = age2
         # cluster_id persists CLUSTER labels in every mode — the domain
         # partition is a derived function of the liquid field, never stored
         trial.cluster_id = new_cl_labels
@@ -913,6 +1031,20 @@ class Engine:
             trial.remap_events["prev"].append(prev_c)
             trial.remap_events["new"].append(new_c)
             trial.remap_events["overlap_vox"].append(ov)
+        if dom_to_cl is not None and parcel_rows:
+            # mode C: one aggregate row per channel per step instead of one
+            # per (domain, channel) — at fine partitions per-domain rows
+            # would grow the event table by orders of magnitude (PRD 2.3).
+            # cluster = -1 marks the aggregate. Mode-C runs have no legacy
+            # parcel goldens; deterministic via sorted channel order.
+            agg: Dict[str, List[float]] = {}
+            for t, _c, hname, mol, skel, env in parcel_rows:
+                a = agg.setdefault(hname, [t, 0.0, 0.0, 0.0])
+                a[1] += mol
+                a[2] += skel
+                a[3] += env
+            parcel_rows = [(a[0], -1, hname, a[1], a[2], a[3])
+                           for hname, a in sorted(agg.items())]
         for row in parcel_rows:
             for key, val in zip(("time_h", "cluster", "hydrate", "mol",
                                  "skel_vol_vox", "bulk_vol_vox"), row):

@@ -400,7 +400,7 @@ class GemsBackend:
         # dict is bitwise-identical to a previous solve reuses that response
         # (deterministic, no physics change); bounded LRU
         self._memo: "OrderedDict[str, Dict]" = OrderedDict()
-        self._memo_cap = 256
+        self.memo_cap = 256   # raised by the engine for mode-C runs
         self._element_ids = ELEMENT_IDS
         self._worker = worker
         self.temperature_k = temperature_k
@@ -498,7 +498,7 @@ class GemsBackend:
                     raise BackendTransientError(str(e)) from e
                 raise
             self._memo[memo_key] = r
-            if len(self._memo) > self._memo_cap:
+            if len(self._memo) > self.memo_cap:
                 self._memo.popitem(last=False)
 
         for el, adj in r.element_input["floor_adjustments_mol"].items():

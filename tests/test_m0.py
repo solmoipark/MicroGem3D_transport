@@ -49,7 +49,10 @@ def test_transport_config_validation():
     non-empty, unknown keys refused, and the stoichiometric backend refused
     (rate limiting its nonexistent re-equilibration would be a silent no-op)."""
     g = json.loads((EXAMPLES / "opc_cnash_32.json").read_text(encoding="utf-8"))
-    for bad in ({"exchange_tau_h": 0.0},
+    floor = g["schedule"]["dt_min_h"]
+    for bad in ({"exchange_tau_h": floor},          # <= dt_min: permanent f=1
+                {"exchange_tau_h_per_phase": {"CSHQ": floor * 0.5}},
+                {"exchange_tau_h": 0.0},
                 {"exchange_tau_h": -5.0},
                 {"exchange_tau_h": float("inf")},
                 {"exchange_tau_h": True},
