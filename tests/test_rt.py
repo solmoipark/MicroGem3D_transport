@@ -654,6 +654,62 @@ def test_boundary_mirror_symmetry():
                            rtol=1e-12, atol=1e-30)
 
 
+# ---------------- review-gate regressions (2026-08-20 round 2) ------------
+
+def test_switch_permutation_is_remapped_exactly():
+    """A seam-only cluster split can PRESERVE the domain count while
+    permuting ids (review repro) - the switch therefore remaps
+    unconditionally. Pin the mechanism: identical liquid, permuted labels
+    => remap_inventories moves each row to its voxel set bit-exactly."""
+    liquid = np.zeros((8, 8, 8))
+    liquid[[0, 1, 2, 3, 6, 7], 0, 0] = 0.5   # chain closed through z seam
+    liquid[4, 4, 4] = 0.5                    # independent pocket
+    lp, ncp = transport.label_clusters(liquid)
+    le, nce = transport.label_clusters(liquid, (False, True, True))
+    dp, ndp, _ = transport.label_domains(lp, ncp, (2, 8, 8))
+    de, nde, _ = transport.label_domains(le, nce, (2, 8, 8))
+    assert ndp == nde                        # the count-proxy trap
+    assert not np.array_equal(dp, de)        # ...while ids permute
+    rows = (np.arange(ndp, dtype=float)[:, None]
+            * np.ones((1, 11)) + 1.0)
+    res = transport.remap_inventories(dp, liquid, de, liquid, rows, nde)
+    assert not res.dryout
+    # every voxel's row content followed its voxel set exactly
+    wet = liquid > transport.LIQ_EPS
+    for old_id, new_id in zip(dp[wet], de[wet]):
+        assert np.array_equal(res.inventory[new_id], rows[old_id])
+
+
+def test_neighbor_attribution_respects_exposed_axis():
+    """Review repro: a dry face site must not be attributed to the cluster
+    on the OPPOSITE face through the wrap when the axis is exposed."""
+    from tinn.engine import _neighbor_best_label
+    n = 6
+    liquid = np.zeros((n, n, n))
+    liquid[n - 1, 2, 2] = 0.9                # far face, wet
+    liquid[0, 3, 2] = 0.1                    # near face neighbor, wet
+    labels, n_cl = transport.label_clusters(liquid, (False, True, True))
+    assert n_cl == 2
+    per = _neighbor_best_label(labels, liquid)
+    exp = _neighbor_best_label(labels, liquid, (False, True, True))
+    site = (0, 2, 2)                         # dry site on the exposed face
+    assert per[site] == labels[n - 1, 2, 2]  # periodic: far face wins
+    assert exp[site] == labels[0, 3, 2]      # exposed: wall blocks the wrap
+
+
+def test_start_h_snaps_to_matching_output_time():
+    """A start_h within the 1e-9 validator tolerance must resolve to the
+    EXACT output float, or activation/switch epsilons diverge (review
+    finding: 1e-10 offset de-periodized mid-window with no remap)."""
+    tr = {"domains": {"tile_vox": 16, "d0_m2_s": 1e-9},
+          "boundary": {"axis": "z", "side": "low",
+                       "start_h": 2.0 + 1e-10,
+                       "composition_mol_per_m3": {}}}
+    eng = Engine(_fake_cfg(transport=tr),
+                 reaction_backend=TwoEndmemberSnapshotBackend(2e-13, 0.5))
+    assert eng._b_start == 2.0
+
+
 # ---------------- RT-W4 enablers ------------------------------------------
 
 def test_boundary_start_h_pre_window_is_bitwise_sealed(tmp_path):

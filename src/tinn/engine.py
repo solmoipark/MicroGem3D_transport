@@ -39,7 +39,8 @@ class StepReject:
     reason: str
 
 
-def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray) -> np.ndarray:
+def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray,
+                         periodic_axes=(True, True, True)) -> np.ndarray:
     """Label of the neighboring cluster with the largest liquid contact — the
     cluster that actually supplies the dissolution weight (deterministic:
     argmax over the fixed axis order breaks ties). Liquid is clamped to >= 0:
@@ -49,8 +50,19 @@ def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray) -> np.ndarray:
     labs = []
     liqs = []
     for ax, shift in ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)):
-        labs.append(np.roll(labels, shift, axis=ax))
-        liqs.append(np.roll(liquid, shift, axis=ax))
+        lab_r = np.roll(labels, shift, axis=ax)
+        liq_r = np.roll(liquid, shift, axis=ax)
+        if not periodic_axes[ax]:
+            # v4.0/RT-W3: an exposed axis is a wall for attribution too -
+            # a dry face site must not feed the reactor on the OPPOSITE
+            # face through the wrap (review repro: released mol teleported
+            # across the sealed/exposed cut)
+            idx: list = [slice(None)] * 3
+            idx[ax] = 0 if shift > 0 else -1
+            lab_r[tuple(idx)] = np.int64(-1)
+            liq_r[tuple(idx)] = -1.0
+        labs.append(lab_r)
+        liqs.append(liq_r)
     labs = np.stack(labs)
     liqs = np.where(labs >= 0, np.maximum(np.stack(liqs), 0.0), -1.0)
     best = np.argmax(liqs, axis=0)
@@ -175,14 +187,22 @@ class Engine:
         # liquid (pure function of state - restart determinism free)
         self._boundary = (config.transport.boundary
                           if config.transport is not None else None)
-        self._periodic_axes = (True, True, True)
         if self._boundary is not None:
             self._b_axis = {"z": 0, "y": 1, "x": 2}[self._boundary.axis]
             self._b_low = self._boundary.side in ("low", "both")
             self._b_high = self._boundary.side in ("high", "both")
             self._periodic_axes = tuple(
                 i != self._b_axis for i in range(3))
-            self._b_start = self._boundary.start_h or 0.0
+            start = self._boundary.start_h or 0.0
+            if start > 0.0:
+                # snap to the matching output time (the validator guarantees
+                # one within 1e-9): activation and the switch trigger then
+                # compare EXACT floats - review finding: a 1e-10 offset
+                # passed validation but de-periodized mid-window with no
+                # row remap
+                start = min(config.schedule.output_times_h,
+                            key=lambda t: abs(t - start))
+            self._b_start = start
             # mol per m^3 of capillary water -> mol per vox^3 of liquid
             vox_m3 = (config.rve.voxel_size_um * 1e-6) ** 3
             c_res = np.zeros(len(ELEMENT_IDS))
@@ -265,7 +285,8 @@ class Engine:
 
         # site -> cluster attribution (own label, else wettest neighboring cluster)
         site_cluster = np.where(labels >= 0, labels,
-                                _neighbor_best_label(labels, prev_liquid))
+                                _neighbor_best_label(labels, prev_liquid,
+                                                     axes_now))
         site_mask = vacated > 0.0
         # a coated site (gel-conduit dissolution, PRD §4.2) may sit several
         # voxels from any liquid: propagate labels ring by ring, RELAYED ONLY
@@ -281,7 +302,9 @@ class Engine:
             for _ in range(2 * trial.grid_size):
                 if not (site_mask & (deep < 0)).any():
                     break
-                nxt = np.where(relay, _neighbor_best_label(deep, prev_liquid),
+                nxt = np.where(relay,
+                               _neighbor_best_label(deep, prev_liquid,
+                                                    axes_now),
                                np.int64(-1))
                 nxt = np.where(deep >= 0, deep, nxt)
                 if int((nxt >= 0).sum()) == int((deep >= 0).sum()):
@@ -333,15 +356,22 @@ class Engine:
         pool_rows = state.cluster_endmember_mol
         eq_rows_ok = True
         if (bath_active and self._b_start > 0.0
-                and abs(trial.time_h - self._b_start) <= 1e-9
-                and inv_rows.shape[0] not in (0, n_clusters)):
+                and abs(trial.time_h - self._b_start) <= 1e-12):
+            # First bath-active step. De-periodization can SPLIT seam-only
+            # clusters while PRESERVING the domain count and permuting ids
+            # (three review repros), so no count test can detect it: remap
+            # UNCONDITIONALLY from the recomputed old periodic partition
+            # (identical liquid on both sides = exact volume split; a pure
+            # identity transfer is frac = 1.0, bit-exact). Economy
+            # snapshots never survive the event - all domains forced.
             old_cl, old_ncl = transport.label_clusters(prev_liquid)
             if dom_to_cl is not None:
                 old_labels, old_n, _ = transport.label_domains(
                     old_cl, old_ncl, self._domains_cfg.tiles(trial.grid_size))
             else:
                 old_labels, old_n = old_cl, old_ncl
-            if inv_rows.shape[0] == old_n:
+            eq_rows_ok = False
+            if inv_rows.shape[0] == old_n and old_n > 0                     and not np.array_equal(old_labels, labels):
                 sw = transport.remap_inventories(
                     old_labels, prev_liquid, labels, prev_liquid,
                     inv_rows, n_clusters)
@@ -351,9 +381,6 @@ class Engine:
                     pool_rows = transport.remap_inventories(
                         old_labels, prev_liquid, labels, prev_liquid,
                         pool_rows, n_clusters).inventory
-                # economy snapshots do not survive a repartition (the 1:1
-                # inheritance rule) - treat as absent: all domains forced
-                eq_rows_ok = False
 
         if inv_rows.shape[0] == n_clusters:
             inv_in = inv_rows
@@ -462,9 +489,8 @@ class Engine:
                 # inventory (the implicit step draws through the face
                 # bands from the whole cluster, so the face-row inventory
                 # alone is not the supply)
-                bath_cl = np.unique(dom_to_cl[bnd_coupled])
-                pool_mask = np.isin(dom_to_cl, bath_cl)
-                inv_pool = float(np.abs(inv_in[pool_mask]).sum())
+                inv_pool = float(np.abs(
+                    inv_in[bath_cluster_domain]).sum())
                 out_mol = float(np.clip(-ex.boundary_net, 0.0, None).sum())
                 exchange_metrics.update({
                     "n_boundary_coupled": float(bnd_coupled.sum()),
@@ -557,9 +583,15 @@ class Engine:
         # cluster-scope views (v4.0/RT): placement overflow and the water
         # ledger stay hydraulically cluster-wide; domains partition solute
         # mixing and chemistry only. Mode-full aliases are bit-identical.
-        if dom_to_cl is None:
+        if dom_to_cl is None or n_clusters == 0:
+            # n_clusters == 0 (total dryout) must degrade gracefully in
+            # mode C too: recon is all -1 and indexing the empty
+            # dom_to_cl would raise (review finding)
             recon_cl = recon
             site_cluster_cl = site_cluster
+            if dom_to_cl is not None:
+                claimed_vol = np.zeros(n_cl)
+                claimed_gas = np.zeros(n_cl)
         else:
             recon_cl = np.where(recon >= 0,
                                 dom_to_cl[np.clip(recon, 0, None)],
@@ -697,36 +729,55 @@ class Engine:
             # in domain-id order, deterministic. Mode full is untouched;
             # the no-overdraw fast path does no arithmetic.
             avail = np.clip(trial.endmember_mol, 0.0, None)
-            if np.any(np.clip(owned_em, 0.0, None).sum(axis=0)
-                      > avail + 1e-30):
+            # only domains that will actually feed the backend claim the
+            # budget: economy-DEFERRED domains never withdraw, and letting
+            # them claim first starved the reacting face (review finding)
+            act_rows = (np.ones(n_clusters, dtype=bool)
+                        if equilibrate is None else equilibrate)
+            fed_tot = np.where(act_rows[:, None],
+                               np.clip(owned_em, 0.0, None),
+                               0.0).sum(axis=0)
+            if np.any(fed_tot > avail + 1e-30):
                 if offered_vol is own_vol:
                     offered_vol = own_vol.copy()
                     offered_mol = owned_mol.copy()
+                bad_ch = []
+                for h in range(n_h):
+                    sl = self._em_slice[self.hydrate_ids[h]]
+                    if np.any(fed_tot[sl] > avail[sl] + 1e-30):
+                        bad_ch.append(h)
                 remaining = avail.copy()
                 clamped = 0.0
-                for c in range(n_clusters):
-                    for h in range(n_h):
-                        sl = self._em_slice[self.hydrate_ids[h]]
-                        need = np.clip(owned_em[c, sl], 0.0, None)
-                        if not need.any():
-                            remaining[sl] -= np.clip(owned_em[c, sl], 0.0,
-                                                     None)
-                            continue
-                        with np.errstate(divide="ignore", invalid="ignore"):
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    for c in np.flatnonzero(act_rows):
+                        for h in bad_ch:
+                            sl = self._em_slice[self.hydrate_ids[h]]
+                            need = np.clip(owned_em[c, sl], 0.0, None)
+                            if not need.any():
+                                continue
                             ratios = np.where(need > 0.0,
                                               remaining[sl] / np.where(
                                                   need > 0.0, need, 1.0),
                                               np.inf)
-                        k = float(min(1.0, max(0.0, ratios.min())))
-                        if k < 1.0:
-                            clamped += float(need.sum() * (1.0 - k))
-                            owned_em[c, sl] *= k
-                            owned_elem[c, h, :] = (owned_em[c, sl]
-                                                   @ trial
-                                                   .endmember_elements[sl])
-                            offered_mol[c, h] *= k
-                            offered_vol[c, h] *= k
-                        remaining[sl] -= np.clip(owned_em[c, sl], 0.0, None)
+                            k = float(min(1.0, max(0.0, ratios.min())))
+                            if k < 1.0:
+                                clamped += float(need.sum() * (1.0 - k))
+                                owned_em[c, sl] *= k
+                                owned_elem[c, h, :] = (
+                                    owned_em[c, sl]
+                                    @ trial.endmember_elements[sl])
+                                offered_mol[c, h] *= k
+                                offered_vol[c, h] *= k
+                                if f_ch is not None:
+                                    # keep mode B archive bookkeeping on
+                                    # the ACTUAL feed (review finding: the
+                                    # stale values silently destroyed pool
+                                    # memory under B+C)
+                                    pool_fed[c, sl] *= k
+                                    withheld_mol[c, h] = (
+                                        owned_mol[c, h] - offered_mol[c, h])
+                            remaining[sl] -= np.clip(owned_em[c, sl], 0.0,
+                                                     None)
                 if clamped > 0.0:
                     exchange_metrics["endmember_feed_clamped_mol"] = clamped
         owned_gel_c = (offered_vol * gel_eps).sum(axis=1)
@@ -778,7 +829,9 @@ class Engine:
                     if (bath_cluster_domain is not None
                             and bath_cluster_domain[c]
                             and not inv_flushed
-                            and np.any(inv_eff[c] != 0.0)):
+                            and np.any(inv_eff[c] != 0.0)
+                            and float(np.abs(inv_eff[c]).sum())
+                            < 1e-4 * water_c):
                         # W4 measured: drained-solution inventories (traces
                         # to ~1/100 of equilibrium, ratio-distorted) sit on
                         # a STOCHASTIC GEM/AIA knife edge, while the same
@@ -1317,8 +1370,18 @@ class Engine:
             # liquid share per pH-carrying cluster: lets the sanity band judge
             # the MAIN solution and merely count nearly-dry pocket outliers
             total_liq = float(liq_vol_c.sum())
+            if dom_to_cl is None:
+                share = liq_vol_c
+            else:
+                # mode C: judge each reading by its PARENT CLUSTER's liquid
+                # share — per-domain shares collapse below the 1% band
+                # threshold at fine partitions and silently disabled the
+                # pH plausibility gate (review finding)
+                cl_liq = np.bincount(dom_to_cl, weights=liq_vol_c,
+                                     minlength=n_cl)
+                share = cl_liq[dom_to_cl]
             metrics["cluster_liq_frac"] = {
-                int(k): (float(liq_vol_c[int(k)]) / total_liq
+                int(k): (float(share[int(k)]) / total_liq
                          if total_liq > 0.0 else 0.0)
                 for k in cluster_ph}
         return trial, None, metrics

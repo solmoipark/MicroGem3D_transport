@@ -8,7 +8,6 @@ mature paste (immature up to ~2x faster).
 
 Usage:  py -3 scripts/run_leach_w4.py [d0_ladder ...]
 """
-import io
 import json
 import math
 import sys
@@ -21,7 +20,7 @@ sys.path.insert(0, str(REPO / "src"))
 from tinn import analysis                    # noqa: E402
 from tinn.config import TinnConfig           # noqa: E402
 from tinn.engine import Engine               # noqa: E402
-from tinn.registry import ELEMENT_IDS, default_registry  # noqa: E402
+from tinn.registry import ELEMENT_IDS, registry_for  # noqa: E402
 from tinn.storage import load_checkpoint     # noqa: E402
 
 BASE = REPO / "examples" / "qualification" / "leach_w4_opc32.json"
@@ -45,11 +44,17 @@ def run_case(d0: float, out_dir: Path) -> dict:
             frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
             frozen["water"] += m.get("water_frozen_domains", 0.0)
 
+    if out_dir.exists():
+        # storage refuses checkpoint overwrites; a rerun after an aborted
+        # or completed ladder must start clean (review finding)
+        import shutil
+        assert out_dir.name.startswith("leach_w4_")
+        shutil.rmtree(out_dir)
     t0 = time.perf_counter()
     state, summary = Engine(cfg).run(out_dir=str(out_dir), audit_hook=hook)
     wall = time.perf_counter() - t0
 
-    reg = default_registry()
+    reg = registry_for(cfg)
     n = cfg.rve.grid_size
     h_um = cfg.rve.voxel_size_um
     guard_hi = n - (GUARD_LO_VOX + TILE_Z)
@@ -65,7 +70,6 @@ def run_case(d0: float, out_dir: Path) -> dict:
             "front_vox": prof["ch_front_depth_vox"],
             "ca_out_mol": float(-s.boundary_exchanged_elements[
                 ELEMENT_IDS.index("Ca")]),
-            "layer_CH": prof["layer_CH_vol"],
         })
     # sqrt(t) fit on the guarded window (exclude the alkali-washout
     # transient at t_leach < 0.05 h and fronts outside [guard_lo, guard_hi])
@@ -84,8 +88,7 @@ def run_case(d0: float, out_dir: Path) -> dict:
         "nonconv_frozen_total": frozen["nonconv"],
         "water_frozen_total": frozen["water"],
         "supply_ratio_mean": (sum(supply) / len(supply)) if supply else None,
-        "rows": [{k: v for k, v in r.items() if k != "layer_CH"}
-                 for r in rows],
+        "rows": rows,
         "a_um_per_sqrt_day": a_um_sqrt_day,
         "n_fit_points": len(pts),
     }
@@ -108,8 +111,7 @@ def main() -> None:
         fronts = [(row['t_leach_h'], row['front_vox']) for row in r['rows']]
         print(f"  fronts: {fronts}", flush=True)
     out_json = REPO / "runs" / "leach_w4_results.json"
-    io.open(out_json, "w", encoding="utf-8").write(
-        json.dumps(results, indent=1))
+    out_json.write_text(json.dumps(results, indent=1), encoding="utf-8")
     print(f"saved {out_json}")
 
 

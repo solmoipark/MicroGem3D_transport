@@ -299,6 +299,29 @@ def casi_channel(state: SimulationState) -> Optional[str]:
     return best
 
 
+def reactor_labels(state: SimulationState) -> np.ndarray:
+    """Dense labels of the solution-reactor row space (the row indexing of
+    cluster_inventory / cluster_endmember_mol): cluster labels in mode
+    full, DOMAIN labels under transport.domains — recomputed here because
+    the partition is a pure function of the stored liquid (PRD 2.3) and
+    state.cluster_id deliberately persists CLUSTER labels in every mode.
+    Review finding: joining domain-keyed rows against cluster_id painted
+    the E2 Ca/Si map with unrelated reactors' compositions."""
+    tr = state.config.transport
+    if tr is None or tr.domains is None:
+        return state.cluster_id
+    axes = (True, True, True)
+    if tr.boundary is not None:
+        start = tr.boundary.start_h or 0.0
+        if state.time_h >= start - 1e-12:
+            ax = {"z": 0, "y": 1, "x": 2}[tr.boundary.axis]
+            axes = tuple(i != ax for i in range(3))
+    labels, n_cl = transport.label_clusters(state.capillary_liquid, axes)
+    d_id, _n_dom, _d2c = transport.label_domains(
+        labels, n_cl, tr.domains.tiles(state.grid_size))
+    return d_id
+
+
 def boundary_profiles(state: SimulationState, axis: int) -> Dict:
     """v4.0/RT-W4 (PRD 4.6.3): per-layer observables along the exposed
     axis — the leaching-front diagnostics. Layer index 0 = the low face.
@@ -376,7 +399,7 @@ def casi_map_rgb(state: SimulationState, lo: float = 0.8, hi: float = 2.2
     if not ratios:
         return None
     n = state.grid_size
-    labels = state.cluster_id[n // 2]
+    labels = reactor_labels(state)[n // 2]
     img = np.full((n, n, 3), 30, dtype=np.float64)
     gray = np.array([120.0, 120.0, 120.0])
     for c in np.unique(labels):
@@ -976,10 +999,49 @@ def report(run_dir: str, out_dir: Optional[str] = None,
                 casi_name = f"casi_{ck.name}.png"
                 write_png(str(out / casi_name), rgb)
                 row["casi_png"] = casi_name
+        # v4.0/RT-W3/W4 (PRD 4.6.3, non-blocking): wrap-guard breakthrough
+        # detection on boundary runs — warn when the last (4 + tile_axis)
+        # layers lose >5% of their initial CH (fits beyond that time are
+        # invalid; the run itself continues)
+        tr_cfg = config.transport
+        if tr_cfg is not None and tr_cfg.boundary is not None:
+            b_ax = {"z": 0, "y": 1, "x": 2}[tr_cfg.boundary.axis]
+            prof = boundary_profiles(state, b_ax)
+            row["boundary_profiles"] = {
+                k: v for k, v in prof.items() if k != "layer_CH_vol"}
+            ch = prof["layer_CH_vol"]
+            if ch is not None:
+                if boundary_ch0 is None:
+                    boundary_ch0 = ch
+                tile_ax = (tr_cfg.domains.tiles(config.rve.grid_size)[b_ax]
+                           if tr_cfg.domains is not None else 1)
+                halo = 4 + tile_ax
+                hit = any(c0 > 0.0 and c1 < 0.95 * c0
+                          for c0, c1 in zip(boundary_ch0[-halo:],
+                                            ch[-halo:]))
+                row["boundary_front_breakthrough"] = bool(hit)
+                if hit:
+                    notes.append(
+                        f"boundary_front_breakthrough at t={row['time_h']} "
+                        f"h: the CH front reached the back halo "
+                        f"({halo} layers) - profile fits beyond this time "
+                        f"are outside the wrap guard (PRD 4.6.3)")
         rows.append(row)
     # checkpoint NAMES sort lexicographically (ckpt_1000 < ckpt_999) — time is
     # the authority for series order
     rows.sort(key=lambda r: r["time_h"])
+    # v4.0/RT dt-policy witness (PRD 4.6.3): persistent supply-limited steps
+    if config.transport is not None \
+            and config.transport.boundary is not None:
+        ratios = [m.get("boundary_supply_ratio")
+                  for r_ in summary_rows
+                  for m in [r_.get("ledger_metrics", {})]
+                  if m.get("boundary_supply_ratio") is not None]
+        if ratios and max(ratios) > 0.7:
+            notes.append(
+                f"boundary_supply_ratio up to {max(ratios):.2f} > 0.7: the "
+                f"front is bath-supply-limited (linear in t, dt-dependent) "
+                f"- reduce dt per PRD 4.6.3 before fitting sqrt(t)")
 
     result = {
         "run_dir": str(run),
