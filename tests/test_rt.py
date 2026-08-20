@@ -617,6 +617,37 @@ def test_boundary_engine_run_closes_forced_and_restarts(tmp_path):
     assert restarted.full_hash() == straight.full_hash()
 
 
+def test_boundary_mirror_symmetry():
+    """DoD 4: a z-mirror-symmetric field with the same bath on BOTH faces
+    exchanges mirror-symmetrically, layer by layer (rel 1e-12 - summation
+    order differs, so not bitwise). Witnesses face-declaration sign and
+    orientation bugs."""
+    n = 8
+    liquid = np.zeros((n, n, n))
+    liquid[:, 3:5, 3:5] = 0.4           # a z-column, mirror-symmetric in z
+    labels, n_cl = transport.label_clusters(liquid, (False, True, True))
+    d_id, n_dom, _ = transport.label_domains(labels, n_cl, 2)
+    g = np.where(liquid > 0, 0.5, 0.0)
+    graph = transport.build_domain_graph(d_id, n_dom, g, liquid,
+                                         (False, True, True))
+    g_ar = transport.boundary_coupling(d_id, n_dom, g, 0, True, True)
+    # z-symmetric inventory profile: n proportional to water, uniform c
+    inv = np.outer(graph.water, np.ones(11)) * 2.5e-10
+    res = transport.exchange_be(graph, inv, 1.0, 2.0, 2.0,
+                                bath=transport.BoundaryBath(
+                                    g_bnd=g_ar, c_res=np.zeros(11)))
+    assert res.status == "ok"
+    # per-z-layer delta via domain -> layer map (tile 2 => 4 z-bands)
+    layer_delta = np.zeros((n // 2, 11))
+    for d in range(n_dom):
+        zs = np.flatnonzero((d_id == d).any(axis=(1, 2)))
+        band = int(zs[0]) // 2
+        layer_delta[band] += res.delta[d]
+    for b in range(n // 4):
+        assert np.allclose(layer_delta[b], layer_delta[-1 - b],
+                           rtol=1e-12, atol=1e-30)
+
+
 @needs_gems
 def test_boundary_gems_leach_closes(rt_full, tmp_path):
     """PC bundle, pure-water bath, short horizon: completes, closes, Ca
