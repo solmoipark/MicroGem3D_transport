@@ -675,6 +675,24 @@ class Engine:
                     scale_c[c] = 0.0
                     residual[c] = inv_eff[c]
                     continue
+                if (self._boundary is not None
+                        and failure_reason == REJECT_BACKEND_FAILURE):
+                    # RT-W3 (PRD 4.6.3): under an active bath, a drained
+                    # domain (assemblage + near-pure water + solute dust)
+                    # can sit on a genuine GEM/AIA knife edge that no
+                    # release scale or dt fixes - the composition is a
+                    # boundary-regime state, not a bug. Freeze it exactly
+                    # like the space-filling impossibility (release ->
+                    # unmet, assemblage and inventory kept); the next
+                    # step's releases re-regularize it. Sealed runs keep
+                    # the hard reject - there this failure signals a
+                    # defect. Visible via nonconv_frozen_domains.
+                    exchange_metrics["nonconv_frozen_domains"] = (
+                        exchange_metrics.get("nonconv_frozen_domains", 0.0)
+                        + 1.0)
+                    scale_c[c] = 0.0
+                    residual[c] = inv_eff[c]
+                    continue
                 return None, StepReject(failure_reason), {}
             if snapshot:
                 # space-filling limit: a pocket whose equilibrium assemblage
