@@ -6,7 +6,9 @@ the wrap-guarded window - for a D0 sensitivity ladder spanning the ionic
 self-diffusivity range. Literature anchor: a ~ 100-200 um/sqrt(day) for
 mature paste (immature up to ~2x faster).
 
-Usage:  py -3 scripts/run_leach_w4.py [d0_ladder ...]
+Usage:  py -3 scripts/run_leach_w4.py [cfg=<name>] [dt=<seconds>] [d0 ...]
+        cfg names an examples/qualification/leach_w4_<name>.json base
+        (default opc32); W4.2 front runs use cfg=opc64.
 """
 import json
 import math
@@ -23,13 +25,16 @@ from tinn.engine import Engine               # noqa: E402
 from tinn.registry import ELEMENT_IDS, registry_for  # noqa: E402
 from tinn.storage import load_checkpoint     # noqa: E402
 
-BASE = REPO / "examples" / "qualification" / "leach_w4_opc32.json"
 START_H = 168.0
 GUARD_LO_VOX = 4                 # exposed-face halo (PRD 4.6.3)
 TILE_Z = 2
 
-def run_case(d0: float, out_dir: Path, dt_s: float = None) -> dict:
-    raw = json.loads(BASE.read_text(encoding="utf-8"))
+def base_path(name: str) -> Path:
+    return REPO / "examples" / "qualification" / f"leach_w4_{name}.json"
+
+def run_case(d0: float, out_dir: Path, dt_s: float = None,
+             base: Path = None) -> dict:
+    raw = json.loads((base or base_path("opc32")).read_text(encoding="utf-8"))
     raw["transport"]["domains"]["d0_m2_s"] = d0
     if dt_s is not None:
         # W4.1 dt ladder: replace the leach window's step (seconds)
@@ -109,18 +114,28 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     args = sys.argv[1:]
     dt_s = None
-    if args and args[0].startswith("dt="):
-        dt_s = float(args[0][3:])
+    cfg_name = "opc32"
+    while args and "=" in args[0]:
+        key, _, val = args[0].partition("=")
+        if key == "dt":
+            dt_s = float(val)
+        elif key == "cfg":
+            cfg_name = val
+        else:
+            raise SystemExit(f"unknown option {args[0]!r}")
         args = args[1:]
+    base = base_path(cfg_name)
     ladder = [float(x) for x in args] or [0.8e-9, 2.0e-9, 5.3e-9]
     results = {}
     for d0 in ladder:
         tag = f"d0_{d0:.1e}".replace("-", "m").replace("+", "")
         if dt_s is not None:
             tag = f"dt{dt_s:g}s_{tag}"
+        if cfg_name != "opc32":
+            tag = f"{cfg_name}_{tag}"
         out = REPO / "runs" / f"leach_w4_{tag}"
         print(f"== {tag} ==", flush=True)
-        results[tag] = run_case(d0, out, dt_s)
+        results[tag] = run_case(d0, out, dt_s, base)
         r = results[tag]
         print(f"  wall {r['wall_s']} s, a = {r['a_um_per_sqrt_day']} "
               f"um/sqrt(day) ({r['n_fit_points']} pts), supply "
@@ -129,6 +144,8 @@ def main() -> None:
         fronts = [(row['t_leach_h'], row['front_vox']) for row in r['rows']]
         print(f"  fronts: {fronts}", flush=True)
     suffix = f"_dt{dt_s:g}s" if dt_s is not None else ""
+    if cfg_name != "opc32":
+        suffix = f"_{cfg_name}{suffix}"
     out_json = REPO / "runs" / f"leach_w4_results{suffix}.json"
     out_json.write_text(json.dumps(results, indent=1), encoding="utf-8")
     print(f"saved {out_json}")
