@@ -1029,7 +1029,27 @@ class Engine:
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
             residual[c] = result.residual_inventory
-            injected_add += result.injected_elements
+            if (bath_active and bath_cluster_domain is not None
+                    and bath_cluster_domain[c]
+                    and np.any(result.injected_elements != 0.0)):
+                # W4.1 measured (PRD 4.6.3): supply-limited drained front
+                # domains re-earn the worker's redox seed on EVERY call; at
+                # fine dt the per-call dust grows linearly with step count
+                # and trips the injected cap (~1e-19 mol/call x 8640 steps,
+                # abort at t=168.99 h) while sitting 13 decades below any
+                # material scale. The anchor a bath-coupled domain receives
+                # is PHYSICALLY the aerated bath's dissolved O2 - book it as
+                # boundary influx (exact floats, closure identity has both
+                # terms additive), keeping the injected gate's strict sealed
+                # meaning: solver-fabricated mass, not bath re-supply.
+                trial.boundary_exchanged_elements = (
+                    trial.boundary_exchanged_elements
+                    + result.injected_elements)
+                exchange_metrics["bath_anchor_mol"] = (
+                    exchange_metrics.get("bath_anchor_mol", 0.0)
+                    + float(np.abs(result.injected_elements).sum()))
+            else:
+                injected_add += result.injected_elements
             if result.ph_status == "ok":
                 cluster_ph[c] = result.ph
             for pc in result.parcels:

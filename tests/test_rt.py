@@ -623,6 +623,46 @@ def test_boundary_engine_run_closes_forced_and_restarts(tmp_path):
     assert restarted.full_hash() == straight.full_hash()
 
 
+def test_bath_anchor_seed_books_to_boundary():
+    """W4.1 measured: supply-limited drained front domains re-earn the
+    worker's redox seed on every call; at fine dt the per-call dust grows
+    with step count and trips the injected cap (abort at t=168.99 h). A
+    bath-coupled domain's seed is physically bath re-supply - it books to
+    the boundary ledger; sealed runs keep the strict injected accounting."""
+    from tinn.registry import ELEMENT_IDS
+    o = ELEMENT_IDS.index("O")
+
+    class _Seeding(TwoEndmemberSnapshotBackend):
+        def react(self, *a, **k):
+            r = super().react(*a, **k)
+            r.injected_elements = r.injected_elements.copy()
+            r.injected_elements[o] += 1e-20
+            r.residual_inventory = r.residual_inventory.copy()
+            r.residual_inventory[o] += 1e-20
+            return r
+
+    dom = {"tile_vox": 16, "d0_m2_s": 1e-9, "dirty_rtol": 1e9,
+           "eq_max_age_steps": 1000}
+    tr = {"domains": dict(dom),
+          "boundary": {"axis": "z", "side": "low",
+                       "composition_mol_per_m3": {}}}
+    eng = Engine(_fake_cfg(transport=tr), reaction_backend=_Seeding(2e-13, 0.5))
+    t1, rej, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej is None
+    t2, rej, m2 = eng.try_step(t1, 2.0)
+    assert rej is None
+    assert float(np.abs(t2.injected_elements).sum()) == 0.0
+    assert m2.get("bath_anchor_mol", 0.0) > 0.0
+    rep = ledger.check_all(t2, REG)
+    assert rep.ok, rep.violations
+    # sealed control: the same seed stays booked as injected
+    eng_s = Engine(_fake_cfg(transport={"domains": dict(dom)}),
+                   reaction_backend=_Seeding(2e-13, 0.5))
+    s1, rej, _ = eng_s.try_step(eng_s.initial_state(), 2.0)
+    assert rej is None
+    assert s1.injected_elements[o] > 0.0
+
+
 def test_boundary_mirror_symmetry():
     """DoD 4: a z-mirror-symmetric field with the same bath on BOTH faces
     exchanges mirror-symmetrically, layer by layer (rel 1e-12 - summation
