@@ -33,9 +33,21 @@ def base_path(name: str) -> Path:
     return REPO / "examples" / "qualification" / f"leach_w4_{name}.json"
 
 def run_case(d0: float, out_dir: Path, dt_s: float = None,
-             base: Path = None) -> dict:
+             base: Path = None, until_h: float = None) -> dict:
     raw = json.loads((base or base_path("opc32")).read_text(encoding="utf-8"))
     raw["transport"]["domains"]["d0_m2_s"] = d0
+    if until_h is not None:
+        # W4.2 supply-clean confirmation: truncate the leach window so a
+        # dt ~ 1/D0 run stays affordable (the front points that matter sit
+        # in the first third of the window anyway)
+        end = START_H + until_h
+        raw["schedule"]["output_times_h"] = [
+            t for t in raw["schedule"]["output_times_h"] if t <= end + 1e-9]
+        raw["schedule"]["dt_windows"] = [
+            w for w in raw["schedule"]["dt_windows"] if w["until_h"] < end]
+        raw["schedule"]["dt_windows"].append(
+            {"until_h": end, "dt_h": raw["schedule"]["dt_windows"][-1]["dt_h"]
+             if raw["schedule"]["dt_windows"] else 0.0014})
     if dt_s is not None:
         # W4.1 dt ladder: replace the leach window's step (seconds)
         dt_h = dt_s / 3600.0
@@ -114,6 +126,7 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     args = sys.argv[1:]
     dt_s = None
+    until_h = None
     cfg_name = "opc32"
     while args and "=" in args[0]:
         key, _, val = args[0].partition("=")
@@ -121,21 +134,27 @@ def main() -> None:
             dt_s = float(val)
         elif key == "cfg":
             cfg_name = val
+        elif key == "until":
+            until_h = float(val)
         else:
             raise SystemExit(f"unknown option {args[0]!r}")
         args = args[1:]
     base = base_path(cfg_name)
     ladder = [float(x) for x in args] or [0.8e-9, 2.0e-9, 5.3e-9]
     results = {}
+    tags = []
     for d0 in ladder:
         tag = f"d0_{d0:.1e}".replace("-", "m").replace("+", "")
         if dt_s is not None:
             tag = f"dt{dt_s:g}s_{tag}"
+        if until_h is not None:
+            tag = f"{tag}_u{until_h:g}h"
         if cfg_name != "opc32":
             tag = f"{cfg_name}_{tag}"
+        tags.append(tag)
         out = REPO / "runs" / f"leach_w4_{tag}"
         print(f"== {tag} ==", flush=True)
-        results[tag] = run_case(d0, out, dt_s, base)
+        results[tag] = run_case(d0, out, dt_s, base, until_h)
         r = results[tag]
         print(f"  wall {r['wall_s']} s, a = {r['a_um_per_sqrt_day']} "
               f"um/sqrt(day) ({r['n_fit_points']} pts), supply "
@@ -143,10 +162,11 @@ def main() -> None:
               flush=True)
         fronts = [(row['t_leach_h'], row['front_vox']) for row in r['rows']]
         print(f"  fronts: {fronts}", flush=True)
-    suffix = f"_dt{dt_s:g}s" if dt_s is not None else ""
-    if cfg_name != "opc32":
-        suffix = f"_{cfg_name}{suffix}"
-    out_json = REPO / "runs" / f"leach_w4_results{suffix}.json"
+    # The results file is named after the CASES it holds, not just the
+    # config: concurrent single-case invocations of the same ladder used to
+    # write the same path and the last finisher clobbered the others
+    # (measured at W4.2 - two of three cases had to be recovered from logs).
+    out_json = REPO / "runs" / f"leach_w4_results_{'__'.join(tags)}.json"
     out_json.write_text(json.dumps(results, indent=1), encoding="utf-8")
     print(f"saved {out_json}")
 
