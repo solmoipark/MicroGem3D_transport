@@ -1,8 +1,14 @@
-# TINN 시멘트 수화 4D 플랫폼 v2
+# MicroGEM3D — 시멘트 수화 4D 플랫폼 v2
 
 배합(C3S, OPC 4상, SCM 블렌드), PSD, w/c, 온도, 시간 스케줄을 입력받아 질량 보존되는
 시간 의존 3D 미세구조(상 분포·물 분배·공극·수송 지표)를 결정론적·재시작 가능하게
 출력하는 시뮬레이션 플랫폼. 설계와 범위는 [PRD.md](PRD.md)가 유일한 기준 문서다.
+
+> **이름 안내.** 플랫폼 이름은 **MicroGEM3D**이고, 개발 중 쓰던 이름은 TINN이었다.
+> 파이썬 패키지·모듈 이름공간(`src/tinn/`, `python -m tinn.cli`)과 환경변수
+> (`TINN_GEMS_PYTHON`, `TINN_GEMS_PERSISTENT`)는 **아직 `tinn`**이다. 재현성 계약
+> (config 해시·체크포인트)에 얽혀 있어 리네임은 별도 작업으로 남겨 둔다. 아래
+> 명령의 `tinn`은 오타가 아니다.
 
 ## 요구 사항
 
@@ -14,7 +20,7 @@
 ## 빠른 시작
 
 ```powershell
-cd "TINN platform v2"
+cd MicroGEM3D
 $env:PYTHONPATH = "src"
 
 # config 검증
