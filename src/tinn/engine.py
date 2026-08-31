@@ -680,14 +680,26 @@ class Engine:
     # -------------------------------------------------------------------- run
     def run(self, state: Optional[SimulationState] = None,
             out_dir: Optional[str] = None,
-            audit_hook: Optional[Callable[[dict], None]] = None
+            audit_hook: Optional[Callable[[dict], None]] = None,
+            recovery_checkpoint_every_h: Optional[float] = None,
             ) -> Tuple[SimulationState, dict]:
         """Run through the configured output schedule.
 
         ``audit_hook`` is an optional, read-only qualification observer.  It is
         deliberately outside :class:`SimulationState`: enabling a paper audit
         must not change the numerical trajectory or checkpoint format.
+
+        ``recovery_checkpoint_every_h`` is likewise runtime-only. It saves the
+        already-accepted state without inserting a timestep boundary, so the
+        numerical trajectory and config hash remain identical to a run with
+        recovery checkpoints disabled.
         """
+        if recovery_checkpoint_every_h is not None:
+            if recovery_checkpoint_every_h <= 0.0:
+                raise ValueError("recovery_checkpoint_every_h must be > 0")
+            if out_dir is None:
+                raise ValueError(
+                    "recovery checkpoints require an output directory")
         state = state or self.initial_state()
         if tuple(state.hydrate_ids) != self.hydrate_ids:
             raise RuntimeError(
@@ -731,10 +743,17 @@ class Engine:
                 "full_hash": state.full_hash(),
             })
         last_metrics: dict = {}
+        next_recovery_h = (
+            float(state.time_h) + float(recovery_checkpoint_every_h)
+            if recovery_checkpoint_every_h is not None else None)
         for t_out in outputs:
             while state.time_h < t_out - 1e-12:
-                cruise = state.dt_h
+                dt_cap = sched.dt_cap_at(state.time_h)
+                cruise = min(state.dt_h, dt_cap)
+                window_end = sched.next_window_end_after(state.time_h)
                 dt_try = min(cruise, t_out - state.time_h)
+                if window_end is not None:
+                    dt_try = min(dt_try, window_end - state.time_h)
                 retries = 0
                 while True:
                     dense_before = (state.dense_hash()
@@ -771,10 +790,15 @@ class Engine:
                 trial.accept_count = state.accept_count + 1
                 # grow cruise dt; a sliver step clamped by the output boundary
                 # must not collapse an otherwise healthy step size
-                if retries == 0:
-                    trial.dt_h = min(max(dt_try * 2.0, cruise), sched.dt_initial_h)
+                next_cap = sched.dt_cap_at(trial.time_h)
+                if sched.dt_windows is not None and retries == 0:
+                    # A declared piecewise schedule is authoritative. Output
+                    # boundary slivers do not change its next prescribed cap.
+                    trial.dt_h = next_cap
+                elif retries == 0:
+                    trial.dt_h = min(max(dt_try * 2.0, cruise), next_cap)
                 else:
-                    trial.dt_h = min(dt_try * 2.0, sched.dt_initial_h)
+                    trial.dt_h = min(dt_try * 2.0, next_cap)
                 state = trial
                 last_metrics = metrics
                 if audit_hook is not None:
@@ -783,6 +807,7 @@ class Engine:
                         "time_start_h": float(state.time_h - dt_try),
                         "time_end_h": float(state.time_h),
                         "dt_accepted_h": float(dt_try),
+                        "scheduled_dt_cap_h": float(dt_cap),
                         "retries": int(retries),
                         "metrics": dict(metrics),
                         "injected_delta_mol": (
@@ -790,6 +815,23 @@ class Engine:
                         "dense_hash": state.dense_hash(),
                         "full_hash": state.full_hash(),
                     })
+                if (next_recovery_h is not None
+                        and state.time_h >= next_recovery_h - 1e-12
+                        and state.time_h < t_out - 1e-12):
+                    ckpt = storage.save_checkpoint(
+                        state, out_dir,
+                        f"recovery_{state.accept_count:08d}")
+                    if audit_hook is not None:
+                        audit_hook({
+                            "event": "recovery_checkpoint_written",
+                            "time_h": float(state.time_h),
+                            "scheduled_after_h": float(next_recovery_h),
+                            "path": str(ckpt),
+                            "dense_hash": state.dense_hash(),
+                            "full_hash": state.full_hash(),
+                        })
+                    while state.time_h >= next_recovery_h - 1e-12:
+                        next_recovery_h += float(recovery_checkpoint_every_h)
             summary["outputs"].append(self._snapshot_row(state, last_metrics))
             if out_dir is not None:
                 k_global = self.config.schedule.output_times_h.index(t_out)
@@ -803,6 +845,12 @@ class Engine:
                         "dense_hash": state.dense_hash(),
                         "full_hash": state.full_hash(),
                     })
+            if next_recovery_h is not None:
+                # A regular output checkpoint at the same age supersedes the
+                # recovery copy. Advance the runtime-only schedule so the next
+                # accepted step does not create a near-duplicate checkpoint.
+                while state.time_h >= next_recovery_h - 1e-12:
+                    next_recovery_h += float(recovery_checkpoint_every_h)
         summary["final"] = self._snapshot_row(state, last_metrics)
         summary["sanity_band"] = analysis.sanity_band(summary["outputs"],
                                                       self.config)

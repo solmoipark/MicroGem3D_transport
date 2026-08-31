@@ -1,0 +1,52 @@
+{
+ "binder": {
+  "mass_fractions": {
+   "C3S": 0.571,
+   "C2S": 0.172,
+   "C3A": 0.04,
+   "C4AF": 0.13,
+   "hemihydrate": 0.026,
+   "anhydrite": 0.028,
+   "arcanite": 0.005
+  }
+ },
+ "w_c": 0.5,
+ "temperature_K": 296.15,
+ "kinetics": {
+  "kind": "pk",
+  "preset": "pk_elakneswaran_2018",
+  "blaine_m2_kg": 381.8
+ },
+ "rve": {
+  "grid_size": 128,
+  "voxel_size_um": 0.25,
+  "seed": 20260731
+ },
+ "chemistry": {
+  "backend": "gems3k",
+  "gems_bundle_lst": "gems_bundles/PC/PC-dat.lst",
+  "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe"
+ },
+ "schedule": {
+  "output_times_h": [
+   8.0,
+   24.0,
+   72.0,
+   168.0,
+   672.0
+  ],
+  "dt_initial_h": 8.0,
+  "dt_min_h": 0.001,
+  "max_retries": 8,
+  "dt_windows": [
+   {
+    "until_h": 24.0,
+    "dt_h": 8.0
+   },
+   {
+    "until_h": 672.0,
+    "dt_h": 12.0
+   }
+  ]
+ }
+}

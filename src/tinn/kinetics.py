@@ -178,7 +178,9 @@ class ParrotKilloh:
     def __init__(self, preset_name: str, w_c: float, temperature_k: float,
                  blaine_m2_kg: float, phase_mass_fractions: Dict[str, float],
                  relative_humidity: float = 1.0,
-                 alpha_seed: float = 1e-8, max_substep_days: float = 0.01):
+                 alpha_seed: float = 1e-8, max_substep_days: float = 0.01,
+                 scm_logistic_override: Optional[Dict[str, Tuple[
+                     float, float, float, float, float]]] = None):
         if preset_name not in PK_PRESETS:
             raise ValueError(
                 f"unknown P&K preset {preset_name!r}; choose one of {sorted(PK_PRESETS)}")
@@ -204,6 +206,11 @@ class ParrotKilloh:
         self._n_clinker = len(CLINKER_PHASE_IDS)
         # availability-scaled D per SCM (recipe-dependent, InverseGems default)
         effective = scm_effective_params(phase_mass_fractions)
+        # declared override (S7 sensitivity protocol): the override IS the
+        # effective curve — availability scaling is not applied on top, so the
+        # declared plateau is exactly what the run realizes as its target
+        for pid, params in (scm_logistic_override or {}).items():
+            effective[pid] = tuple(float(x) for x in params)
         self._scm_params = [effective[pid] for pid in SCM_PHASE_IDS]
         self.scm_effective_d = {pid: effective[pid][3] for pid in SCM_PHASE_IDS}
         # fixed-grid prefix memo for alpha_at: {n_full: (clinker_state, t)}
@@ -336,4 +343,5 @@ def make_kinetics(config: TinnConfig) -> KineticsModel:
         phase_mass_fractions=config.binder.mass_fractions,
         alpha_seed=kin.pk_alpha_seed,
         max_substep_days=kin.pk_max_substep_days,
+        scm_logistic_override=kin.scm_logistic_override,
     )

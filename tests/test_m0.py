@@ -38,6 +38,35 @@ def test_config_valid_and_hash_stable():
     assert TinnConfig.model_validate(_opc_config()).binder.unassigned == pytest.approx(0.09)
 
 
+def test_absent_piecewise_timestep_keeps_legacy_hash():
+    raw = _base_config()
+    legacy = TinnConfig.model_validate(raw)
+    raw["schedule"]["dt_windows"] = None
+    explicit_none = TinnConfig.model_validate(raw)
+    assert explicit_none.config_hash() == legacy.config_hash()
+
+
+def test_piecewise_timestep_validation_and_lookup():
+    raw = _base_config()
+    raw["schedule"] = {
+        "output_times_h": [1.0, 4.0],
+        "dt_initial_h": 0.25,
+        "dt_min_h": 0.01,
+        "dt_windows": [
+            {"until_h": 1.0, "dt_h": 0.25},
+            {"until_h": 4.0, "dt_h": 1.0},
+        ],
+    }
+    cfg = TinnConfig.model_validate(raw)
+    assert cfg.schedule.dt_cap_at(0.5) == 0.25
+    assert cfg.schedule.dt_cap_at(1.0) == 1.0
+    assert cfg.schedule.next_window_end_after(1.0) == 4.0
+
+    raw["schedule"]["dt_windows"][-1]["until_h"] = 3.0
+    with pytest.raises(ValidationError, match="cover"):
+        TinnConfig.model_validate(raw)
+
+
 def test_config_rejects_bad_wc_and_temperature():
     with pytest.raises(ValidationError):
         TinnConfig.model_validate(_base_config(w_c=-0.1))
@@ -68,6 +97,13 @@ def test_config_rejects_bad_rve():
         TinnConfig.model_validate(_base_config(rve={"grid_size": 48, "voxel_size_um": 1.0, "seed": 1}))
     with pytest.raises(ValidationError):
         TinnConfig.model_validate(_base_config(rve={"grid_size": 32, "voxel_size_um": 0.4, "seed": 1}))
+
+
+def test_config_accepts_declared_four_level_spatial_tracks():
+    TinnConfig.model_validate(
+        _base_config(rve={"grid_size": 96, "voxel_size_um": 1.0, "seed": 1}))
+    TinnConfig.model_validate(
+        _base_config(rve={"grid_size": 320, "voxel_size_um": 0.1, "seed": 1}))
 
 
 def test_config_rejects_psd_larger_than_rve():

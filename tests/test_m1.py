@@ -152,6 +152,29 @@ def test_run_audit_proves_rejected_trial_dense_rollback(monkeypatch):
     assert audit["accepted_dt_h"]["min"] == pytest.approx(0.05)
 
 
+def test_piecewise_timestep_caps_are_followed_exactly():
+    cfg = _cfg(
+        kinetics={"kind": "tabulated",
+                  "table": {"times_h": [0.0, 2.0],
+                            "alpha": {"C3S": [0.0, 0.002]}}},
+        schedule={
+            "output_times_h": [1.0, 2.0],
+            "dt_initial_h": 0.25,
+            "dt_min_h": 0.001,
+            "dt_windows": [
+                {"until_h": 1.0, "dt_h": 0.25},
+                {"until_h": 2.0, "dt_h": 0.5},
+            ],
+        })
+    events = []
+    Engine(cfg).run(audit_hook=events.append)
+    accepted = [e for e in events if e["event"] == "step_accepted"]
+    assert [e["dt_accepted_h"] for e in accepted] == [
+        0.25, 0.25, 0.25, 0.25, 0.5, 0.5]
+    assert [e["scheduled_dt_cap_h"] for e in accepted] == [
+        0.25, 0.25, 0.25, 0.25, 0.5, 0.5]
+
+
 def test_tabulated_beyond_horizon_raises():
     kin = TabulatedKinetics(_cfg().kinetics)
     with pytest.raises(ValueError):
@@ -592,6 +615,35 @@ def test_restart_bitwise_equivalence(full_run):
     assert restarted.dense_hash() == straight.dense_hash()
     assert restarted.full_hash() == straight.full_hash()
     assert restarted.rng_state == straight.rng_state
+
+
+def test_recovery_checkpoints_do_not_change_numerical_trajectory(tmp_path):
+    cfg = _cfg(
+        kinetics={"kind": "tabulated",
+                  "table": {"times_h": [0.0, 0.5],
+                            "alpha": {"C3S": [0.0, 0.002]}}},
+        schedule={"output_times_h": [0.5], "dt_initial_h": 0.1,
+                  "dt_min_h": 0.001})
+    straight, _ = Engine(cfg).run()
+    events = []
+    recovered, _ = Engine(cfg).run(
+        out_dir=str(tmp_path), audit_hook=events.append,
+        recovery_checkpoint_every_h=0.2)
+
+    assert recovered.dense_hash() == straight.dense_hash()
+    assert recovered.full_hash() == straight.full_hash()
+    recovery_events = [
+        e for e in events if e["event"] == "recovery_checkpoint_written"]
+    assert [e["time_h"] for e in recovery_events] == pytest.approx([0.2, 0.4])
+    for event in recovery_events:
+        loaded = load_checkpoint(event["path"], REG)
+        assert loaded.dense_hash() == event["dense_hash"]
+        assert loaded.full_hash() == event["full_hash"]
+
+
+def test_recovery_checkpoint_requires_output_directory():
+    with pytest.raises(ValueError, match="output directory"):
+        Engine(_short_cfg()).run(recovery_checkpoint_every_h=1.0)
 
 
 # ---------------- cli ----------------

@@ -226,9 +226,30 @@ class KineticsConfig(BaseModel):
     # >= 1e-15 keeps 1 - seed representable so the Jander denominator stays finite
     pk_alpha_seed: float = Field(default=1e-8, ge=1e-15, lt=1.0)
     pk_max_substep_days: float = Field(default=0.01, gt=0.0)
+    # Declared SCM logistic curves (A, B, C_days, D, G) replacing the built-in
+    # preset + CH-availability scaling for the listed phases (S7 sensitivity
+    # protocol). An override IS the effective curve — the availability modifier
+    # is NOT applied on top, otherwise the declared plateau would be silently
+    # rescaled. Phases absent from the map keep the preset + availability path.
+    # None keeps every earlier config hash (and checkpoint) unchanged.
+    scm_logistic_override: Optional[Dict[str, Tuple[float, float, float, float,
+                                                    float]]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "KineticsConfig":
+        if self.scm_logistic_override is not None:
+            if self.kind != "pk":
+                raise ValueError("scm_logistic_override only applies to pk kinetics")
+            unknown = set(self.scm_logistic_override) - set(SCM_PHASE_IDS)
+            if unknown:
+                raise ValueError(
+                    f"scm_logistic_override for unknown SCM phases "
+                    f"{sorted(unknown)}; allowed: {SCM_PHASE_IDS}")
+            for pid, (a, b, c, d, g) in self.scm_logistic_override.items():
+                if not (0.0 <= a <= 1.0 and 0.0 <= d <= 1.0):
+                    raise ValueError(f"{pid}: A and D must be in [0, 1]")
+                if not (b > 0.0 and c > 0.0 and g > 0.0):
+                    raise ValueError(f"{pid}: B, C_days and G must be positive")
         if self.kind == "pk":
             if self.preset not in PK_PRESETS:
                 raise ValueError(f"pk kinetics requires preset in {PK_PRESETS}, got {self.preset!r}")
@@ -344,12 +365,23 @@ class ChemistryConfig(BaseModel):
 
 class RVEConfig(BaseModel):
     model_config = _STRICT
-    # 128^3 @ 0.25 um serves the resolution-convergence track (PRD 1.2 rev.2);
+    # 128^3 @ 0.25 um serves the coupled resolution-convergence track.
+    # 96^3 is the fourth domain-size level. 320^3 @ 0.1 um is admitted only
+    # for the geometry/topology stress screen: the dense hydrate state and
+    # transactional copies would exceed the supported coupled-runtime memory
+    # envelope, so run_section_4_1 explicitly refuses it.
     # below ~0.1 um voxels the capillary/gel-pore split would double-count
     # C-S-H gel porosity, so finer grids are out of scope by design
-    grid_size: Literal[32, 64, 128]
-    voxel_size_um: float = Field(ge=0.25, le=1.0)
+    grid_size: Literal[32, 64, 96, 128, 320]
+    voxel_size_um: float = Field(ge=0.1, le=1.0)
     seed: int = Field(ge=0)
+
+
+class TimeStepWindow(BaseModel):
+    """Piecewise-constant external timestep cap up to ``until_h``."""
+    model_config = _STRICT
+    until_h: float = Field(gt=0.0)
+    dt_h: float = Field(gt=0.0)
 
 
 class ScheduleConfig(BaseModel):
@@ -358,6 +390,7 @@ class ScheduleConfig(BaseModel):
     dt_initial_h: float = Field(default=0.01, gt=0.0)
     dt_min_h: float = Field(default=1e-4, gt=0.0)
     max_retries: int = Field(default=8, ge=1)
+    dt_windows: Optional[List[TimeStepWindow]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "ScheduleConfig":
@@ -368,7 +401,37 @@ class ScheduleConfig(BaseModel):
                 raise ValueError("output_times_h must be strictly increasing")
         if self.dt_min_h > self.dt_initial_h:
             raise ValueError("dt_min_h must be <= dt_initial_h")
+        if self.dt_windows is not None:
+            if not self.dt_windows:
+                raise ValueError("dt_windows must be non-empty when provided")
+            for a, b in zip(self.dt_windows, self.dt_windows[1:]):
+                if b.until_h <= a.until_h:
+                    raise ValueError("dt_windows until_h values must increase")
+            if self.dt_windows[-1].until_h < self.output_times_h[-1] - 1e-12:
+                raise ValueError(
+                    "last dt_window must cover the last output time")
+            if any(w.dt_h < self.dt_min_h for w in self.dt_windows):
+                raise ValueError("every dt_window dt_h must be >= dt_min_h")
+            if self.dt_windows[0].dt_h != self.dt_initial_h:
+                raise ValueError(
+                    "dt_initial_h must equal the first dt_window dt_h")
         return self
+
+    def dt_cap_at(self, time_h: float) -> float:
+        if self.dt_windows is None:
+            return self.dt_initial_h
+        for window in self.dt_windows:
+            if time_h < window.until_h - 1e-12:
+                return window.dt_h
+        return self.dt_windows[-1].dt_h
+
+    def next_window_end_after(self, time_h: float) -> Optional[float]:
+        if self.dt_windows is None:
+            return None
+        for window in self.dt_windows:
+            if window.until_h > time_h + 1e-12:
+                return window.until_h
+        return None
 
 
 class ParticleShape(BaseModel):
@@ -572,6 +635,14 @@ class TinnConfig(BaseModel):
         # the built-in glasses keeps its earlier hash
         if payload.get("scm_composition") is None:
             payload.pop("scm_composition", None)
+        # Piecewise timesteps were added after checkpoint format v3. An absent
+        # schedule keeps every legacy config/checkpoint hash unchanged.
+        if payload.get("schedule", {}).get("dt_windows") is None:
+            payload["schedule"].pop("dt_windows", None)
+        # declared SCM logistic curves (S7): absent map keeps every earlier
+        # config hash (and checkpoint) unchanged
+        if payload.get("kinetics", {}).get("scm_logistic_override") is None:
+            payload["kinetics"].pop("scm_logistic_override", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every
         # bins-only legacy PSD keeps its hash; a truncated PSD hashes its
         # TRUNCATED bins plus the original measured input — physics-faithful

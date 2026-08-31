@@ -1,0 +1,130 @@
+{
+ "binder": {
+  "mass_fractions": {
+   "C3S": 0.2855,
+   "C2S": 0.086,
+   "C3A": 0.02,
+   "C4AF": 0.065,
+   "hemihydrate": 0.013,
+   "anhydrite": 0.0153353,
+   "arcanite": 0.003425,
+   "thenardite": 0.0003438,
+   "fly_ash": 0.4165
+  }
+ },
+ "w_c": 0.5,
+ "temperature_K": 296.15,
+ "kinetics": {
+  "kind": "pk",
+  "preset": "pk_elakneswaran_2018",
+  "blaine_m2_kg": 381.8,
+  "scm_logistic_override": {
+   "fly_ash": [
+    0.0,
+    1.05,
+    53.0,
+    0.296,
+    1.0
+   ]
+  }
+ },
+ "rve": {
+  "grid_size": 64,
+  "voxel_size_um": 1.0,
+  "seed": 20260731
+ },
+ "chemistry": {
+  "backend": "gems3k",
+  "gems_bundle_lst": "gems_bundles/CNASH/Test-dat.lst",
+  "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe"
+ },
+ "material_psd": {
+  "fly_ash": {
+   "cumulative": [
+    [
+     0.2,
+     0.0
+    ],
+    [
+     0.3,
+     0.01
+    ],
+    [
+     0.5,
+     0.02
+    ],
+    [
+     1.0,
+     0.06
+    ],
+    [
+     2.0,
+     0.13
+    ],
+    [
+     3.0,
+     0.2
+    ],
+    [
+     5.0,
+     0.32
+    ],
+    [
+     8.0,
+     0.45
+    ],
+    [
+     10.0,
+     0.52
+    ],
+    [
+     15.0,
+     0.63
+    ],
+    [
+     20.0,
+     0.7
+    ],
+    [
+     30.0,
+     0.78
+    ],
+    [
+     50.0,
+     0.88
+    ],
+    [
+     70.0,
+     0.97
+    ],
+    [
+     100.0,
+     1.0
+    ]
+   ],
+   "truncate_to_grid": true
+  }
+ },
+ "scm_composition": {
+  "fly_ash": {
+   "oxides_wt_pct": {
+    "SiO2": 54.4,
+    "Al2O3": 24.8,
+    "Fe2O3": 5.7,
+    "CaO": 4.6,
+    "MgO": 2.1,
+    "K2O": 4.9,
+    "Na2O": 1.1
+   },
+   "density_g_cm3": 2.2
+  }
+ },
+ "schedule": {
+  "output_times_h": [
+   168.0
+  ],
+  "dt_initial_h": 168.0,
+  "dt_min_h": 0.001,
+  "max_retries": 8
+ }
+}

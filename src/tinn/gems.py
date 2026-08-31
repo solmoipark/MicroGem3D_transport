@@ -554,6 +554,10 @@ class GemsBackend:
         if r.aqueous_h2o_mol is None:
             raise GemsError("worker did not split the aqueous solvent", kind="protocol")
         h2o_out = r.aqueous_h2o_mol / s
+        aqueous_elements = np.zeros(len(e_ids))
+        for el, v in r.phase_elements_mol.get(AQUEOUS_PHASE, {}).items():
+            if el in self._h2o_index:
+                aqueous_elements[self._h2o_index[el]] = v / s
         residual = np.zeros(len(e_ids))
         for phase in residual_phases:
             for el, v in r.phase_elements_mol.get(phase, {}).items():
@@ -587,6 +591,10 @@ class GemsBackend:
             residual_inventory=residual,
             injected_elements=injected,
             ph=r.ph, ph_status=r.ph_status,
+            ionic_strength=r.ionic_strength,
+            ionic_strength_status=r.ionic_strength_status,
+            aqueous_h2o_mol=h2o_out,
+            aqueous_elements=aqueous_elements,
         )
 
 
