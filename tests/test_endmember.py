@@ -159,8 +159,10 @@ def test_checkpoint_v2_explicitly_rejected(tmp_path):
     with pytest.raises(StorageError, match="endmember ledger"):
         load_checkpoint(str(tmp_path / "v2ish"), REG)
     # E1 broke the format once (3); v4.0/RT broke it once more (4, PRD 2.3:
-    # domain-keyed rows + boundary_water_mol) - the RT-W2 sanctioned break
-    assert FORMAT_VERSION == 4
+    # domain-keyed rows + boundary_water_mol) - the RT-W2 sanctioned break;
+    # Tier 0 broke it once more (5, RT-P0b: frozen speciation + the
+    # RESERVED Tier-1 sorbed inventory riding the same break)
+    assert FORMAT_VERSION == 5
 
 
 def test_run_guard_rejects_endmember_universe_mismatch(tmp_path):

@@ -309,11 +309,17 @@ class Engine:
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
         rve = initialize_rve(self.config, self.registry)
-        return SimulationState.from_geometry(
+        st = SimulationState.from_geometry(
             self.config, self.registry, rve, self.backend.backend_id,
             hydrate_ids=self.hydrate_ids,
             hydrate_endmembers=self._hydrate_endmembers,
             endmember_elements=self._endmember_elements)
+        if self._np_cfg is not None and not self._np_cfg.diagnostics_only:
+            # RT-P0b: the speciation cache's column order is run-scoped and
+            # header-owned (endmember_ids precedent); diagnostics-only runs
+            # stay stateless
+            st.aq_species_ids = tuple(self.backend.aq_species_ids)
+        return st
 
     # ------------------------------------------------------------------- step
     def try_step(self, state: SimulationState, dt_h: float
@@ -450,6 +456,7 @@ class Engine:
         # impossible. Pure function of (config, state): restart-safe.
         inv_rows = state.cluster_inventory
         pool_rows = state.cluster_endmember_mol
+        spec_state_rows = state.domain_species_mol
         eq_rows_ok = True
         if (bath_active and self._b_start > 0.0
                 and abs(trial.time_h - self._b_start) <= 1e-12):
@@ -477,6 +484,10 @@ class Engine:
                     pool_rows = transport.remap_inventories(
                         old_labels, prev_liquid, labels, prev_liquid,
                         pool_rows, n_clusters).inventory
+                if spec_state_rows.shape[0] == old_n:
+                    spec_state_rows = transport.remap_inventories(
+                        old_labels, prev_liquid, labels, prev_liquid,
+                        spec_state_rows, n_clusters).inventory
 
         if inv_rows.shape[0] == n_clusters:
             inv_in = inv_rows
@@ -498,6 +509,22 @@ class Engine:
                 f"{pool_rows.shape} but "
                 f"({n_clusters}, {self._n_em}) was expected - state is "
                 f"corrupted (no fallback)")
+        # RT-P0b: frozen speciation rows ride the same labeling contract
+        np_active = (self._np_cfg is not None
+                     and not self._np_cfg.diagnostics_only)
+        spec_in = None
+        if np_active:
+            n_s = len(self.backend.aq_species_ids)
+            if (spec_state_rows.shape[0] == n_clusters
+                    and spec_state_rows.shape[1] == n_s):
+                spec_in = spec_state_rows
+            elif spec_state_rows.shape[0] == 0:
+                spec_in = np.zeros((n_clusters, n_s))
+            else:
+                raise RuntimeError(
+                    f"domain speciation cache has shape "
+                    f"{spec_state_rows.shape} but ({n_clusters}, {n_s}) was "
+                    f"expected - state is corrupted (no fallback)")
 
         # ---- transport phase (v4.0/RT mode C, Lie split T -> R) -------------
         # implicit solute diffusion between the domains of each cluster on
@@ -533,8 +560,22 @@ class Engine:
                 bath = transport.BoundaryBath(g_bnd=g_ar,
                                               c_res=self._c_res_vox)
                 bnd_coupled = g_ar > 0.0
-            ex = transport.exchange_be(graph, inv_eff, dt_h,
-                                       self._d0_vox2_h, bath=bath)
+            if np_active:
+                npc = transport.np_effective_conductance(
+                    graph, spec_in, graph.water, self._np_dw_vox2_h,
+                    self._np_z, self._np_nu,
+                    g_bnd=(bath.g_bnd if bath is not None else None),
+                    c_res=(bath.c_res if bath is not None else None))
+                if self._np_cfg.phi_clamp_report:
+                    for key, v in npc.counts.items():
+                        exchange_metrics[key] = float(v)
+                    exchange_metrics["np_charge_flux_rel_max"] = (
+                        npc.charge_flux_rel_max)
+                ex = transport.exchange_be(graph, inv_eff, dt_h, None,
+                                           bath=bath, np_cond=npc)
+            else:
+                ex = transport.exchange_be(graph, inv_eff, dt_h,
+                                           self._d0_vox2_h, bath=bath)
             if ex.status != "ok":
                 return None, StepReject(REJECT_TRANSPORT_FAILURE), {}
             inv_eff = inv_eff + ex.delta
@@ -1467,6 +1508,23 @@ class Engine:
                                            pool_remap.dryout)
             fold_events.extend(pool_folds)
         trial.cluster_endmember_mol = pool_remap.inventory
+        if np_active:
+            # frozen speciation: solved domains take THIS step's accepted
+            # speciation, deferred domains keep their last one (domain_eq_age
+            # semantics); then remap onto the new labels with the same
+            # liquid-overlap weights. A COEFFICIENT CACHE, not a ledger:
+            # dry folds keep rows usable but are NOT booked as remap events,
+            # and hard-dry rows simply drop (conservation lives elsewhere).
+            spec_base = spec_in.copy()
+            if spec_rows is not None:
+                spec_base[solved] = spec_rows[solved]
+            spec_remap = transport.remap_inventories(
+                labels, prev_liquid, new_labels, trial.capillary_liquid,
+                spec_base, n_new)
+            if dom_to_cl is not None and spec_remap.dryout:
+                _fold_dry_rows(spec_base, spec_remap.inventory,
+                               spec_remap.dryout)
+            trial.domain_species_mol = spec_remap.inventory
         # RT-W2b: economy snapshots survive relabeling only through pure
         # 1:1 transfers (one source, one target); merges, splits and folds
         # invalidate the record — merging equilibration snapshots is not
@@ -1575,6 +1633,15 @@ class Engine:
                 "checkpoint hydrate channels do not match the backend's channel "
                 f"order - bundle changed between runs? state: {state.hydrate_ids} "
                 f"backend: {self.hydrate_ids}")
+        if (self._np_cfg is not None and not self._np_cfg.diagnostics_only
+                and tuple(state.aq_species_ids)
+                != tuple(self.backend.aq_species_ids)):
+            raise RuntimeError(
+                "checkpoint aqueous species order does not match the "
+                "backend's - bundle changed between runs, or species "
+                "transport was toggled mid-run (no silent fallback): "
+                f"state {state.aq_species_ids[:5]}... backend "
+                f"{tuple(self.backend.aq_species_ids)[:5]}...")
         expect_em = tuple((h, dc) for h in self.hydrate_ids
                           for dc in self._hydrate_endmembers[h])
         if tuple(state.endmember_ids) != expect_em:

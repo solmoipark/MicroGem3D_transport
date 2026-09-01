@@ -206,3 +206,114 @@ def test_equilibrate_elements_filters_suppression():
                                    suppressed_phases=("Alite",))
     finally:
         w.close()
+
+
+# ------------------------------------------------- P0b: solver integration
+
+def test_np_charge_zero_and_element_closure():
+    """Anchors 3+4 through the promoted solver: the per-element BE with NP
+    conductances keeps exact flux antisymmetry (delta sums to zero per
+    element from the same floats) and the kernel's zero-current witness
+    stays at rounding level."""
+    table = load_species_dw(str(DW_JSON))
+    graph = _two_domain_graph(g=1.5, w=(3.0, 5.0))
+    z = np.array([1.0, -1.0, 2.0, -2.0])
+    dw = np.array([table.dw["Na+"], table.dw["Cl-"],
+                   table.dw["Ca+2"], table.dw["SO4-2"]]) * 3.6e15  # vox^2/h-ish
+    nu = np.eye(4)
+    species = np.array([[2.0, 1.6, 0.3, 0.5], [0.5, 0.9, 0.5, 0.3]])
+    npc = transport.np_effective_conductance(
+        graph, species, graph.water, dw, z, nu)
+    assert npc.charge_flux_rel_max <= 1e-12
+    inv = np.array([[4.0, 3.0, 1.0, 1.5], [1.0, 2.0, 2.0, 0.5]])
+    ex = transport.exchange_be(graph, inv, 0.25, None, np_cond=npc)
+    assert ex.status == "ok"
+    total = ex.delta.sum(axis=0)
+    assert np.all(total == 0.0)                      # same-float antisymmetry
+    assert np.array_equal(ex.delta[0], -ex.delta[1])
+    assert np.all(inv + ex.delta >= 0.0)
+
+
+def test_np_scalar_path_bitwise_and_hash():
+    """The promoted solver fed a broadcast-scalar conductance is BITWISE
+    equal to the scalar path (each column sees the same float sequence);
+    an active species block changes the config hash."""
+    d0 = 2.4e-3
+    graph = transport.DomainGraph(
+        n_domains=4, edge_a=np.array([0, 1, 2]), edge_b=np.array([1, 2, 3]),
+        edge_g=np.array([1.0, 2.0, 0.5]),
+        water=np.array([4.0, 2.0, 3.0, 5.0]), dust=np.zeros(4, dtype=bool))
+    rng = np.random.default_rng(11)
+    inv = rng.uniform(0.0, 2.0, size=(4, 6))
+    a = transport.exchange_be(graph, inv.copy(), 0.5, d0)
+    n_elem = inv.shape[1]
+    npc = transport.NPConductance(
+        t_edge=np.tile((d0 * graph.edge_g)[:, None], (1, n_elem)),
+        t_bnd=None, deff_edge=np.full((3, n_elem), d0))
+    b = transport.exchange_be(graph, inv.copy(), 0.5, None, np_cond=npc)
+    assert np.array_equal(a.delta, b.delta)
+    assert a.cg_iterations == b.cg_iterations
+    # exactly one conductance source
+    with pytest.raises(ValueError):
+        transport.exchange_be(graph, inv.copy(), 0.5, d0, np_cond=npc)
+    with pytest.raises(ValueError):
+        transport.exchange_be(graph, inv.copy(), 0.5, None)
+    # config hash: active species differs from the scalar config
+    from tinn.config import TinnConfig
+    raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"] = {"backend": "gems3k"}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    h_scalar = TinnConfig.model_validate(raw).config_hash()
+    raw["transport"]["domains"] = {
+        "tile_vox": 8,
+        "species": {"dw_table": str(DW_JSON), "default_dw_m2_s": 1.0e-9,
+                    "geometry_factor": 1.0}}
+    h_np = TinnConfig.model_validate(raw).config_hash()
+    assert h_np != h_scalar
+
+
+@needs_gems
+def test_np_engine_restart_bit_identity(tmp_path):
+    """Species-active mode-C run: restart equals straight-through bit for
+    bit (frozen speciation included), the reserved sorbed array round-trips
+    as (0, E), and a v4-stamped checkpoint is refused."""
+    from tinn.config import TinnConfig
+    from tinn.engine import Engine
+    from tinn.registry import ELEMENT_IDS, default_registry
+    from tinn.storage import (FORMAT_VERSION, StorageError, load_checkpoint,
+                              save_checkpoint)
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(PC_BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = str(GEMS_PYTHON)
+    raw["schedule"] = {"output_times_h": [2.0, 4.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {
+        "tile_vox": 8,
+        "species": {"dw_table": str(DW_JSON), "default_dw_m2_s": 1.0e-9,
+                    "geometry_factor": 1.0}}}
+    cfg = TinnConfig.model_validate(raw)
+    straight, _ = Engine(cfg).run(out_dir=str(tmp_path / "run"))
+    assert straight.aq_species_ids            # stamped, header-owned
+    assert straight.domain_species_mol.shape[0] > 0
+    assert straight.domain_sorbed_mol.shape == (0, len(ELEMENT_IDS))
+    reg = default_registry()
+    mid = load_checkpoint(str(tmp_path / "run" / "ckpt_000"), reg)
+    assert tuple(mid.aq_species_ids) == tuple(straight.aq_species_ids)
+    restarted, _ = Engine(mid.config).run(state=mid)
+    assert restarted.full_hash() == straight.full_hash()
+    # v4-stamped checkpoint refused (extended message)
+    save_checkpoint(straight, str(tmp_path), "v4ish")
+    hdr = tmp_path / "v4ish" / "header.json"
+    payload = json.loads(hdr.read_text(encoding="utf-8"))
+    payload["format_version"] = 4
+    hdr.write_text(json.dumps(payload), encoding="utf-8")
+    man = tmp_path / "v4ish" / "manifest.json"
+    import hashlib as _hl
+    manifest = json.loads(man.read_text(encoding="utf-8"))
+    manifest["header.json"] = _hl.sha256(hdr.read_bytes()).hexdigest()
+    man.write_text(json.dumps(manifest), encoding="utf-8")
+    assert FORMAT_VERSION == 5
+    with pytest.raises(StorageError, match="species transport"):
+        load_checkpoint(str(tmp_path / "v4ish"), reg)

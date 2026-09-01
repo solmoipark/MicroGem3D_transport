@@ -28,9 +28,15 @@ from .state import SimulationState, _DENSE_FIELDS, code_version
 # explicitly incompatible (no migration, PRD rule). E2's per-cluster pool
 # array (cluster_endmember_mol) rides the SAME version: no external v3
 # checkpoints existed when it landed, so no second break.
-FORMAT_VERSION = 4  # v4.0/RT (PRD 2.3): domain-keyed rows + boundary_water_mol
-                    # + economy snapshots; v3 checkpoints predate equilibration
-                    # domains - rerun from the config (no migration, PRD 0.3)
+FORMAT_VERSION = 5  # Tier 0 / RT-P0b (PRD 2.3/4.6.4): frozen aqueous
+                    # speciation per domain (domain_species_mol +
+                    # aq_species_ids) AND the reserved Tier-1 sorbed
+                    # inventory (domain_sorbed_mol, zero rows until RT-S1a
+                    # - the v4 boundary_water_mol precedent: one break, one
+                    # anchor re-pin). v4 checkpoints predate species
+                    # transport - rerun from the config (no migration).
+                    # v4 was: domain-keyed rows + boundary_water_mol +
+                    # economy snapshots.
 
 _LEDGER_VECTORS = ("phase_mol", "initial_phase_mol", "unmet_mol", "hydrate_mol",
                    "hydrate_env_vol_vox", "injected_elements",
@@ -100,6 +106,10 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
                           state.domain_eq_water)
         _write_zarr_array(tmp / "arrays" / "domain_eq_age",
                           state.domain_eq_age)
+        _write_zarr_array(tmp / "arrays" / "domain_species_mol",
+                          state.domain_species_mol)
+        _write_zarr_array(tmp / "arrays" / "domain_sorbed_mol",
+                          state.domain_sorbed_mol)
 
         header = {
             "format_version": FORMAT_VERSION,
@@ -116,6 +126,9 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             "element_ids": list(ELEMENT_IDS),
             # E1: run-scoped endmember universe, positional over endmember_mol
             "endmember_ids": [list(pair) for pair in state.endmember_ids],
+            # RT-P0b: run-scoped aqueous species order, positional over
+            # domain_species_mol columns (empty when species transport off)
+            "aq_species_ids": list(state.aq_species_ids),
         }
         for k in _LEDGER_SCALARS:
             header[k] = getattr(state, k)
@@ -168,9 +181,10 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     if header["format_version"] != FORMAT_VERSION:
         raise StorageError(
             f"checkpoint format {header['format_version']} is not supported by "
-            f"this build (current {FORMAT_VERSION}); v3 checkpoints predate "
-            f"the equilibration domains and boundary water ledger (v4.0/RT), "
-            f"v2 the endmember ledger (E1), earlier ones reversible chemistry "
+            f"this build (current {FORMAT_VERSION}); v4 checkpoints predate "
+            f"species transport and the reserved sorbed-inventory array "
+            f"(Tier 0/RT-P0b), v3 the equilibration domains and boundary "
+            f"water ledger (v4.0/RT), v2 the endmember ledger (E1) "
             f"- rerun from the config (no migration code, PRD 0.3)")
     for key, current in (("kinetic_phase_ids", KINETIC_PHASE_IDS),
                          ("solid_phase_ids", SOLID_PHASE_IDS),
@@ -207,6 +221,10 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     domain_eq_water = _read_zarr_array(root / "arrays" / "domain_eq_water")
     domain_eq_age = _read_zarr_array(
         root / "arrays" / "domain_eq_age").astype(np.int64)
+    domain_species_mol = _read_zarr_array(
+        root / "arrays" / "domain_species_mol")
+    domain_sorbed_mol = _read_zarr_array(
+        root / "arrays" / "domain_sorbed_mol")
 
     tables = json.loads((root / "tables.json").read_text(encoding="utf-8"))
 
@@ -233,6 +251,9 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         domain_eq_water=domain_eq_water,
         domain_eq_age=domain_eq_age,
         cluster_endmember_mol=cluster_endmember_mol,
+        aq_species_ids=tuple(header.get("aq_species_ids", [])),
+        domain_species_mol=domain_species_mol,
+        domain_sorbed_mol=domain_sorbed_mol,
         time_h=header["time_h"],
         dt_h=header["dt_h"],
         phase_mol=np.asarray(header["phase_mol"]),

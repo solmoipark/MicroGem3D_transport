@@ -21,6 +21,20 @@
     "max_gem_calls_per_step": 128
   }
 }
+
+// Tier 0 (RT-P0, PRD 4.6.4): d0 대신 종별 NP 원소별 유효 전도도.
+// d0_m2_s와 상호 배타 (diagnostics_only: true면 d0 유지 + 리포트만).
+"transport": {
+  "domains": {
+    "tile_vox": 8,
+    "species": {
+      "dw_table": "gems_bundles/species_dw/species_dw.json",
+      "default_dw_m2_s": 1.0e-9,     // null = 미매핑 종 존재 시 거부
+      "geometry_factor": 1.0,        // 필수 명시 (d0 전례)
+      "phi_clamp_report": true
+    }
+  }
+}
 ```
 
 ## 요구 사항
@@ -108,6 +122,11 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       2-스케일 공극 분석(네트워크 D_eff + 서브복셀 크기분포), 해상도 수렴 사다리
       (32/64/128³), 재료별 타원체 형상(효과 실측: D_rel −4.4% — 구형 유지 판정),
       목 보정 노브(1d 사다리 평탄화, 28d는 위상 한계 — 기본 조화 유지).
+- [x] **RT-P0a/P0b (2026-09-02)** — Tier 0 종별 NP 영전류 사영(PRD 4.6.4):
+      dw 테이블 벤더링 + 워커 프로토콜 v2(스페시에이션 노출) + 원소별 BE
+      전도도(FORMAT_VERSION 5, Tier 1 수착 배열 예약 동승). 실측: OPC 공극수
+      D_eff/D₀ 0.008–8.1×(p50 1.57×). 전제 G0(PHREEQC-Cemdata18 0D
+      교차검증)은 `scripts/README_phreeqc_crosscheck.md`에 기록.
 
 ## 예제 config
 
@@ -139,7 +158,7 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
 `geometry.py`(주기 RVE 초기화, 3계층 입자, 타원체 형상), `kinetics.py`(Tabulated+
 ParrotKilloh+SCM 로지스틱), `state.py`(SimulationState, mol 권위 원장),
 `ledger.py`(§6.1 불변식), `dissolution.py`(전도 면수 가중 배분 — 겔 전도 포함),
-`transport.py`(클러스터 라벨링+리매핑), `backend.py`(ReactionBackend+합성),
+`transport.py`(클러스터 라벨링+리매핑 — v4.0/RT 도메인 그래프·BE 교환 + Tier 0 NP 유효 전도도), `backend.py`(ReactionBackend+합성),
 `morphology.py`(배치+제거+오버플로), `engine.py`(트랜잭션 오케스트레이터),
 `storage.py`(Zarr-v2 체크포인트), `gems.py`(격리 xGEMS 워커+번들 감사+0D 프로브+
 GemsBackend snapshot), `analysis.py`(공극/수송 분석+리포트+§6.3 판정+PNG),

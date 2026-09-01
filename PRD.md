@@ -51,7 +51,8 @@ v1(2026-07 개발분)은 다음을 실제로 동작시켰고, 이 설계들은 v
 3. **처음부터 다상(multiphase).** 상태는 첫 커밋부터 phase-vector 기반. 스칼라 alpha 전용 경로,
    호환 뷰, 스키마 마이그레이션 코드를 만들지 않는다.
 4. **테스트 예산.** 전체 테스트 파일 ≤ 15개, 총 테스트 ≤ 280개. 한 기능에 한 테스트가 원칙.
-   (v4.0/RT 개정: 240 → 280, 파일 14 → 15. 실측 기점 225/11파일(f7be88b). RT가
+   (v4.0/RT 개정: 240 → 280, 파일 14 → 15. 실측 기점 225/11파일(f7be88b);
+   RT-P0b 시점 실측 278/13파일 — `tests/test_np.py` 신설 10개. RT가
    `tests/test_rt.py` 1파일 + 약 22개(모드 B 등가·폐합·재시작, 파티션·해석해 3종·
    플럭스 반대칭·결정론, 경계 저수조 폐합, config 해시 불변)를 요구하고, 플랫폼
    상류(WIP)의 커밋 합류 시 +2파일/+10개 여유를 남긴다. 우산 병합 금지는 그대로.)
@@ -325,7 +326,11 @@ A행렬 행 그대로 — 하드코딩·고정 화학식 fallback 금지)를 둔
 저장과 동일함을 테스트로 고정). 행수 계약("행수 = 도메인 수 또는 0, 그 외 손상")과
 액체 겹침 리매핑은 클러스터 계약을 그대로 일반화한다. 모드 B는 **새 배열이 없다** —
 기존 풀의 갱신 규칙이 절대 교체에서 블렌드(f=1 경로는 현행 코드 경로 그대로)로
-바뀔 뿐이다. **FORMAT_VERSION 4는 RT-W2에서 1회 단절**: 도메인 키 행 의미 +
+바뀔 뿐이다. **FORMAT_VERSION 5는 RT-P0b에서 1회 단절**(2026-09-02): 동결
+스페시에이션 `domain_species_mol (D,S)` + 헤더 `aq_species_ids` + **Tier 1
+예약** `domain_sorbed_mol (0,E)`(RT-S1a까지 제로행 — v4의 boundary_water_mol
+예약 전례: 단절 1회로 앵커 재고정 1회). 그 이전, **FORMAT_VERSION 4는
+RT-W2에서 1회 단절**: 도메인 키 행 의미 +
 GEM 경제 스냅샷 배열(`domain_eq_*` — 재시작 비트 동일성에 필수) + 예약 스칼라
 `boundary_water_mol`(0; RT-W3 물 교환 대비 동승 — 재단절 없음) + 모드 C 런의
 parcels 채널 집계 행. RT-W1(모드 B)은 스키마 무변경 — v3 유지. 마이그레이션 코드
@@ -874,6 +879,44 @@ alpha 슬롯은 항상 0이고, 방출량은 엔진이 접근성에서 직접 �
   레버이자 더 나은 물리다(강제 ~1밴드 + 전선 밴드 수 개 → 스텝당 ≤~25 호출).
   W4 착수 시 config 확장으로 구현한다.
 
+#### 4.6.4 Tier 0 — 종별 NP 영전류 사영 (RT-P0, `transport.domains.species`)
+
+부속 설계문서 `TINN_RT_phreeqc_tiers_spec_2026-09-01.md` §2의 확정 병합본.
+모드 C의 스칼라 `d0_m2_s`를 수용액 스페시에이션 + 종별 자기확산계수 기반
+**에지·원소별 유효 전도도**로 대체하는 config 선택형 옵션. PHREEQC 코드는
+실행되지 않는다 — phreeqpython 동봉 `phreeqc.dat`의 `-dw` 57건을
+`gems_bundles/species_dw/species_dw.json`으로 벤더링(생성기
+`scripts/make_species_dw_table.py`, PROVENANCE 동봉; alias는 GEMS DC명 →
+phreeqc명 항등 매핑만, 미매핑 종은 `default_dw_m2_s` **명시** 시에만 그 값
++ 런 summary 목록, null이면 거부 — 침묵 기본값 금지).
+
+- **데이터 경로**: 워커 프로토콜 v2 — info()에 `species_charge`(DCH Zz 열),
+  평형 응답에 `aqueous_species_mol`(전 수용액 DC mol; 기존에 계산 후
+  버리던 dict). 구버전 워커 + species 활성 = 거부(`require_speciation`),
+  비활성 = 무시(하위호환 `.get` 패턴).
+- **동결 스페시에이션**: 도메인별 종 mol 행렬 `domain_species_mol (D,S)` +
+  런 스코프 `aq_species_ids`(FORMAT_VERSION 5, §2.3). T는 직전 R의
+  스페시에이션(리매핑 경유) 위에서 돈다 — Lie 1차 정합. **보존 원장이
+  아니라 계수 캐시**: §6.1 폐합 불참, 물 비례 리매핑, dryout 행 폐기,
+  미평형 도메인 = 제로행 → 해당 에지 전도 0 + `np_empty_el` 보고.
+- **수식**: 에지 (a,b), 동결 c_i (= n_i/W), c̄_i 조화 면평균(배스 면은
+  상류 one-sided — 조화면 이동항이 항등 소멸), Φ* = Σz_jD_jΔc_j /
+  Σz_j²D_jc̄_j, 원소별 `D_eff = (Σν_iD_iΔc_i − Φ*·Σν_iz_iD_ic̄_i) / Δc_el`
+  — 동결 상태에서 NP 영전류 원소 플럭스와 항등. BE는 원소 공간 유지,
+  기존 블록 CG를 열 축으로 재사용(스텝 내 비선형 재결합은 비범위 = P0c).
+- **클램프 사다리**(각 단 카운터 보고): ① |Δc_el| 미소 → 가중 Fick D̄_el
+  ② 본식 ③ 음수 → Φ 항 제거(순수 Fick) ④ 여전히 음수 → D̄_el ⑤ 에지 내
+  전 종 최대 D 상한. 0 ≤ D_eff ≤ D_max 무조건 → M-행렬·무조건 안정·
+  플럭스 반대칭(구성적 보존) 전부 유지.
+- **제약**: gems3k 전용; `d0_m2_s`와 상호 배타(diagnostics_only는 d0 필수
+  — 스칼라 물리 + 리포트만); 배스는 O/H(폭기수)만 허용(용질 배스의
+  스페시에이션은 미정의 — 재검토 트리거: 이온성 배스 응용 착수);
+  온도 보정은 Stokes–Einstein 1차(0–100 °C 점도표), 계수 summary 기록.
+- **RT-P0a 실측(2026-09-02, OPC 32³ 6 h)**: D_eff/D₀ 분포 0.008–8.1×,
+  p50 1.57× — 검토서 "이온성 매질 단일 D₀ 2–4×"가 계기화됨.
+- **P0c(종 공간 완전 결합)는 이연**: P0b 실측에서 클램프율·오차가 유의할
+  때만 별도 설계 리뷰로.
+
 ---
 
 ## 5. 비기능 요구
@@ -940,8 +983,9 @@ alpha 슬롯은 항상 0이고, 방출량은 엔진이 접근성에서 직접 �
 | RT 해석 앵커 2 (v4.0) | 타일별 상수 슬래브 체인: 도메인 그래프 정상 플럭스 = 미세 격자 `relative_diffusivity_network` 플럭스 (CG 공차 내 — TPFA는 타일별 상수장에서 정확) | 전달률 p-나눗셈·공용 전도 규칙 고정 |
 | RT 해석 앵커 3 (v4.0/W3) | 슬래브 + 양끝 Dirichlet 배스: 도메인 그래프 정상 플럭스 = 네트워크 솔버(gin=2g_a) 플럭스 — G_AR 반셀 factor-2의 수치 고정(중복 곱이면 정확히 2× 실패) | 경계 결합 스케일 고정 |
 | RT 해석 앵커 4 (v4.0/W3) | 1-도메인+배스 BE 1스텝: c⁺−c_R = (c−c_R)/(1+Δt·λ_R), λ_R = D₀·G_AR/(p·W); 서브스텝 → exp(−λ_R t) 1차 수렴 | boundary exchange 단위 테스트 |
-| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df (버전 불변 권위), full_hash v3 원기록 1c7d2a10…, **v4 재고정(RT-W2, boundary_water_mol이 해시에 편입) fe100126c8a0fa1b5e59181433237776bfc58bc83cecffe18acecf0ae9f85572** — dense 동일 실측으로 물리 불변 입증 | 합성 경로 기본값 불변 감시 (GEMS 불요) |
-| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 (버전 불변 권위), full_hash v3 원기록 84751b8b…, **v4 재고정(RT-W2) b30c6f1a3102b2cbdb853496b9b2cf19dd6b2c1cc6bbb985eb4b73323ecf2f9c** — dense 동일 실측 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
+| RT 해석 앵커 5 (Tier 0/P0) | Nernst–Hartley 2종 전해질: D_salt = (z₊−z₋)D₊D₋/(z₊D₊−z₋D₋) 정확 재현(rel 1e-10; NaCl≈1.61e-9·KCl≈1.99e-9 교차 확인) + 등-D 항등(Φ≡0, rel 1e-12) + 에지 전하플럭스 영(1e-12) | `np_effective_conductance` 단위 테스트 |
+| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df (버전 불변 권위), full_hash v3 원기록 1c7d2a10…, v4 재고정(RT-W2, boundary_water_mol 편입) fe100126…, **v5 재고정(RT-P0b 2026-09-02, domain_species_mol/aq_species_ids/예약 domain_sorbed_mol이 해시에 편입) 40e4760ed020fe619bc853beba9a91f37de108da1a93ee247fc1d4fb1129de12** — dense 동일 실측으로 물리 불변 입증 | 합성 경로 기본값 불변 감시 (GEMS 불요) |
+| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 (버전 불변 권위), full_hash v3 원기록 84751b8b…, v4 재고정(RT-W2) b30c6f1a…, **v5 재고정(RT-P0b) 78eeec4ef1d6b0ea86791edc62eaed63c97410d873aef7b89a5a6ddcc625e70d** — dense 동일 실측 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
 
 ### 6.3 Sanity band (비블로킹 — 리포트에 pass/warn/info만 기록; info = 해당 배합에 밴드 전제가 비적용, 값만 표시 — rev.2)
 

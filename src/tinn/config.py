@@ -581,10 +581,6 @@ class DomainPartitionConfig(BaseModel):
             raise ValueError(
                 "transport.domains needs d0_m2_s (species diagnostics and "
                 "the scalar path both run on it; no invented default)")
-        if active:
-            raise ValueError(
-                "active species transport lands with RT-P0b - set "
-                "diagnostics_only: true (RT-P0a) for now")
         return self
 
     def tiles(self, grid_size: int) -> Tuple[int, int, int]:

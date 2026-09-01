@@ -123,6 +123,23 @@ class SimulationState:
     domain_eq_water: np.ndarray = field(default_factory=lambda: np.zeros(0))
     domain_eq_age: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int64))
+    # Tier 0 / RT-P0b (FORMAT_VERSION 5, PRD 4.6.4): frozen aqueous
+    # speciation per domain — a COEFFICIENT CACHE for the NP conductances,
+    # not a conservation ledger (it never enters §6.1 closure). Rows follow
+    # the cluster_inventory contract; (0, 0) whenever species transport is
+    # off, so pre-Tier-0 trajectories and hashes gain nothing but the
+    # format break itself. aq_species_ids is the run-scoped column order
+    # (bundle DCH aqueous DCs, solvent excluded), header-owned like
+    # endmember_ids.
+    aq_species_ids: tuple = ()
+    domain_species_mol: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0)))
+    # RESERVED for RT-S1a (Tier 1 sorption): per-domain sorbed element
+    # inventory. Zero rows until the sorption operator lands — reserved in
+    # the SAME format break (the v4 boundary_water_mol precedent) so Tier 1
+    # does not cost a second anchor re-pin.
+    domain_sorbed_mol: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, len(ELEMENT_IDS))))
 
     # --- derived helpers ---
     @property
@@ -162,10 +179,12 @@ class SimulationState:
                     self.injected_elements,
                     self.initial_elements, self.cluster_inventory,
                     self.cluster_endmember_mol, self.domain_eq_inventory,
-                    self.domain_eq_water, self.domain_eq_age):
+                    self.domain_eq_water, self.domain_eq_age,
+                    self.domain_species_mol, self.domain_sorbed_mol):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(repr(self.hydrate_ids).encode())
         h.update(repr(self.endmember_ids).encode())
+        h.update(repr(self.aq_species_ids).encode())
         for x in (self.time_h, self.dt_h, self.water_free_mol, self.water_gel_mol,
                   self.water_bound_mol, self.initial_water_mol,
                   self.boundary_water_mol,

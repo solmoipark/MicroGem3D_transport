@@ -451,9 +451,10 @@ class ExchangeResult:
 
 
 def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
-                d0_vox2_h: float,
+                d0_vox2_h: Optional[float] = None,
                 bath: Optional[BoundaryBath] = None,
-                tol: float = 1e-12, max_iter: int = 10000) -> ExchangeResult:
+                tol: float = 1e-12, max_iter: int = 10000, *,
+                np_cond: Optional[NPConductance] = None) -> ExchangeResult:
     """One backward-Euler diffusion step on the domain graph, in FLUX FORM
     (PRD 4.6.2): solve (diag(W) + dt L) c = n per element column with
     Jacobi-preconditioned CG (fixed operation order - deterministic), then
@@ -464,39 +465,56 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     and charges the largest entry, asserting the magnitude stays dust."""
     n_dom, n_elem = inventory.shape
     delta = np.zeros_like(inventory)
+    # RT-P0b: exactly one conductance source — the scalar D0 (as (E,1)/(D,1)
+    # broadcast views, so every column sees the SAME float sequence as the
+    # historical 1D path: bit-identity by construction, not by luck) or the
+    # per-edge/per-element NP transmissibilities.
+    if (d0_vox2_h is None) == (np_cond is None):
+        raise ValueError("exchange_be needs exactly one of d0_vox2_h/np_cond")
+    ea, eb = graph.edge_a, graph.edge_b
     # RT-W3: a bath-coupled domain participates even with no internal
     # edges (an isolated surface-connected pore physically leaches)
-    t_bnd = None
-    if bath is not None and np.any(bath.g_bnd > 0.0):
-        t_bnd = d0_vox2_h * bath.g_bnd
-    if dt_h <= 0.0 or (graph.edge_a.size == 0 and t_bnd is None):
+    t_bnd2 = None
+    if np_cond is None:
+        t_e2 = (d0_vox2_h * graph.edge_g)[:, None]      # (E, 1) vox^3/h
+        if bath is not None and np.any(bath.g_bnd > 0.0):
+            t_bnd2 = (d0_vox2_h * bath.g_bnd)[:, None]  # (D, 1)
+    else:
+        t_e2 = np_cond.t_edge                            # (E, n_elem)
+        if bath is not None:
+            if np_cond.t_bnd is None:
+                raise ValueError(
+                    "bath given but np_cond carries no boundary "
+                    "transmissibilities")
+            if np.any(np_cond.t_bnd > 0.0):
+                t_bnd2 = np_cond.t_bnd                   # (D, n_elem)
+    if dt_h <= 0.0 or (graph.edge_a.size == 0 and t_bnd2 is None):
         return ExchangeResult(delta, "ok", 0, 0.0, 0.0, np.zeros(n_elem))
-    ea, eb = graph.edge_a, graph.edge_b
-    t_e = d0_vox2_h * graph.edge_g                  # vox^3 / h
     # only edge-connected (or bath-coupled) domains participate; the
     # diagonal floors at a tiny positive value on those rows
     act = np.zeros(n_dom, dtype=bool)
     act[ea] = True
     act[eb] = True
-    if t_bnd is not None:
-        act |= t_bnd > 0.0
+    if t_bnd2 is not None:
+        act |= (t_bnd2 > 0.0).any(axis=1)
     w_act = np.where(act, np.maximum(graph.water, 1e-300), 1.0)
-    deg = np.zeros(n_dom)
-    np.add.at(deg, ea, t_e)
-    np.add.at(deg, eb, t_e)
+    deg = np.zeros((n_dom, t_e2.shape[1]))
+    np.add.at(deg, ea, t_e2)
+    np.add.at(deg, eb, t_e2)
     # bath term: known c_R eliminated to the RHS — diagonal gains dt*T_bnd
     # (SPD/M-matrix preserved, diagonal dominance improves), RHS gains
     # dt*T_bnd*c_res (PRD 4.6.3). The sealed path aliases w_eff = w_act.
-    w_eff = w_act if t_bnd is None else w_act + dt_h * t_bnd
-    diag = w_eff + dt_h * deg
+    w2 = w_act[:, None]
+    w_eff = w2 if t_bnd2 is None else w2 + dt_h * t_bnd2
+    diag = w_eff + dt_h * deg                            # (D, cols)
     b = inventory * act[:, None]
-    if t_bnd is not None:
-        b = b + (dt_h * t_bnd)[:, None] * bath.c_res[None, :]
+    if t_bnd2 is not None:
+        b = b + (dt_h * t_bnd2) * bath.c_res[None, :]
 
     def matvec(x):
-        y = w_eff[:, None] * x
+        y = w_eff * x
         d = x[ea] - x[eb]
-        contrib = dt_h * t_e[:, None] * d
+        contrib = dt_h * t_e2 * d
         np.add.at(y, ea, contrib)
         np.add.at(y, eb, -contrib)
         return y
@@ -507,9 +525,9 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     # and rescale the solution (deterministic, columnwise).
     col_scale = np.maximum(np.abs(b).sum(axis=0), 1e-300)
     b = b / col_scale[None, :]
-    x = b / diag[:, None]
+    x = b / diag
     r = b - matvec(x)
-    z = r / diag[:, None]
+    z = r / diag
     p = z.copy()
     rz = (r * z).sum(axis=0)
     iters = 0
@@ -521,7 +539,7 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         alpha = np.where(pap > 0.0, rz / np.where(pap > 0.0, pap, 1.0), 0.0)
         x = x + alpha[None, :] * p
         r = r - alpha[None, :] * ap
-        z = r / diag[:, None]
+        z = r / diag
         rz_new = (r * z).sum(axis=0)
         beta = np.where(rz > 0.0, rz_new / np.where(rz > 0.0, rz, 1.0), 0.0)
         p = z + beta[None, :] * p
@@ -531,14 +549,14 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
                               np.zeros(n_elem))
     x = x * col_scale[None, :]
 
-    flux = dt_h * t_e[:, None] * (x[ea] - x[eb])    # (n_edges, n_elem)
+    flux = dt_h * t_e2 * (x[ea] - x[eb])            # (n_edges, n_elem)
     np.add.at(delta, ea, -flux)
     np.add.at(delta, eb, flux)
     max_flux = float(np.abs(flux).max()) if flux.size else 0.0
     boundary_net = np.zeros(n_elem)
-    if t_bnd is not None:
-        rows = np.flatnonzero(t_bnd > 0.0)           # ascending, deterministic
-        f_out = dt_h * t_bnd[rows, None] * (x[rows] - bath.c_res[None, :])
+    if t_bnd2 is not None:
+        rows = np.flatnonzero((t_bnd2 > 0.0).any(axis=1))  # ascending, deterministic
+        f_out = dt_h * t_bnd2[rows] * (x[rows] - bath.c_res[None, :])
         delta[rows] -= f_out                          # the same floats feed
         boundary_net = -f_out.sum(axis=0)             # rows AND the ledger
         if f_out.size:
