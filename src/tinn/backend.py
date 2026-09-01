@@ -172,6 +172,19 @@ def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
     """elements -> {neutral reactant: mol}; exact-closure audited."""
     reactants: Dict[str, float] = {}
     o_used = 0.0
+    # Cl rides the NaCl carrier (E3 salt-carrier precedent): chloride has
+    # no neutral oxide, so it consumes Na 1:1 BEFORE the oxide sweep. A
+    # Cl surplus over Na is refused - no other carrier is declared.
+    elements = dict(elements)
+    cl = elements.pop("Cl", 0.0)
+    if cl > 0.0:
+        na = elements.get("Na", 0.0)
+        if na + 1e-12 * max(na, cl) < cl:
+            raise ValueError(
+                f"Cl {cl} exceeds Na {na} - the NaCl carrier cannot "
+                f"represent this solution (no HCl/KCl carrier declared)")
+        reactants["NaCl"] = cl
+        elements["Na"] = na - cl
     for formula, el, n_el, n_o in _SORB_OXIDES:
         amount = elements.get(el, 0.0)
         if amount <= 0.0:
@@ -193,6 +206,14 @@ def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
     if o_left > 1e-15 * scale:
         reactants["O2"] = o_left / 2.0
     rebuilt: Dict[str, float] = {el: 0.0 for el in elements}
+    nacl = reactants.get("NaCl", 0.0)
+    if nacl:
+        rebuilt["Cl"] = nacl
+        rebuilt["Na"] = rebuilt.get("Na", 0.0) + nacl
+    rebuilt["Cl"] = rebuilt.get("Cl", 0.0)
+    if cl:
+        elements["Cl"] = cl
+        elements["Na"] = elements["Na"] + cl
     for formula, el, n_el, n_o in _SORB_OXIDES:
         mol = reactants.get(formula, 0.0)
         rebuilt[el] = rebuilt.get(el, 0.0) + mol * n_el
@@ -228,12 +249,9 @@ class SorptionOperator:
 
     def __init__(self, config, temperature_k: float):
         from collections import OrderedDict
-        if config.surface_model != "no_edl":
-            raise RuntimeError(
-                "surface_model 'ddl' is declared but not implemented yet - "
-                "the electrostatic model needs real area/mass parameters "
-                "(no silent placeholder physics)")
         self._cfg = config
+        self._ddl = config.surface_model == "ddl"
+        self._area_per_mol = config.specific_area_m2_per_mol_site
         self.temperature_k = float(temperature_k)
         self._dat = str(Path(config.phreeqc_dat).resolve())
         from .gems import audit_bundle
@@ -243,12 +261,15 @@ class SorptionOperator:
         self._memo: "OrderedDict[str, SorptionResult]" = OrderedDict()
         self.memo_cap = 4096
         # per-reaction element rows over ELEMENT_IDS, config-declared
-        self._bound_species = [rx.bound_species
-                               for rx in config.surface_species]
+        # charging reactions (ddl) ride the SAME machinery as sorbate
+        # reactions: their bound species are punched, their element rows
+        # book the solution deltas (deprotonation releases H+ etc.)
+        rxs = [*config.surface_species, *config.charging_reactions]
+        self._bound_species = [rx.bound_species for rx in rxs]
         if len(set(self._bound_species)) != len(self._bound_species):
             raise RuntimeError("surface reactions bind duplicate species")
-        self._rows = np.zeros((len(config.surface_species), len(ELEMENT_IDS)))
-        for i, rx in enumerate(config.surface_species):
+        self._rows = np.zeros((len(rxs), len(ELEMENT_IDS)))
+        for i, rx in enumerate(rxs):
             for el, v in rx.sorbed_elements.items():
                 self._rows[i, ELEMENT_IDS.index(el)] = float(v)
         self._whitelist = tuple(config.elements)
@@ -265,7 +286,8 @@ class SorptionOperator:
                      "SURFACE_SPECIES",
                      "    Surf_sOH = Surf_sOH",
                      "        log_k 0"]
-            for rx in self._cfg.surface_species:
+            for rx in [*self._cfg.surface_species,
+                       *self._cfg.charging_reactions]:
                 lines += [f"    {rx.reaction}",
                           f"        log_k {rx.log_k!r}"]
             punch_tot = " ".join(self._whitelist)
@@ -339,11 +361,22 @@ class SorptionOperator:
         # PHREEQC REACTION semantics: moles added = coefficient x amount.
         # Coefficients above ARE the absolute ledger mols, so the amount is
         # exactly 1.0 (the spike README's measured convention).
-        lines += ["    1.0 moles",
-                  "SURFACE 1",
-                  f"    Surf_sOH {sorbent_sites_mol * s_fac!r} 600.0 1.0",
-                  "    -no_edl",
-                  "END"]
+        sites_s = sorbent_sites_mol * s_fac
+        if self._ddl:
+            # Gouy-Chapman surface: the area scales JOINTLY with the sites
+            # (charge density sigma is the intensive quantity); mass 1.0 g
+            # is a bookkeeping carrier - PHREEQC uses area x mass only.
+            area_m2 = sites_s * self._area_per_mol
+            lines += ["    1.0 moles",
+                      "SURFACE 1",
+                      f"    Surf_sOH {sites_s!r} {area_m2!r} 1.0",
+                      "END"]
+        else:
+            lines += ["    1.0 moles",
+                      "SURFACE 1",
+                      f"    Surf_sOH {sites_s!r} 600.0 1.0",
+                      "    -no_edl",
+                      "END"]
         pp = self._instance()
         try:
             pp.ip.run_string("\n".join(lines))

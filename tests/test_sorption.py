@@ -248,3 +248,108 @@ def test_sorption_engine_run_closes_and_restarts(tmp_path):
     assert mid.domain_sorbed_mol.shape[0] > 0        # store round-trips
     restarted, _ = Engine(mid.config).run(state=mid)
     assert restarted.full_hash() == straight.full_hash()
+
+
+def test_sorption_ddl_config_gates():
+    """RT-S2a config contract: ddl requires the physical area, no_edl
+    refuses ddl-only fields (no silent ignore), the bound-species parser
+    keeps charged names intact, and the new optional fields are hash-
+    invisible when unset (pre-S2a configs keep their hash)."""
+    from tinn.config import SurfaceReaction
+
+    with pytest.raises(Exception, match="specific_area"):
+        _sorption_cfg(surface_model="ddl")
+    with pytest.raises(Exception, match="meaningless"):
+        _sorption_cfg(specific_area_m2_per_mol_site=1.25e5)
+    with pytest.raises(Exception, match="charging_reactions"):
+        _sorption_cfg(charging_reactions=[
+            {"reaction": "Surf_sOH = Surf_sO- + H+", "log_k": -9.8,
+             "sorbed_elements": {"H": -1.0}}])
+    cfg = _sorption_cfg(
+        surface_model="ddl", specific_area_m2_per_mol_site=1.2544e5,
+        charging_reactions=[
+            {"reaction": "Surf_sOH = Surf_sO- + H+", "log_k": -9.8,
+             "sorbed_elements": {"H": -1.0}},
+            {"reaction": "Surf_sOH + Ca+2 = Surf_sOCa+ + H+",
+             "log_k": -7.0,
+             "sorbed_elements": {"Ca": 1.0, "H": -1.0}}],
+        elements=["S", "Ca"])
+    assert cfg.charging_reactions[1].bound_species == "Surf_sOCa+"
+    rx = SurfaceReaction(reaction="Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                         log_k=0.5,
+                         sorbed_elements={"S": 1.0, "O": 3.0, "H": -1.0})
+    assert rx.bound_species == "Surf_sSO4-"
+
+    base = json.loads((REPO / "examples" / "qualification"
+                       / "deschner_opc_q32_dt06_28d.json"
+                       ).read_text(encoding="utf-8"))
+    base["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.05},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"]}
+    h_bare = TinnConfig.model_validate(base).config_hash()
+    base["sorption"]["charging_reactions"] = []
+    base["sorption"]["specific_area_m2_per_mol_site"] = None
+    h_explicit = TinnConfig.model_validate(base).config_hash()
+    assert h_bare == h_explicit
+
+
+@needs_iphreeqc
+def test_sorption_ddl_operator_matches_standalone():
+    """RT-S2a operator: under ddl the charging reactions ride the same
+    bound-species machinery, the closure witness holds, and the result
+    matches an independently assembled PHREEQC batch (rel 1e-9). The
+    Gouy-Chapman surface suppresses anion binding vs no_edl (measured
+    sign of the electrostatic correction)."""
+    from phreeqpython import PhreeqPython
+    from tinn.backend import SorptionOperator, _decompose_to_reactants
+
+    area_per_mol = 1.2544e5
+    charging = [{"reaction": "Surf_sOH = Surf_sO- + H+", "log_k": -9.8,
+                 "sorbed_elements": {"H": -1.0}},
+                {"reaction": "Surf_sOH + Ca+2 = Surf_sOCa+ + H+",
+                 "log_k": -7.0,
+                 "sorbed_elements": {"Ca": 1.0, "H": -1.0}}]
+    cfg = _sorption_cfg(surface_model="ddl",
+                        specific_area_m2_per_mol_site=area_per_mol,
+                        charging_reactions=charging,
+                        elements=["S", "Ca"])
+    op = SorptionOperator(cfg, 298.15)
+    e = _solution()
+    water_mol, sites = 2.0, 3e-4
+    r = op.sorb(e, water_mol, sites)
+    s_idx = ELEMENT_IDS.index("S")
+    assert r.sorbed_mol[s_idx] > 0.0
+    assert "Surf_sO-" in r.site_occupancy          # charging punched too
+
+    r0 = SorptionOperator(_sorption_cfg(), 298.15).sorb(e, water_mol,
+                                                        sites)
+    assert r.sorbed_mol[s_idx] < r0.sorbed_mol[s_idx]  # GC suppression
+
+    pp = PhreeqPython(database=CEMDAT.name, database_directory=CEMDAT.parent)
+    reactants = _decompose_to_reactants(
+        {el: float(e[i]) for i, el in enumerate(ELEMENT_IDS) if e[i] > 0.0})
+    lines = ["SURFACE_MASTER_SPECIES", "    Surf_s Surf_sOH",
+             "SURFACE_SPECIES", "    Surf_sOH = Surf_sOH",
+             "        log_k 0",
+             f"    {SO4_RX['reaction']}",
+             f"        log_k {SO4_RX['log_k']!r}"]
+    for c in charging:
+        lines += [f"    {c['reaction']}", f"        log_k {c['log_k']!r}"]
+    lines += ["SELECTED_OUTPUT 1", "    -reset false",
+              "    -high_precision true", "    -water true",
+              "    -molalities Surf_sSO4-", "END",
+              "SOLUTION 1", "    temp 25.0",
+              f"    water {water_mol * 18.015 / 1000.0!r} kg",
+              "REACTION 1"]
+    lines += [f"    {f} {mol!r}" for f, mol in sorted(reactants.items())]
+    lines += ["    1.0 moles", "SURFACE 1",
+              f"    Surf_sOH {sites!r} {sites * area_per_mol!r} 1.0",
+              "END"]
+    pp.ip.run_string("\n".join(lines))
+    rows = pp.ip.get_selected_output_array()
+    col = {str(h).strip(): i for i, h in enumerate(rows[0])}
+    kgw = float(rows[-1][col["mass_H2O"]])
+    bound = float(rows[-1][col["m_Surf_sSO4-(mol/kgw)"]]) * kgw
+    assert r.site_occupancy["Surf_sSO4-"] == pytest.approx(bound, rel=1e-9)

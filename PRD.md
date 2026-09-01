@@ -986,6 +986,23 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   1/Cb = 54.42/C − 0.053, R² 0.9868) 대비 모형 ~6× 과소. 단일 리간드
   교환(OH⁻ 방출)의 pH 경향이 실측(pH·이온강도와 함께 **증가**)과 반대 —
   상수는 보정 pH(~12.9–13.4) 전용, pH 외삽 금지.
+- **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
+  구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
+  Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
+  탈양성자화·Ca 착화; 결합종·원소행이 수착 반응과 **동일 기계** 탑재,
+  H⁺ 방출도 같은 원장 delta)를 소유. 면적은 사이트와 공동 스케일(전하
+  밀도 σ가 intensive). `bound_species` 파서를 항 구분자 기반으로 수정
+  (하전 종명 `Surf_sOCa+` 보존). 분해기에 NaCl 담체 추가(Cl은 원장
+  원소가 아직 아님 — E3 선행분, Na 부족 시 거부). 신규 optional은 해시
+  불가시(pre-S2a 수착 config 해시 불변, 테스트 고정).
+  **공동 보정 실측** (`scripts/fit_so4_ddl.py`: NaOH 4곡선 31점 피팅 +
+  NaCl 2곡선 out-of-sample 예측): 최적 (A형 OH방출, pK_H 9.8/K_Ca −7,
+  Na쌍 +0.5, SO4 log_K +5.3)에서도 joint RMS 0.62 mmol/g — pH 사다리를
+  정량 재현 못함(0.05 M ~2× 과대, 0.5 M ~6× 과소; Gouy-Chapman의
+  고이온강도 스크리닝 과장). NaCl 경향은 **부호 재현**(no_edl은 불가)
+  하나 크기 ~2× 과대. **판정: SO4 프로덕션 상수는 no_edl 국소 보정
+  (S1c) 유지; ddl은 능력으로 탑재하되 정전 지배 이온(Cl 배제, 알칼리
+  Donnan)용으로 보류** — 메커니즘 표 항목.
 - **28d 실측 런** (`scripts/run_sorption_so4.py calibrated`, Deschner
   OPC 32³ 봉인 dt 0.6 h, 296.15 K, 벽시계 766 s,
   `runs/sorption_so4_results_calibrated.json`): 수착 S 24 h 1.68e-12 →

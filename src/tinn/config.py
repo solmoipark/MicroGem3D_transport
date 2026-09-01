@@ -703,11 +703,14 @@ class SurfaceReaction(BaseModel):
 
     @property
     def bound_species(self) -> str:
-        """Product surface species name (first Surf_s term on the RHS)."""
+        """Product surface species name (first Surf_s term on the RHS).
+        Terms split on the ' + ' separator, NOT on every '+', so charged
+        species names like Surf_sOCa+ survive intact (RT-S2a fix)."""
         rhs = self.reaction.split("=", 1)[1]
-        for tok in rhs.replace("+", " ").split():
-            if tok.startswith("Surf_s"):
-                return tok
+        for term in rhs.split(" + "):
+            term = term.strip()
+            if term.startswith("Surf_s"):
+                return term
         raise ValueError(f"no Surf_s product in {self.reaction!r}")
 
 
@@ -720,6 +723,14 @@ class SorptionConfig(BaseModel):
     operator: Literal["phreeqc_surface"]
     phreeqc_dat: str
     surface_model: Literal["no_edl", "ddl"] = "no_edl"
+    # ddl only (RT-S2a): Gouy-Chapman needs the physical surface area the
+    # site total lives on. Literature-derived, config-owned (d0 precedent):
+    # Divet SSA 350 m2/g / 2.79 mmol sites/g = 1.254e5 m2 per mol sites.
+    specific_area_m2_per_mol_site: Optional[float] = None
+    # ddl only: intrinsic charging reactions (silanol deprotonation, Ca
+    # complexation) - these SET the surface potential every ion feels; the
+    # sorbed_elements rows book their solution deltas in the same ledger.
+    charging_reactions: List[SurfaceReaction] = Field(default_factory=list)
     # sites per mol of each C-S-H endmember (bundle DC names; REQUIRED, no
     # defaults - the engine validates the keys against the bundle at S1b).
     # Uncovered pool mass takes the global endmember fractions (the E2
@@ -750,12 +761,33 @@ class SorptionConfig(BaseModel):
                 raise ValueError(
                     f"site_density_mol_per_mol[{k!r}] must be finite >= 0")
         allowed = set(self.elements) | {"O", "H"}
-        for rx in self.surface_species:
+        for rx in [*self.surface_species, *self.charging_reactions]:
             bad = sorted(set(rx.sorbed_elements) - allowed)
             if bad:
                 raise ValueError(
                     f"surface reaction {rx.reaction!r} moves {bad} - "
                     f"outside the declared elements whitelist")
+        if self.surface_model == "ddl":
+            a = self.specific_area_m2_per_mol_site
+            if a is None or not math.isfinite(a) or a <= 0.0:
+                raise ValueError(
+                    "surface_model 'ddl' requires a finite positive "
+                    "specific_area_m2_per_mol_site (the Gouy-Chapman "
+                    "charge density needs real area - no placeholder)")
+        else:
+            if self.specific_area_m2_per_mol_site is not None:
+                raise ValueError(
+                    "specific_area_m2_per_mol_site is meaningless without "
+                    "surface_model 'ddl' - remove it (no silent ignore)")
+            if self.charging_reactions:
+                raise ValueError(
+                    "charging_reactions need surface_model 'ddl' - without "
+                    "an electrostatic model the surface charge they create "
+                    "has no effect (no silent ignore)")
+        names = [rx.bound_species
+                 for rx in [*self.surface_species, *self.charging_reactions]]
+        if len(set(names)) != len(names):
+            raise ValueError("surface reactions bind duplicate species")
         if (any(el in ("Na", "K") for el in self.elements)
                 and not self.alkali_exchange):
             raise ValueError(
@@ -1023,6 +1055,14 @@ class TinnConfig(BaseModel):
         # RT-S1: a sorption-free config keeps its pre-Tier-1 hash
         if payload.get("sorption") is None:
             payload.pop("sorption", None)
+        # RT-S2a: no_edl configs written before the ddl fields keep their
+        # hash (material_psd pattern - unset optionals pop)
+        sorp = payload.get("sorption")
+        if sorp is not None:
+            if sorp.get("specific_area_m2_per_mol_site") is None:
+                sorp.pop("specific_area_m2_per_mol_site", None)
+            if not sorp.get("charging_reactions"):
+                sorp.pop("charging_reactions", None)
         # Piecewise timesteps were added after checkpoint format v3. An absent
         # schedule keeps every legacy config/checkpoint hash unchanged.
         if payload.get("schedule", {}).get("dt_windows") is None:
