@@ -33,9 +33,22 @@ def base_path(name: str) -> Path:
     return REPO / "examples" / "qualification" / f"leach_w4_{name}.json"
 
 def run_case(d0: float, out_dir: Path, dt_s: float = None,
-             base: Path = None, until_h: float = None) -> dict:
+             base: Path = None, until_h: float = None,
+             np_mode: bool = False) -> dict:
     raw = json.loads((base or base_path("opc32")).read_text(encoding="utf-8"))
-    raw["transport"]["domains"]["d0_m2_s"] = d0
+    if np_mode:
+        # RT-W4(2) remeasure (PRD 4.6.4): species NP conductances replace the
+        # scalar; the ladder argument becomes the EXPLICIT default dw for
+        # unmapped species (recorded per species in the run summary)
+        raw["transport"]["domains"].pop("d0_m2_s", None)
+        raw["transport"]["domains"]["species"] = {
+            "dw_table": "gems_bundles/species_dw/species_dw.json",
+            "default_dw_m2_s": d0,
+            "geometry_factor": 1.0,
+            "phi_clamp_report": True,
+        }
+    else:
+        raw["transport"]["domains"]["d0_m2_s"] = d0
     if until_h is not None:
         # W4.2 supply-clean confirmation: truncate the leach window so a
         # dt ~ 1/D0 run stays affordable (the front points that matter sit
@@ -59,6 +72,9 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
 
     frozen = {"nonconv": 0.0, "water": 0.0, "surrendered": 0.0,
               "surrendered_mol": 0.0}
+    np_counts = {"np_phi_clamped": 0.0, "np_fick_clamped": 0.0,
+                 "np_cap_clamped": 0.0, "np_smalldc": 0.0, "np_empty_el": 0.0,
+                 "np_charge_flux_rel_max": 0.0}
 
     def hook(ev):
         if ev.get("event") == "step_accepted":
@@ -69,6 +85,11 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
             frozen["water"] += m.get("water_frozen_domains", 0.0)
             frozen["surrendered"] += m.get("dryout_surrendered_domains", 0.0)
             frozen["surrendered_mol"] += m.get("dryout_surrendered_mol", 0.0)
+            for k in np_counts:
+                if k == "np_charge_flux_rel_max":
+                    np_counts[k] = max(np_counts[k], m.get(k, 0.0))
+                else:
+                    np_counts[k] += m.get(k, 0.0)
 
     if out_dir.exists():
         # storage refuses checkpoint overwrites; a rerun after an aborted
@@ -119,6 +140,8 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
         "rows": rows,
         "a_um_per_sqrt_day": a_um_sqrt_day,
         "n_fit_points": len(pts),
+        "np_mode": np_mode,
+        "np_counters": (np_counts if np_mode else None),
     }
 
 
@@ -128,6 +151,7 @@ def main() -> None:
     dt_s = None
     until_h = None
     cfg_name = "opc32"
+    np_mode = False
     while args and "=" in args[0]:
         key, _, val = args[0].partition("=")
         if key == "dt":
@@ -136,15 +160,19 @@ def main() -> None:
             cfg_name = val
         elif key == "until":
             until_h = float(val)
+        elif key == "np":
+            np_mode = val not in ("0", "false", "")
         else:
             raise SystemExit(f"unknown option {args[0]!r}")
         args = args[1:]
     base = base_path(cfg_name)
-    ladder = [float(x) for x in args] or [0.8e-9, 2.0e-9, 5.3e-9]
+    ladder = [float(x) for x in args] or (
+        [1.0e-9] if np_mode else [0.8e-9, 2.0e-9, 5.3e-9])
     results = {}
     tags = []
     for d0 in ladder:
-        tag = f"d0_{d0:.1e}".replace("-", "m").replace("+", "")
+        tag = (f"np_dwdef_{d0:.1e}" if np_mode
+               else f"d0_{d0:.1e}").replace("-", "m").replace("+", "")
         if dt_s is not None:
             tag = f"dt{dt_s:g}s_{tag}"
         if until_h is not None:
@@ -154,7 +182,8 @@ def main() -> None:
         tags.append(tag)
         out = REPO / "runs" / f"leach_w4_{tag}"
         print(f"== {tag} ==", flush=True)
-        results[tag] = run_case(d0, out, dt_s, base, until_h)
+        results[tag] = run_case(d0, out, dt_s, base, until_h,
+                                np_mode=np_mode)
         r = results[tag]
         print(f"  wall {r['wall_s']} s, a = {r['a_um_per_sqrt_day']} "
               f"um/sqrt(day) ({r['n_fit_points']} pts), supply "
