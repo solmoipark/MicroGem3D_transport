@@ -281,6 +281,35 @@ class Engine:
         # v4.0/RT-W3 boundary reservoir (PRD 4.6.3): precompute the static
         # parts; the coupling itself is rebuilt each step from the labeled
         # liquid (pure function of state - restart determinism free)
+        # Tier 1 (RT-S1b): PHREEQC surface-sorption operator. Independent
+        # of transport.domains - without mode C the connected cluster is
+        # the reactor, same as the chemistry.
+        self._sorb_op = None
+        self._sorb_density = None
+        if config.sorption is not None:
+            if "CSHQ" not in self.hydrate_ids:
+                raise RuntimeError(
+                    "sorption needs the CSHQ solid solution as the sorbent "
+                    f"- this bundle declares {self.hydrate_ids[:6]}...")
+            if (any(el in ("Na", "K") for el in config.sorption.elements)
+                    and "CNASH" in self.hydrate_ids):
+                raise RuntimeError(
+                    "alkali sorption with a CNASH-bearing bundle would "
+                    "double-count alkali uptake (the solid solution binds "
+                    "them thermodynamically) - refused, mechanism table")
+            cshq_dcs = self._hydrate_endmembers["CSHQ"]
+            unknown = sorted(set(config.sorption.site_density_mol_per_mol)
+                             - set(cshq_dcs))
+            if unknown:
+                raise RuntimeError(
+                    f"site_density_mol_per_mol names endmembers {unknown} "
+                    f"the bundle's CSHQ does not declare ({cshq_dcs})")
+            self._sorb_density = np.array(
+                [config.sorption.site_density_mol_per_mol.get(dc, 0.0)
+                 for dc in cshq_dcs])
+            from .backend import SorptionOperator
+            self._sorb_op = SorptionOperator(config.sorption,
+                                             config.temperature_K)
         self._boundary = (config.transport.boundary
                           if config.transport is not None else None)
         if self._boundary is not None:
@@ -457,6 +486,7 @@ class Engine:
         inv_rows = state.cluster_inventory
         pool_rows = state.cluster_endmember_mol
         spec_state_rows = state.domain_species_mol
+        sorb_state_rows = state.domain_sorbed_mol
         eq_rows_ok = True
         if (bath_active and self._b_start > 0.0
                 and abs(trial.time_h - self._b_start) <= 1e-12):
@@ -488,6 +518,10 @@ class Engine:
                     spec_state_rows = transport.remap_inventories(
                         old_labels, prev_liquid, labels, prev_liquid,
                         spec_state_rows, n_clusters).inventory
+                if sorb_state_rows.shape[0] == old_n:
+                    sorb_state_rows = transport.remap_inventories(
+                        old_labels, prev_liquid, labels, prev_liquid,
+                        sorb_state_rows, n_clusters).inventory
 
         if inv_rows.shape[0] == n_clusters:
             inv_in = inv_rows
@@ -509,6 +543,18 @@ class Engine:
                 f"{pool_rows.shape} but "
                 f"({n_clusters}, {self._n_em}) was expected - state is "
                 f"corrupted (no fallback)")
+        # RT-S1b: the sorbed store rides the same labeling contract
+        sorb_in = None
+        if self._sorb_op is not None:
+            if sorb_state_rows.shape[0] == n_clusters:
+                sorb_in = sorb_state_rows
+            elif sorb_state_rows.shape[0] == 0:
+                sorb_in = np.zeros((n_clusters, len(ELEMENT_IDS)))
+            else:
+                raise RuntimeError(
+                    f"sorbed store has {sorb_state_rows.shape[0]} rows but "
+                    f"{n_clusters} reactors were labeled - state is "
+                    f"corrupted (no fallback)")
         # RT-P0b: frozen speciation rows ride the same labeling contract
         np_active = (self._np_cfg is not None
                      and not self._np_cfg.diagnostics_only)
@@ -784,6 +830,8 @@ class Engine:
             if np.any(f < 1.0):
                 f_ch = f
 
+        sorb_sites_mol = None
+        sorb_cov_frac = 0.0
         own_vol = np.zeros((n_clusters, n_h))
         owned_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
         owned_mol = np.zeros((n_clusters, n_h))
@@ -860,6 +908,21 @@ class Engine:
                 # global element/endmember ledgers stay mutually consistent
                 # by construction ("subtract what was fed")
                 owned_elem[:, h, :] = owned_em[:, sl] @ trial.endmember_elements[sl]
+                if (self._sorb_density is not None
+                        and self.hydrate_ids[h] == "CSHQ"):
+                    # RT-S1b sorbent sites: the SAME covered-pool +
+                    # global-fallback endmember split as the feed, but over
+                    # the FULL owned amount - surfaces exist regardless of
+                    # the mode-B aging fraction (endmember-preserving per
+                    # the S1 plan decision)
+                    amounts_full = np.clip(owned_mol[:, h], 0.0, None)
+                    covered_full = np.minimum(psum, amounts_full)
+                    site_em = (pool * (covered_full / safe)[:, None]
+                               + (amounts_full - covered_full)[:, None]
+                               * g_ratio[None, :])
+                    sorb_sites_mol = site_em @ self._sorb_density
+                    sorb_cov_frac = (float(covered_full.sum())
+                                     / max(float(amounts_full.sum()), 1e-30))
         if snapshot and dom_to_cl is not None and n_clusters > 0:
             # Cross-domain overdraft guard (W4 measured: leaching's sharp
             # AFm OH/SO4 redistribution drove the summed per-endmember feed
@@ -923,6 +986,51 @@ class Engine:
                 if clamped > 0.0:
                     exchange_metrics["endmember_feed_clamped_mol"] = clamped
         owned_gel_c = (offered_vol * gel_eps).sum(axis=1)
+
+        # ---- S stage (RT-S1b, Lie T->S->R): equilibrium surface sorption -
+        # per wet reactor: offer = pore solution + previous sorbed
+        # (snapshot re-offer, so shrinking sites desorb automatically);
+        # the SAME delta array moves mass between inv_eff and the sorbed
+        # store (balance_sorption is same-float by construction).
+        sorption_bal = None
+        sorb_new = None
+        if self._sorb_op is not None and n_clusters > 0:
+            if not snapshot:
+                raise RuntimeError(
+                    "sorption needs the snapshot backend (sites come from "
+                    "the owned endmember split)")
+            sites = (sorb_sites_mol if sorb_sites_mol is not None
+                     else np.zeros(n_clusters))
+            sorb_new = np.zeros_like(sorb_in)
+            for c in range(n_clusters):
+                if water_mol_c[c] <= 0.0:
+                    sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
+                    continue
+                offer = inv_eff[c] + sorb_in[c]
+                res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
+                                         float(sites[c]))
+                sorb_new[c] = res.sorbed_mol
+            s_delta = sorb_new - sorb_in
+            inv_eff = inv_eff - s_delta
+            neg = inv_eff < 0.0
+            if np.any(neg):
+                worst = float(inv_eff[neg].min())
+                scale = float(np.abs(inv_eff).max())
+                if -worst > 1e-24 + 1e-12 * scale:
+                    raise RuntimeError(
+                        f"sorption overdrew the pore solution by {worst:.3e}"
+                        f" mol - operator/config inconsistency (no clip)")
+                inv_eff = np.where(neg, 0.0, inv_eff)
+            sorption_bal = ledger.SorptionBalance(
+                applied_inventory_delta=(-s_delta).sum(axis=0),
+                applied_sorbed_delta=s_delta.sum(axis=0),
+                abs_scale=float(np.abs(s_delta).sum()))
+            exchange_metrics["sorbed_total_mol"] = float(
+                np.abs(sorb_new).sum())
+            exchange_metrics["sorbed_delta_mol"] = float(
+                np.abs(s_delta).sum())
+            exchange_metrics["sorption_sites_mol"] = float(sites.sum())
+            exchange_metrics["sorption_pool_coverage"] = sorb_cov_frac
 
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
@@ -1525,6 +1633,26 @@ class Engine:
                 _fold_dry_rows(spec_base, spec_remap.inventory,
                                spec_remap.dryout)
             trial.domain_species_mol = spec_remap.inventory
+        if sorb_new is not None:
+            # the sorbed store is a LEDGER (unlike the speciation cache):
+            # it remaps with the inventory weights, folds on domain dryout
+            # with the same recorded events, and a hard dryout - sorbed
+            # mass with no wet successor anywhere - rejects the step like
+            # the solution inventory does (mass must not vanish)
+            sorb_remap = transport.remap_inventories(
+                labels, prev_liquid, new_labels, trial.capillary_liquid,
+                sorb_new, n_new)
+            sorb_folds = []
+            if sorb_remap.dryout:
+                if dom_to_cl is None:
+                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                hard_s, sorb_folds = _fold_dry_rows(sorb_new,
+                                                    sorb_remap.inventory,
+                                                    sorb_remap.dryout)
+                if hard_s:
+                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+            fold_events.extend(sorb_folds)
+            trial.domain_sorbed_mol = sorb_remap.inventory
         # RT-W2b: economy snapshots survive relabeling only through pure
         # 1:1 transfers (one source, one target); merges, splits and folds
         # invalidate the record — merging equilibration snapshots is not
@@ -1590,7 +1718,8 @@ class Engine:
                 domain_to_cluster=dom_to_cl)
         report = ledger.check_all(trial, reg, placement,
                                   exchange=exchange_bal,
-                                  partition=partition_check)
+                                  partition=partition_check,
+                                  sorption=sorption_bal)
         if not report.ok:
             return None, StepReject(report.violations[0]), report.metrics
         metrics = dict(report.metrics)

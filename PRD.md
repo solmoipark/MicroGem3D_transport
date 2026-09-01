@@ -921,6 +921,33 @@ phreeqc명 항등 매핑만, 미매핑 종은 `default_dw_m2_s` **명시** 시�
 - **P0c(종 공간 완전 결합)는 이연**: P0b 실측에서 클램프율·오차가 유의할
   때만 별도 설계 리뷰로.
 
+#### 4.6.5 Tier 1 — PHREEQC 수착 연산자 (RT-S1, `sorption`)
+
+Lie 분할 T→R을 **T→S→R**로 확장. S = 도메인별 순수 함수: (공극수 원소 +
+직전 수착 재제공 + 물 + 사이트 총량) → 평형 표면 결합 벡터 (snapshot
+의미론 — 사이트가 줄면 자동 탈착). 구현은 IPhreeqc in-process(SOLUTION +
+SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
+금지), DB는 벤더링 cemdata18.dat(호출 전후 sha256 감사).
+
+- **수착 화학은 config 소유**: cemdata18.dat에 SURFACE 정의가 없음(실측
+  grep 0건) — 표면 반응식·log_K·`sorbed_elements`(결합종 1 mol당 용액에서
+  제거되는 원소 행)를 config에 명시. 연산자는 매 호출 그 행을 PHREEQC
+  자신의 용액 수지와 대조해 불일치 시 거부(폐합 증인, rel 1e-8).
+- **사이트 부기(endmember 보존, 사용자 결정 2026-09-02)**: 급이와 동일한
+  covered-pool + 전역 fallback endmember 분할을 **전체 소유량**에 적용
+  (모드 B의 노화 분율과 무관 — 표면은 존재 자체가 사이트),
+  `site_density_mol_per_mol`은 CSHQ endmember별 필수 명시.
+- **원장**: `domain_sorbed_mol`(v5 예약분 활성) — §6.1 폐합이
+  "수용액+고체+**수착**=전체"로 확장, S 단계 이동은 같은 delta 배열로
+  양쪽에 기입(`balance_sorption`, 위반 = 부기 손상). 리매핑은 인벤토리
+  가중, dryout 접기 이벤트 기록, hard dryout = 스텝 리젝트.
+- **정준 스케일링**: RVE 원장(~1e-10 mol)에서 IPhreeqc 절대 수렴 기준이
+  실패(실측) → (용액, 물, 사이트) 공동 스케일 1e-2(평형은 intensive,
+  GEMS 백엔드 전례) 후 정확 역스케일.
+- **제약**: gems3k 전용, 용질 화이트리스트(첫 대상 SO4/S — Cl은 E3 염
+  담체·배스 확장 후속), Na/K는 `alkali_exchange` 명시 + 비-CNASH 번들
+  (구조 흡수와 이중 계상 금지), ddl은 실전 정전 파라미터 확보 전 거부.
+
 ---
 
 ## 5. 비기능 요구
@@ -969,6 +996,7 @@ phreeqc명 항등 매핑만, 미매핑 종은 `default_dw_m2_s` **명시** 시�
 | 롤백 불변성 | 거부 트라이얼 후 커밋 상태 해시 불변 |
 | 재시작 동등성 | 중단/재시작 = 무중단, dense 배열·원장·RNG 비트단위 동일 |
 | 도메인 분할 정합 (v4.0/RT, 모드 C) | 도메인은 클러스터의 세분: 습윤 복셀 전부 도메인 ≥ 0, 도메인별 부모 클러스터 유일, 건조 = −1 (정수 정확) — `balance_domain:partition` |
+| 수착 수지 (Tier 1/RT-S1) | S 단계의 용액→수착 이동은 같은 delta 배열로 양쪽 기입: \|Δinv + Δsorbed\| ≤ atol 1e-24 + rtol 1e-12·Σ\|이동\| — 위반 = 부기 손상. 원소 폐합은 수착 저장소 포함 (`balance_sorption`) |
 | 교환 수지 (v4.0/RT, 모드 C) | Σ_도메인 Δinv_교환 = boundary_net (봉인계 = 0), atol 1e-24 + rtol 1e-12·Σ\|q\| — 엣지 반대칭 적용이라 위반 = 부기 손상. `balance_exchange` |
 | 물 항등식 (v4.0/RT 확장) | 자유+겔+결합 = 초기 + `boundary_water_mol`(RT-W3 전까지 0) |
 

@@ -8,3 +8,5 @@ runs/
 ipmlog.txt
 xGEMS.log
 ipmlog*.txt
+error.inp
+phreeqc*.log

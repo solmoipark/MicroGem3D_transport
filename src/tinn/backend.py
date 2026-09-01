@@ -308,10 +308,19 @@ class SorptionOperator:
             return SorptionResult(hit.status, hit.sorbed_mol.copy(),
                                   dict(hit.site_occupancy))
 
-        elements = {el: float(e[i]) for i, el in enumerate(ELEMENT_IDS)
-                    if e[i] > 0.0}
+        # equilibrium is intensive: scale (solution, water, sites) jointly
+        # to the canonical magnitude where IPhreeqc converges - RVE ledger
+        # amounts are ~1e-10 mol and PHREEQC's absolute convergence criteria
+        # fail there (measured: mass-balance residuals ~1e-14 with
+        # 'Numerical method failed'). The GEMS backend does exactly this
+        # (CANONICAL_MAX_ELEMENT_MOL); the partition scales back exactly.
+        peak = float(e.max())
+        s_fac = 1e-2 / peak
+        e_s = e * s_fac
+        elements = {el: float(e_s[i]) for i, el in enumerate(ELEMENT_IDS)
+                    if e_s[i] > 0.0}
         reactants = _decompose_to_reactants(elements)
-        water_kg = water_mol * _H2O_G_MOL / 1000.0
+        water_kg = (water_mol * s_fac) * _H2O_G_MOL / 1000.0
         lines = ["SOLUTION 1",
                  f"    temp {t_k - 273.15:.6f}",
                  f"    water {water_kg!r} kg",
@@ -322,7 +331,7 @@ class SorptionOperator:
         # exactly 1.0 (the spike README's measured convention).
         lines += ["    1.0 moles",
                   "SURFACE 1",
-                  f"    Surf_sOH {sorbent_sites_mol!r} 600.0 1.0",
+                  f"    Surf_sOH {sorbent_sites_mol * s_fac!r} 600.0 1.0",
                   "    -no_edl",
                   "END"]
         pp = self._instance()
@@ -339,7 +348,7 @@ class SorptionOperator:
         occupancy: Dict[str, float] = {}
         sorbed = np.zeros(len(ELEMENT_IDS))
         for i, sp in enumerate(self._bound_species):
-            n_i = float(last[col[f"m_{sp}(mol/kgw)"]]) * kgw
+            n_i = float(last[col[f"m_{sp}(mol/kgw)"]]) * kgw / s_fac
             occupancy[sp] = n_i
             sorbed += n_i * self._rows[i]
         # closure witness: for every whitelisted element the config-declared
@@ -349,7 +358,7 @@ class SorptionOperator:
                     1e-30)
         for el in self._whitelist:
             k = ELEMENT_IDS.index(el)
-            aq_after = float(last[col[f"{el}(mol/kgw)"]]) * kgw
+            aq_after = float(last[col[f"{el}(mol/kgw)"]]) * kgw / s_fac
             drift = abs((e[k] - aq_after) - sorbed[k])
             if drift > 1e-8 * scale + 1e-18:
                 raise RuntimeError(

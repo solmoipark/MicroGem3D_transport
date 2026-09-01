@@ -198,3 +198,53 @@ def test_sorption_config_and_ledger():
         abs_scale=3e-6 * len(ELEMENT_IDS))
     rep2 = ledger.check_all(st2, reg, sorption=bad_bal)
     assert "balance_sorption" in rep2.violations
+
+
+# ------------------------------------------------- S1b: engine integration
+
+GEMS_PYTHON = Path(r"C:\Users\solmo\miniforge3\envs\py313-xgems\python.exe")
+PC_BUNDLE = REPO / "gems_bundles" / "PC" / "PC-dat.lst"
+needs_gems = pytest.mark.skipif(
+    not (PC_BUNDLE.is_file() and GEMS_PYTHON.is_file()),
+    reason="xgems worker interpreter or PC bundle not available")
+
+
+@needs_gems
+@needs_iphreeqc
+def test_sorption_engine_run_closes_and_restarts(tmp_path):
+    """T->S->R spliced run: element closure holds WITH the sorbed store in
+    current_elements (every accepted step passes check_all), sulfate
+    actually binds, and a checkpoint restart is bit-identical."""
+    import os
+    from tinn.engine import Engine
+    from tinn.registry import default_registry
+    from tinn.storage import load_checkpoint
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(PC_BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = os.environ.get(
+        "TINN_GEMS_PYTHON", str(GEMS_PYTHON))
+    raw["schedule"] = {"output_times_h": [2.0, 4.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    raw["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {
+                           "CSHQ-TobH": 0.02, "CSHQ-TobD": 0.02,
+                           "CSHQ-JenH": 0.02, "CSHQ-JenD": 0.02},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"]}
+    cfg = TinnConfig.model_validate(raw)
+    straight, summary = Engine(cfg).run(out_dir=str(tmp_path / "run"))
+    s_idx = ELEMENT_IDS.index("S")
+    assert straight.domain_sorbed_mol.shape[1] == len(ELEMENT_IDS)
+    assert straight.domain_sorbed_mol[:, s_idx].sum() > 0.0
+    m = summary["outputs"][-1]["ledger_metrics"]
+    assert m["sorbed_total_mol"] > 0.0
+    assert m["sorption_sites_mol"] > 0.0
+    assert m["sorption_balance_max_mol"] == 0.0     # same-float transfer
+    reg = default_registry()
+    mid = load_checkpoint(str(tmp_path / "run" / "ckpt_000"), reg)
+    assert mid.domain_sorbed_mol.shape[0] > 0        # store round-trips
+    restarted, _ = Engine(mid.config).run(state=mid)
+    assert restarted.full_hash() == straight.full_hash()
