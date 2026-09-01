@@ -937,16 +937,66 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   covered-pool + 전역 fallback endmember 분할을 **전체 소유량**에 적용
   (모드 B의 노화 분율과 무관 — 표면은 존재 자체가 사이트),
   `site_density_mol_per_mol`은 CSHQ endmember별 필수 명시.
+- **S 단계 wetness 계약 (2026-09-02)**: 반응기가 수용액인 조건 = 물/용질
+  몰비 ≥ 10 (무차원·intensive; 실제 공극수 >50, 리매핑·접기 float dust는
+  ~1). 미달이면 water≤0 분기와 동일하게 저장소 동결 + 스텝 지표
+  `sorption_dry_reactors`로 보고(침묵 아님). dust 조항: 용질 총량이 원장
+  노이즈 플로어(`1e-24 + 1e-12 × max|inv|`, overdraw 가드와 동일 스타일)
+  이하인 오퍼도 동결 — 화학계가 아님. 실측 근거 2건: ① 물 5.6e-17 mol /
+  S 7.3e-17 mol dust가 스케일 후 ~7e4 mol/kg "용액"이 되어 IPhreeqc
+  A(H2O) 발산, ② 물-과잉·용질-노이즈 반응기가 산화물 분해기의 정확 폐합
+  검사를 노이즈 크기에서 격발(O 잔차 −4e-16).
 - **원장**: `domain_sorbed_mol`(v5 예약분 활성) — §6.1 폐합이
   "수용액+고체+**수착**=전체"로 확장, S 단계 이동은 같은 delta 배열로
   양쪽에 기입(`balance_sorption`, 위반 = 부기 손상). 리매핑은 인벤토리
   가중, dryout 접기 이벤트 기록, hard dryout = 스텝 리젝트.
 - **정준 스케일링**: RVE 원장(~1e-10 mol)에서 IPhreeqc 절대 수렴 기준이
   실패(실측) → (용액, 물, 사이트) 공동 스케일 1e-2(평형은 intensive,
-  GEMS 백엔드 전례) 후 정확 역스케일.
+  GEMS 백엔드 전례) 후 정확 역스케일. 스케일 앵커는 **용액 peak와
+  사이트 총량의 기하평균** (2026-09-02 보강: 문헌 밀도에서 사이트가 용액
+  원소를 1e2–1e4× 초과하는 초기-수화 클러스터가 실재 — 원소-only 앵커는
+  표면을 0.62 mol로 올려 표면/H/O 수지 발산, max() 앵커는 용액을 회피
+  대상이던 ~1e-8 영역으로 되눌러 A(H2O) 발산, 둘 다 실측. 기하평균이
+  편차를 대칭 분할하며 공동 인자라 사이트/용액 비 — 물리 — 는 정확).
 - **제약**: gems3k 전용, 용질 화이트리스트(첫 대상 SO4/S — Cl은 E3 염
   담체·배스 확장 후속), Na/K는 `alkali_exchange` 명시 + 비-CNASH 번들
   (구조 흡수와 이중 계상 금지), ddl은 실전 정전 파라미터 확보 전 거부.
+
+**실측 기록 (RT-S1c, 2026-09-02 — SO4 문헌 보정 + 28d 실측)**: 사용자
+공급 문헌 5편에서 추출·보정.
+
+- **사이트 밀도 (구조 기반, 피팅과 독립)**: Labbez et al. 2006 (JPCB
+  110, 9219) 티트레이션 실란올 **4.8 /nm²** × Divet C-S-H BET SSA
+  350 m²/g (C/S 1.57, H/S 1.26 → 170.8 g/mol-Si) = 2.79 mmol/g =
+  **0.4766 mol 사이트/mol Si**; endmember별 = ×Si 화학량론(PC 번들
+  DCH: TobH/JenH 1, TobD/JenD 0.6667) → **TobH/JenH 0.4766,
+  TobD/JenD 0.3178**. 교차: Haas & Nonat 2015 (CCR 68, 124) 몰당
+  titratable 실란올 0.5–1.0/Si — 동일 차수; Divet 등온선 plateau
+  접근(~2 mmol/g @150 mmol/L)과 정합.
+- **log_K (등온선 피팅)**: Divet & Randriambololona 1998 (CCR 28(3),
+  357) 배치 실험(3.4 g C-S-H/250 mL NaOH, 25 °C)을 **SorptionOperator
+  자체로 재현**(cemdata18 활동도, no_edl, 사이트 고정)해 0.1 M NaOH
+  등온선(Fig. 3 디지타이즈 11점, OPC 공극수 최근접 pH)에 최소자승 →
+  **log_K = +0.50** (0.25 그리드 + 0.05 정밀화, SSE 0.286 (mmol/g)²,
+  RMS ~0.16 mmol/g). 파생 Rd(10 mmol/L, 0.1 M NaOH) ≈ **29 L/kg** —
+  Ochs et al. 2016의 약한 음이온(Se(VI) 유사체) C-S-H 밴드와 정합.
+  피팅 스크립트+디지타이즈 점 = `scripts/fit_so4_logk.py`(재실행 가능,
+  스케일 불변 실측: 기하평균 앵커 전환 후 12자리 일치).
+- **모형 한계 (메커니즘 표 항목)**: 0.5 M 검증 — 논문 자체 회귀(Fig. 2:
+  1/Cb = 54.42/C − 0.053, R² 0.9868) 대비 모형 ~6× 과소. 단일 리간드
+  교환(OH⁻ 방출)의 pH 경향이 실측(pH·이온강도와 함께 **증가**)과 반대 —
+  상수는 보정 pH(~12.9–13.4) 전용, pH 외삽 금지.
+- **28d 실측 런** (`scripts/run_sorption_so4.py calibrated`, Deschner
+  OPC 32³ 봉인 dt 0.6 h, 296.15 K, 벽시계 766 s,
+  `runs/sorption_so4_results_calibrated.json`): 수착 S 24 h 1.68e-12 →
+  168 h 1.75e-12 → **672 h 1.85e-12 mol = 총 S(1.665e-11)의 11.1%**;
+  사이트 1.91→3.85e-11 mol(CSHQ 성장 동승), 점유율 4.8%, 커버리지
+  0.999→0.938. 최종 공극수(주 클러스터): **[SO4] 0.37 mmol/L —
+  Barbarulo & al. 2007 (CCR 37, 1176)의 20 °C 에트린자이트 평형
+  ~0.4 mmol/L과 일치**(sanity 앵커), [K] 114 mmol/L(아카나이트 유래),
+  [Ca] 6.3 mmol/L. 수착의 91%가 첫 24 h(석고류 용해 전이기)에 발생 —
+  snapshot 재제공이 이후 자동 재평형. 자기일관: 최종 상태를 연산자에
+  재제공 시 저장소 0.06% 이내 재현(= 연산자-평형 상태 실측).
 
 ---
 

@@ -10,7 +10,23 @@ accordingly - the PRD-recorded run uses literature-calibrated values via
 the CLI overrides once they are supplied:
 
     py -3 scripts/run_sorption_so4.py [log_k=<x>] [density=<mol/mol>]
-                                      [tag=<name>]
+                                      [tag=<name>] | calibrated
+
+`calibrated` uses the literature constants fitted on 2026-09-02:
+log_K +0.50 from replaying Divet & Randriambololona (CCR 28(3) 1998,
+Fig. 3 0.1 M NaOH isotherm, 3.4 g C-S-H / 250 mL, 25 C) through this
+platform's SorptionOperator, with the site total FIXED from Labbez et
+al. (J Phys Chem B 110, 2006: 4.8 silanol/nm2) x Divet's BET SSA
+(350 m2/g) = 2.79 mmol/g = 0.4766 mol sites per mol Si (C/S 1.57,
+H/S 1.26 -> 170.8 g/mol-Si). Per-endmember density = 0.4766 x Si
+stoichiometry from the PC bundle DCH (TobH/JenH Si=1, TobD/JenD
+Si=0.6667). Haas & Nonat (CCR 68, 2015) give 0.5-1.0 titratable
+silanol per Si - same order. Caveat (mechanism table): the single
+ligand-exchange reaction releases OH-, so its pH trend is OPPOSITE to
+Divet's measured ionic-strength enhancement - constants are valid
+near the calibration pH (~12.9-13.4, the OPC pore-solution regime)
+and must not be extrapolated across pH. Fit script + digitized
+points: scripts/fit_so4_logk.py (fitted 2026-09-02).
 """
 import json
 import sys
@@ -28,15 +44,27 @@ BASE = REPO / "examples" / "qualification" / "deschner_opc_q32_dt06_28d.json"
 SO4_REACTION = "Surf_sOH + SO4-2 = Surf_sSO4- + OH-"
 SO4_ROW = {"S": 1.0, "O": 3.0, "H": -1.0}
 
+# literature-calibrated constants (see module docstring for provenance)
+CAL_LOG_K = 0.50
+CAL_SITES_PER_SI = 0.4766           # mol sites / mol Si
+CAL_SI = {"CSHQ-TobH": 1.0, "CSHQ-TobD": 0.6667,
+          "CSHQ-JenH": 1.0, "CSHQ-JenD": 0.6667}
+
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     log_k = 1.2
     density = 0.02
     tag = "demo"
+    density_map = None
     for arg in sys.argv[1:]:
         key, _, val = arg.partition("=")
-        if key == "log_k":
+        if arg == "calibrated":
+            log_k = CAL_LOG_K
+            density_map = {dc: CAL_SITES_PER_SI * si
+                           for dc, si in CAL_SI.items()}
+            tag = "calibrated"
+        elif key == "log_k":
             log_k = float(val)
         elif key == "density":
             density = float(val)
@@ -44,15 +72,15 @@ def main() -> None:
             tag = val
         else:
             raise SystemExit(f"unknown option {arg!r}")
+    if density_map is None:
+        density_map = {dc: density for dc in CAL_SI}
 
     raw = json.loads(BASE.read_text(encoding="utf-8"))
     raw["sorption"] = {
         "operator": "phreeqc_surface",
         "phreeqc_dat": str(REPO / "gems_bundles" / "PHREEQC-cemdata18"
                            / "cemdata18.dat"),
-        "site_density_mol_per_mol": {dc: density for dc in
-                                     ("CSHQ-TobH", "CSHQ-TobD",
-                                      "CSHQ-JenH", "CSHQ-JenD")},
+        "site_density_mol_per_mol": density_map,
         "surface_species": [{"reaction": SO4_REACTION, "log_k": log_k,
                              "sorbed_elements": dict(SO4_ROW)}],
         "elements": ["S"],
@@ -77,15 +105,19 @@ def main() -> None:
             "sorbed_delta_mol": m.get("sorbed_delta_mol"),
             "sorption_sites_mol": m.get("sorption_sites_mol"),
             "sorption_pool_coverage": m.get("sorption_pool_coverage"),
+            "sorption_dry_reactors": m.get("sorption_dry_reactors"),
         })
     total_s = float(state.initial_elements[s_idx])
     sorbed_s = float(state.domain_sorbed_mol[:, s_idx].sum())
     aq_s = float(state.cluster_inventory[:, s_idx].sum())
     result = {
         "label": ("DEMONSTRATION constants - not literature-calibrated"
-                  if tag == "demo" else tag),
+                  if tag == "demo" else
+                  ("literature-calibrated: Divet 1998 log_K fit + "
+                   "Labbez 2006 site density" if tag == "calibrated"
+                   else tag)),
         "log_k": log_k,
-        "site_density_mol_per_mol": density,
+        "site_density_mol_per_mol": density_map,
         "wall_s": round(wall, 1),
         "outputs": rows,
         "final": {

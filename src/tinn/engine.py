@@ -1002,11 +1002,34 @@ class Engine:
             sites = (sorb_sites_mol if sorb_sites_mol is not None
                      else np.zeros(n_clusters))
             sorb_new = np.zeros_like(sorb_in)
+            # S-stage wetness contract: a reactor is an aqueous phase only
+            # when water dominates the solutes (mol ratio >= 10; real pore
+            # solutions sit above ~50, remap/fold float dust sits near 1).
+            # Below that there is nothing to sorb FROM - the store freezes
+            # like the water<=0 branch, and the count is REPORTED, not
+            # swallowed (measured: a 5.6e-17 mol water / 7.3e-17 mol S
+            # dust cluster scaled to a ~7e4 mol/kg "solution" and broke
+            # IPhreeqc's A(H2O) convergence).
+            oh_cols = [ELEMENT_IDS.index("O"), ELEMENT_IDS.index("H")]
+            solute_cols = [i for i in range(len(ELEMENT_IDS))
+                           if i not in oh_cols]
+            n_sorb_dry = 0
+            # dust clause: an offer whose solute total sits at the ledger's
+            # float-noise floor (same style as the overdraw guard below)
+            # is not a chemical system either - water-rich micro-reactors
+            # with noise-level contents broke the operator's exact oxide
+            # decomposition (measured: O deficit -4e-16 at noise scale).
+            inv_scale = float(np.abs(inv_eff).max()) if inv_eff.size else 0.0
+            dust_floor = 1e-24 + 1e-12 * inv_scale
             for c in range(n_clusters):
-                if water_mol_c[c] <= 0.0:
-                    sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
-                    continue
                 offer = inv_eff[c] + sorb_in[c]
+                solute = float(np.clip(offer[solute_cols], 0.0, None).sum())
+                if (water_mol_c[c] <= 0.0
+                        or water_mol_c[c] < 10.0 * solute
+                        or solute <= dust_floor):
+                    sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
+                    n_sorb_dry += int(water_mol_c[c] > 0.0)
+                    continue
                 res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
                                          float(sites[c]))
                 sorb_new[c] = res.sorbed_mol
@@ -1031,6 +1054,7 @@ class Engine:
                 np.abs(s_delta).sum())
             exchange_metrics["sorption_sites_mol"] = float(sites.sum())
             exchange_metrics["sorption_pool_coverage"] = sorb_cov_frac
+            exchange_metrics["sorption_dry_reactors"] = n_sorb_dry
 
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):

@@ -126,6 +126,12 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       T→S→R 분할, config 소유 표면 화학(SO4 첫 대상), endmember 보존 사이트
       부기, §6.1 폐합에 수착 저장소 편입 + `balance_sorption`. 포맷 무단절
       (v5 예약분 활성).
+- [x] **RT-S1c (2026-09-02)** — SO4 문헌 보정(PRD 4.6.5 실측 블록): Labbez
+      실란올 4.8/nm² → 사이트 0.4766 mol/mol-Si(endmember별 ×Si), Divet
+      1998 0.1 M NaOH 등온선을 연산자 자체로 재현해 log_K +0.50 피팅
+      (`scripts/fit_so4_logk.py`), Ochs Se(VI) 밴드 sanity. 정준 스케일
+      앵커를 용액×사이트 기하평균으로 보강. 28d calibrated 실측
+      `runs/sorption_so4_results_calibrated.json`.
 - [x] **RT-P0a/P0b (2026-09-02)** — Tier 0 종별 NP 영전류 사영(PRD 4.6.4):
       dw 테이블 벤더링 + 워커 프로토콜 v2(스페시에이션 노출) + 원소별 BE
       전도도(FORMAT_VERSION 5, Tier 1 수착 배열 예약 동승). 실측: OPC 공극수

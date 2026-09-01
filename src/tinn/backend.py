@@ -314,7 +314,17 @@ class SorptionOperator:
         # fail there (measured: mass-balance residuals ~1e-14 with
         # 'Numerical method failed'). The GEMS backend does exactly this
         # (CANONICAL_MAX_ELEMENT_MOL); the partition scales back exactly.
-        peak = float(e.max())
+        # the scale anchor is the GEOMETRIC MEAN of the solution peak and
+        # the site total: with literature site densities the surface can
+        # exceed every solution element by 1e2-1e4 (early hydration: much
+        # CSHQ, little solute), and no single-sided anchor fits both -
+        # element-only scaling put the surface at 0.62 mol (Surf_s/H/O
+        # residuals ~0.6, measured), max()-scaling pushed the solution
+        # back into the ~1e-8 zone the canonical scale exists to avoid
+        # (A(H2O) nonconvergence, measured). The geometric mean splits
+        # the deviation symmetrically; the joint factor keeps the
+        # site/solution ratio - the physics - exact.
+        peak = math.sqrt(float(e.max()) * float(sorbent_sites_mol))
         s_fac = 1e-2 / peak
         e_s = e * s_fac
         elements = {el: float(e_s[i]) for i, el in enumerate(ELEMENT_IDS)
@@ -340,7 +350,11 @@ class SorptionOperator:
             rows = pp.ip.get_selected_output_array()
         except Exception as exc:               # IPhreeqc raises plain errors
             raise BackendTransientError(
-                f"PHREEQC sorption call failed: {exc}") from exc
+                f"PHREEQC sorption call failed: {exc} | "
+                f"[input] s_fac={s_fac!r} water_mol={water_mol!r} "
+                f"sites_mol={sorbent_sites_mol!r} "
+                f"elements={ {el: float(e[i]) for i, el in enumerate(ELEMENT_IDS) if e[i] != 0.0} !r}"
+            ) from exc
         header = [str(h).strip() for h in rows[0]]
         col = {h: i for i, h in enumerate(header)}
         last = rows[-1]
