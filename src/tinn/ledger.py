@@ -46,6 +46,17 @@ class ExchangeBalance:
 
 
 @dataclass
+class SorptionBalance:
+    """Tier 1 (RT-S1, PRD 6.1 extension): the S stage moves mass between
+    the pore solution and the sorbed store with the SAME floats, so the
+    two applied deltas must cancel exactly - a violation is bookkeeping
+    corruption, not discretization error."""
+    applied_inventory_delta: np.ndarray   # (E,) sum over domains
+    applied_sorbed_delta: np.ndarray      # (E,)
+    abs_scale: float                      # sum |moved| for the tolerance
+
+
+@dataclass
 class DomainPartition:
     """v4.0/RT mode C (PRD §6.1 도메인 분할 정합): the domain map must refine
     the cluster map — every wet voxel in a domain, every domain inside
@@ -78,14 +89,29 @@ def current_elements(state: SimulationState, registry: Registry) -> np.ndarray:
         state.water_free_mol + state.water_gel_mol)
     if state.cluster_inventory.size:
         e += state.cluster_inventory.sum(axis=0)
+    if state.domain_sorbed_mol.size:
+        # Tier 1 (RT-S1): surface-sorbed elements are part of the total -
+        # solution + solids + sorbed = everything (zero rows until the
+        # sorption operator is active, so pre-S1 behavior is unchanged)
+        e += state.domain_sorbed_mol.sum(axis=0)
     return e
 
 
 def check_all(state: SimulationState, registry: Registry,
               placement: Optional[PlacementBalance] = None,
               exchange: Optional[ExchangeBalance] = None,
-              partition: Optional[DomainPartition] = None) -> LedgerReport:
+              partition: Optional[DomainPartition] = None,
+              sorption: Optional[SorptionBalance] = None) -> LedgerReport:
     rep = LedgerReport()
+
+    if sorption is not None:
+        # RT-S1: same-float transfer between solution and the sorbed store
+        gap = np.abs(sorption.applied_inventory_delta
+                     + sorption.applied_sorbed_delta)
+        bound = ELEMENT_ATOL_MOL + 1e-12 * sorption.abs_scale
+        rep.metrics["sorption_balance_max_mol"] = float(gap.max())
+        if np.any(gap > bound):
+            rep.violations.append("balance_sorption")
 
     # 1. element balance (expected = initial + anything the backend injected:
     # redox seeds and solver floors, both tracked exactly)

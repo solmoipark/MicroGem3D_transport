@@ -15,8 +15,10 @@ the engine turns into a trial reject; any other exception is a hard error.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Protocol
 
 import numpy as np
@@ -144,3 +146,223 @@ class StoichiometricBackend:
         return ReactionResult(status=STATUS_OK, parcels=parcels,
                               water_consumed_mol=water_need,
                               residual_inventory=inventory.copy())
+
+
+# ------------------------------------------------------- Tier 1 (RT-S1a)
+# PHREEQC SURFACE sorption operator (spec 3). Lives in backend.py by the
+# module-cap rule (16/16). Phase-assemblage authority stays with GEMS:
+# the operator runs SOLUTION + SURFACE only, and cemdata18.dat carries no
+# surface chemistry (measured) - the reactions, constants and site
+# densities are config-owned.
+
+# neutral reactant decomposition of a ledger element vector (ported from
+# the G0 spike, scripts/spike_phreeqc_crosscheck.py - scripts are not
+# importable modules): (reactant formula, element, element per formula,
+# O per formula)
+_SORB_OXIDES = (
+    ("CaO", "Ca", 1.0, 1.0), ("SiO2", "Si", 1.0, 2.0),
+    ("Al2O3", "Al", 2.0, 3.0), ("Fe2O3", "Fe", 2.0, 3.0),
+    ("SO3", "S", 1.0, 3.0), ("Na2O", "Na", 2.0, 1.0),
+    ("K2O", "K", 2.0, 1.0), ("MgO", "Mg", 1.0, 1.0), ("CO2", "C", 1.0, 2.0),
+)
+_H2O_G_MOL = 18.015
+
+
+def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
+    """elements -> {neutral reactant: mol}; exact-closure audited."""
+    reactants: Dict[str, float] = {}
+    o_used = 0.0
+    for formula, el, n_el, n_o in _SORB_OXIDES:
+        amount = elements.get(el, 0.0)
+        if amount <= 0.0:
+            continue
+        mol = amount / n_el
+        reactants[formula] = mol
+        o_used += mol * n_o
+    h = elements.get("H", 0.0)
+    if h < -1e-15:
+        raise ValueError(f"negative H in sorption input: {h}")
+    h2o = h / 2.0
+    o_left = elements.get("O", 0.0) - o_used - h2o
+    scale = max((abs(v) for v in elements.values()), default=0.0) or 1.0
+    if o_left < -1e-9 * scale:
+        raise ValueError(
+            f"element vector is not oxide-decomposable: O deficit {o_left}")
+    if h2o > 0.0:
+        reactants["H2O"] = h2o
+    if o_left > 1e-15 * scale:
+        reactants["O2"] = o_left / 2.0
+    rebuilt: Dict[str, float] = {el: 0.0 for el in elements}
+    for formula, el, n_el, n_o in _SORB_OXIDES:
+        mol = reactants.get(formula, 0.0)
+        rebuilt[el] = rebuilt.get(el, 0.0) + mol * n_el
+        rebuilt["O"] = rebuilt.get("O", 0.0) + mol * n_o
+    rebuilt["H"] = rebuilt.get("H", 0.0) + 2.0 * reactants.get("H2O", 0.0)
+    rebuilt["O"] = (rebuilt.get("O", 0.0) + reactants.get("H2O", 0.0)
+                    + 2.0 * reactants.get("O2", 0.0))
+    for el, target in elements.items():
+        if abs(rebuilt.get(el, 0.0) - target) > 1e-9 * scale + 1e-15:
+            raise AssertionError(
+                f"reactant decomposition broke {el}: "
+                f"{rebuilt.get(el)} != {target}")
+    return reactants
+
+
+@dataclass
+class SorptionResult:
+    status: str                       # "ok" (nonconvergence raises instead)
+    sorbed_mol: np.ndarray            # (E,) equilibrium surface-bound elements
+    site_occupancy: Dict[str, float]  # bound species -> mol (diagnostics)
+
+
+class SorptionOperator:
+    """Pure-function equilibrium sorption: (pore-solution elements incl.
+    the previously sorbed re-offer, water, site total) -> the equilibrium
+    surface-bound element vector. Snapshot semantics, like the GEMS
+    backend: the engine books the DELTA against its sorbed store, so a
+    shrinking site total desorbs automatically. Deterministic: one
+    IPhreeqc instance, numbered blocks fully redefined per call, exact
+    input-hash memoization (LRU), dat audited before/after every call."""
+
+    operator_id = "phreeqc_surface"
+
+    def __init__(self, config, temperature_k: float):
+        from collections import OrderedDict
+        if config.surface_model != "no_edl":
+            raise RuntimeError(
+                "surface_model 'ddl' is declared but not implemented yet - "
+                "the electrostatic model needs real area/mass parameters "
+                "(no silent placeholder physics)")
+        self._cfg = config
+        self.temperature_k = float(temperature_k)
+        self._dat = str(Path(config.phreeqc_dat).resolve())
+        from .gems import audit_bundle
+        self._audit = audit_bundle
+        self.baseline_audit = audit_bundle(self._dat)
+        self._pp = None
+        self._memo: "OrderedDict[str, SorptionResult]" = OrderedDict()
+        self.memo_cap = 4096
+        # per-reaction element rows over ELEMENT_IDS, config-declared
+        self._bound_species = [rx.bound_species
+                               for rx in config.surface_species]
+        if len(set(self._bound_species)) != len(self._bound_species):
+            raise RuntimeError("surface reactions bind duplicate species")
+        self._rows = np.zeros((len(config.surface_species), len(ELEMENT_IDS)))
+        for i, rx in enumerate(config.surface_species):
+            for el, v in rx.sorbed_elements.items():
+                self._rows[i, ELEMENT_IDS.index(el)] = float(v)
+        self._whitelist = tuple(config.elements)
+
+    # ------------------------------------------------------------- private
+    def _instance(self):
+        if self._pp is None:
+            from phreeqpython import PhreeqPython
+            dat = Path(self._dat)
+            self._pp = PhreeqPython(database=dat.name,
+                                    database_directory=dat.parent)
+            lines = ["SURFACE_MASTER_SPECIES",
+                     "    Surf_s Surf_sOH",
+                     "SURFACE_SPECIES",
+                     "    Surf_sOH = Surf_sOH",
+                     "        log_k 0"]
+            for rx in self._cfg.surface_species:
+                lines += [f"    {rx.reaction}",
+                          f"        log_k {rx.log_k!r}"]
+            punch_tot = " ".join(self._whitelist)
+            punch_mol = " ".join(self._bound_species)
+            lines += ["SELECTED_OUTPUT 1",
+                      "    -reset false",
+                      "    -high_precision true",
+                      "    -water true",
+                      f"    -totals {punch_tot}",
+                      f"    -molalities {punch_mol}",
+                      "END"]
+            self._pp.ip.run_string("\n".join(lines))
+        return self._pp
+
+    # -------------------------------------------------------------- public
+    def sorb(self, aqueous_elements: np.ndarray, water_mol: float,
+             sorbent_sites_mol: float,
+             temperature_k: Optional[float] = None) -> SorptionResult:
+        e = np.asarray(aqueous_elements, dtype=np.float64)
+        zeros = np.zeros(len(ELEMENT_IDS))
+        if (sorbent_sites_mol <= 0.0 or water_mol <= 0.0
+                or not np.any(e > 0.0)):
+            # null fast path: no sites / no water / no solutes - identical
+            # to the operator being absent (the S1a null gate)
+            return SorptionResult("ok", zeros, {})
+        before = self._audit(self._dat)
+        if before != self.baseline_audit:
+            raise RuntimeError(
+                "sorption dat changed since operator construction - "
+                "read-only input violated (PROVENANCE audit rule)")
+        t_k = (self.temperature_k if temperature_k is None
+               else float(temperature_k))
+        key = json.dumps({"e": [v.hex() for v in e],
+                          "w": float(water_mol).hex(),
+                          "s": float(sorbent_sites_mol).hex(),
+                          "t": t_k.hex()})
+        hit = self._memo.get(key)
+        if hit is not None:
+            self._memo.move_to_end(key)
+            return SorptionResult(hit.status, hit.sorbed_mol.copy(),
+                                  dict(hit.site_occupancy))
+
+        elements = {el: float(e[i]) for i, el in enumerate(ELEMENT_IDS)
+                    if e[i] > 0.0}
+        reactants = _decompose_to_reactants(elements)
+        water_kg = water_mol * _H2O_G_MOL / 1000.0
+        lines = ["SOLUTION 1",
+                 f"    temp {t_k - 273.15:.6f}",
+                 f"    water {water_kg!r} kg",
+                 "REACTION 1"]
+        lines += [f"    {f} {mol!r}" for f, mol in sorted(reactants.items())]
+        # PHREEQC REACTION semantics: moles added = coefficient x amount.
+        # Coefficients above ARE the absolute ledger mols, so the amount is
+        # exactly 1.0 (the spike README's measured convention).
+        lines += ["    1.0 moles",
+                  "SURFACE 1",
+                  f"    Surf_sOH {sorbent_sites_mol!r} 600.0 1.0",
+                  "    -no_edl",
+                  "END"]
+        pp = self._instance()
+        try:
+            pp.ip.run_string("\n".join(lines))
+            rows = pp.ip.get_selected_output_array()
+        except Exception as exc:               # IPhreeqc raises plain errors
+            raise BackendTransientError(
+                f"PHREEQC sorption call failed: {exc}") from exc
+        header = [str(h).strip() for h in rows[0]]
+        col = {h: i for i, h in enumerate(header)}
+        last = rows[-1]
+        kgw = float(last[col["mass_H2O"]])
+        occupancy: Dict[str, float] = {}
+        sorbed = np.zeros(len(ELEMENT_IDS))
+        for i, sp in enumerate(self._bound_species):
+            n_i = float(last[col[f"m_{sp}(mol/kgw)"]]) * kgw
+            occupancy[sp] = n_i
+            sorbed += n_i * self._rows[i]
+        # closure witness: for every whitelisted element the config-declared
+        # rows must reproduce PHREEQC's own solution balance - a wrong
+        # sorbed_elements declaration is refused, never absorbed
+        scale = max(float(np.abs(e).max()), float(np.abs(sorbed).max()),
+                    1e-30)
+        for el in self._whitelist:
+            k = ELEMENT_IDS.index(el)
+            aq_after = float(last[col[f"{el}(mol/kgw)"]]) * kgw
+            drift = abs((e[k] - aq_after) - sorbed[k])
+            if drift > 1e-8 * scale + 1e-18:
+                raise RuntimeError(
+                    f"sorbed_elements for {el} disagrees with PHREEQC's "
+                    f"solution balance by {drift:.3e} mol (input {e[k]!r}, "
+                    f"aqueous after {aq_after!r}, declared row gives "
+                    f"{sorbed[k]!r}) - fix the config rows")
+        after = self._audit(self._dat)
+        if after != self.baseline_audit:
+            raise RuntimeError("sorption dat changed during the call")
+        result = SorptionResult("ok", sorbed, occupancy)
+        self._memo[key] = SorptionResult("ok", sorbed.copy(),
+                                         dict(occupancy))
+        if len(self._memo) > self.memo_cap:
+            self._memo.popitem(last=False)
+        return result

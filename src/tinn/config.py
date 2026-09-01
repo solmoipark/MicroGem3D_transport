@@ -667,6 +667,105 @@ class TransportConfig(BaseModel):
                 or self.exchange_tau_h_per_phase is not None)
 
 
+class SurfaceReaction(BaseModel):
+    """One PHREEQC SURFACE_SPECIES reaction (RT-S1, spec 3). cemdata18.dat
+    defines NO surface chemistry (measured: zero SURFACE blocks), so the
+    reactions and constants are config-owned - literature values go HERE,
+    never invented in code (d0 precedent). sorbed_elements declares the
+    element mols REMOVED from solution per mol of the bound species formed
+    (negative = released, e.g. the OH- freed by ligand exchange); the
+    operator cross-checks it against PHREEQC's own solution totals on
+    every call."""
+    model_config = _STRICT
+    reaction: str            # e.g. "Surf_sOH + SO4-2 = Surf_sSO4- + OH-"
+    log_k: float
+    sorbed_elements: Dict[str, float]   # per mol bound, ELEMENT_IDS keys
+
+    @model_validator(mode="after")
+    def _check(self) -> "SurfaceReaction":
+        if not math.isfinite(self.log_k):
+            raise ValueError("surface reaction log_k must be finite")
+        if "=" not in self.reaction or "Surf_s" not in self.reaction:
+            raise ValueError(
+                "surface reaction must be a PHREEQC equation over the "
+                "Surf_s site (e.g. 'Surf_sOH + SO4-2 = Surf_sSO4- + OH-')")
+        unknown = sorted(set(self.sorbed_elements) - set(ELEMENT_IDS))
+        if unknown:
+            raise ValueError(
+                f"sorbed_elements has unknown elements {unknown}")
+        if not any(v != 0.0 for v in self.sorbed_elements.values()):
+            raise ValueError("sorbed_elements is all zero - the reaction "
+                             "would sorb nothing (omit it instead)")
+        for el, v in self.sorbed_elements.items():
+            if not math.isfinite(v):
+                raise ValueError(f"sorbed_elements[{el!r}] must be finite")
+        return self
+
+    @property
+    def bound_species(self) -> str:
+        """Product surface species name (first Surf_s term on the RHS)."""
+        rhs = self.reaction.split("=", 1)[1]
+        for tok in rhs.replace("+", " ").split():
+            if tok.startswith("Surf_s"):
+                return tok
+        raise ValueError(f"no Surf_s product in {self.reaction!r}")
+
+
+class SorptionConfig(BaseModel):
+    """Tier 1 (RT-S1): PHREEQC SURFACE sorption operator on C-S-H sites.
+    Phase-assemblage authority stays with GEMS (mechanism table, spec 1):
+    the operator runs SOLUTION + SURFACE only. Absence of this section =
+    no S stage, bit-identical engine, unchanged config hash."""
+    model_config = _STRICT
+    operator: Literal["phreeqc_surface"]
+    phreeqc_dat: str
+    surface_model: Literal["no_edl", "ddl"] = "no_edl"
+    # sites per mol of each C-S-H endmember (bundle DC names; REQUIRED, no
+    # defaults - the engine validates the keys against the bundle at S1b).
+    # Uncovered pool mass takes the global endmember fractions (the E2
+    # feeding fallback), so the coverage gap adds no new assumption.
+    site_density_mol_per_mol: Dict[str, float]
+    surface_species: List[SurfaceReaction] = Field(min_length=1)
+    # elements the operator may move (solutes only; O/H ride implicitly as
+    # the protonation frame). A delta outside this list is a hard error.
+    elements: List[str] = Field(min_length=1)
+    alkali_exchange: bool = False
+
+    @model_validator(mode="after")
+    def _check(self) -> "SorptionConfig":
+        unknown = sorted(set(self.elements) - set(ELEMENT_IDS))
+        if unknown:
+            raise ValueError(f"sorption.elements has unknown elements "
+                             f"{unknown}; allowed: {ELEMENT_IDS}")
+        if any(el in ("O", "H") for el in self.elements):
+            raise ValueError(
+                "sorption.elements lists solutes only - O/H ride "
+                "implicitly as the surface protonation frame")
+        if len(set(self.elements)) != len(self.elements):
+            raise ValueError("sorption.elements has duplicates")
+        if not self.site_density_mol_per_mol:
+            raise ValueError("site_density_mol_per_mol must not be empty")
+        for k, v in self.site_density_mol_per_mol.items():
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"site_density_mol_per_mol[{k!r}] must be finite >= 0")
+        allowed = set(self.elements) | {"O", "H"}
+        for rx in self.surface_species:
+            bad = sorted(set(rx.sorbed_elements) - allowed)
+            if bad:
+                raise ValueError(
+                    f"surface reaction {rx.reaction!r} moves {bad} - "
+                    f"outside the declared elements whitelist")
+        if (any(el in ("Na", "K") for el in self.elements)
+                and not self.alkali_exchange):
+            raise ValueError(
+                "Na/K sorption requires alkali_exchange: true (and a C-S-H "
+                "model without structural alkali uptake - CSHQ bundle only, "
+                "engine-checked; the CNASH bundle binds alkalis "
+                "thermodynamically and double-counting is refused)")
+        return self
+
+
 class TinnConfig(BaseModel):
     model_config = _STRICT
     binder: BinderRecipe
@@ -692,6 +791,10 @@ class TinnConfig(BaseModel):
     # v4.0/RT chemistry-transport modes (PRD 4.6). None keeps every earlier
     # config hash (and the engine's exact legacy code path) unchanged.
     transport: Optional[TransportConfig] = None
+    # Tier 1 (RT-S1): PHREEQC surface-sorption operator. None = no S stage,
+    # bit-identical engine and unchanged hash (explicit pop in config_hash -
+    # top-level optionals are NOT auto-swept).
+    sorption: Optional[SorptionConfig] = None
     # coarse-tail volume fraction removed per PSD by truncate_to_grid, keyed
     # "__shared__" (the top-level psd) or the material_psd key — diagnostics
     # for the geometry report, never part of the hash/serialized payload
@@ -868,6 +971,20 @@ class TinnConfig(BaseModel):
                 f"{self.transport.boundary.start_h} must coincide with an "
                 f"output time so no step straddles the sealed->exposed "
                 f"switch")
+        if self.sorption is not None:
+            if self.chemistry.backend != "gems3k":
+                raise ValueError(
+                    "sorption needs the gems3k backend - sorbent sites come "
+                    "from the C-S-H endmember ledger, which only the "
+                    "snapshot backend maintains")
+            if (self.sorption.alkali_exchange
+                    and self.chemistry.gems_bundle_lst is None):
+                raise ValueError(
+                    "sorption.alkali_exchange needs an EXPLICIT "
+                    "gems_bundle_lst (the omitted default is the CNASH "
+                    "bundle, whose C-S-H binds alkalis thermodynamically - "
+                    "surface exchange on top would double-count; the engine "
+                    "re-checks the actual bundle)")
         if (self.transport is not None and self.transport.boundary is not None
                 and self.chemistry.backend != "gems3k"):
             # the stoichiometric backend's solution ledger is identically
@@ -903,6 +1020,9 @@ class TinnConfig(BaseModel):
         # the built-in glasses keeps its earlier hash
         if payload.get("scm_composition") is None:
             payload.pop("scm_composition", None)
+        # RT-S1: a sorption-free config keeps its pre-Tier-1 hash
+        if payload.get("sorption") is None:
+            payload.pop("sorption", None)
         # Piecewise timesteps were added after checkpoint format v3. An absent
         # schedule keeps every legacy config/checkpoint hash unchanged.
         if payload.get("schedule", {}).get("dt_windows") is None:
