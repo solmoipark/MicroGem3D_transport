@@ -192,8 +192,68 @@ class Engine:
                              if config.transport is not None else None)
         if self._domains_cfg is not None:
             h_m = config.rve.voxel_size_um * 1e-6
-            self._d0_vox2_h = (self._domains_cfg.d0_m2_s * 3600.0
-                               / (h_m * h_m))
+            vox2_h_per_m2_s = 3600.0 / (h_m * h_m)
+            self._d0_vox2_h = (
+                None if self._domains_cfg.d0_m2_s is None
+                else self._domains_cfg.d0_m2_s * vox2_h_per_m2_s)
+            # Tier 0 (RT-P0, PRD 4.6.4): per-species diffusivities from the
+            # vendored dw table, resolved against the RUN's aqueous species
+            # universe (bundle DCH via the backend) - never hardcoded
+            self._np_cfg = self._domains_cfg.species
+            if self._np_cfg is not None:
+                from .gems import GemsError, load_species_dw
+                worker = getattr(self.backend, "_worker", None)
+                if worker is not None:
+                    worker.require_speciation()
+                aq_ids = getattr(self.backend, "aq_species_ids", ())
+                if not aq_ids:
+                    raise RuntimeError(
+                        "transport.domains.species needs a backend with an "
+                        "aqueous species universe (gems3k)")
+                table = load_species_dw(self._np_cfg.dw_table)
+                se = transport.stokes_einstein_factor(config.temperature_K)
+                dw = np.zeros(len(aq_ids))
+                z_dch = np.asarray(self.backend.aq_species_charge,
+                                   dtype=np.float64)
+                defaulted = []
+                unmapped = []
+                for k, dc in enumerate(aq_ids):
+                    hit = table.lookup(dc)
+                    if hit is not None:
+                        dw[k] = hit[0]
+                        if hit[1] != z_dch[k]:
+                            raise GemsError(
+                                f"dw table charge {hit[1]:+g} for {dc!r} "
+                                f"contradicts the bundle DCH ({z_dch[k]:+g})"
+                                f" - alias curation error", kind="config")
+                    elif self._np_cfg.default_dw_m2_s is not None:
+                        dw[k] = self._np_cfg.default_dw_m2_s
+                        defaulted.append(dc)
+                    else:
+                        unmapped.append(dc)
+                if unmapped:
+                    raise GemsError(
+                        f"species dw table maps no diffusivity for "
+                        f"{len(unmapped)} aqueous species (e.g. "
+                        f"{unmapped[:10]}) and default_dw_m2_s is null - "
+                        f"declare a default or extend the aliases",
+                        kind="config")
+                self._np_dc_index = {dc: k for k, dc in enumerate(aq_ids)}
+                self._np_dw_vox2_h = (dw * se * self._np_cfg.geometry_factor
+                                      * vox2_h_per_m2_s)
+                self._np_z = z_dch
+                self._np_nu = np.asarray(self.backend.aq_species_elements,
+                                         dtype=np.float64)
+                self._np_provenance = {
+                    "dw_table": self._np_cfg.dw_table,
+                    "dw_table_sha256": table.sha256,
+                    "dw_source": table.source,
+                    "se_factor": se,
+                    "geometry_factor": self._np_cfg.geometry_factor,
+                    "default_dw_m2_s": self._np_cfg.default_dw_m2_s,
+                    "default_dw_species": defaulted,
+                    "diagnostics_only": self._np_cfg.diagnostics_only,
+                }
             # RT-W2b GEM-call economy active iff either knob departs from
             # the equilibrate-everything default
             self._economy = (self._domains_cfg.dirty_rtol > 0.0
@@ -217,6 +277,7 @@ class Engine:
                 for p in KINETIC_PHASE_IDS])
         else:
             self._economy = False
+            self._np_cfg = None
         # v4.0/RT-W3 boundary reservoir (PRD 4.6.3): precompute the static
         # parts; the coupling itself is rebuilt each step from the labeled
         # liquid (pure function of state - restart determinism free)
@@ -650,6 +711,11 @@ class Engine:
         parcel_rows: List[tuple] = []
         scale_c = np.ones(n_clusters)
         solved = np.zeros(n_clusters, dtype=bool)
+        # Tier 0 (RT-P0a): per-domain aqueous speciation captured from the
+        # SAME accepted responses that feed residual[c] — diagnostics only,
+        # not persisted (P0b adds the frozen state array)
+        spec_rows = (np.zeros((n_clusters, len(self.backend.aq_species_ids)))
+                     if self._np_cfg is not None else None)
 
         def _envelope_vox(parcel) -> float:
             try:
@@ -1029,6 +1095,13 @@ class Engine:
             scale_c[c] = s
             chem_mol_c[c] = result.water_consumed_mol
             residual[c] = result.residual_inventory
+            if spec_rows is not None and result.aqueous_species_mol:
+                row = spec_rows[c]
+                idx = self._np_dc_index
+                for dc, m in result.aqueous_species_mol.items():
+                    k = idx.get(dc)
+                    if k is not None:      # solvent H2O@ is not transported
+                        row[k] = m
             if (bath_active and bath_cluster_domain is not None
                     and bath_cluster_domain[c]
                     and np.any(result.injected_elements != 0.0)):
@@ -1103,6 +1176,36 @@ class Engine:
                 dis.removed_mol[k] = new_removed
             vacated = dis.removed_vol.sum(axis=0)
             site_mask = vacated > 0.0
+
+        # ---- Tier 0 diagnostics (RT-P0a, PRD 4.6.4): NP effective
+        # diffusivities from THIS step's accepted speciation, report-only.
+        # Masked to edges whose BOTH endpoints equilibrated this step (other
+        # rows are zeros here — the frozen state array is a P0b concern).
+        if (spec_rows is not None and self._np_cfg.diagnostics_only
+                and dom_to_cl is not None):
+            npc = transport.np_effective_conductance(
+                graph, spec_rows, graph.water, self._np_dw_vox2_h,
+                self._np_z, self._np_nu)
+            both = solved[graph.edge_a] & solved[graph.edge_b]
+            exchange_metrics["np_edges_measured"] = float(both.sum())
+            exchange_metrics["np_edges_stale"] = float((~both).sum())
+            if self._np_cfg.phi_clamp_report:
+                for key, v in npc.counts.items():
+                    exchange_metrics[key] = float(v)
+                exchange_metrics["np_charge_flux_rel_max"] = (
+                    npc.charge_flux_rel_max)
+            if both.any() and self._d0_vox2_h:
+                ratio = npc.deff_edge[both] / self._d0_vox2_h
+                ratio = ratio[ratio > 0.0]
+                if ratio.size:
+                    qs = np.percentile(ratio, (25.0, 50.0, 75.0))
+                    exchange_metrics.update({
+                        "np_deff_ratio_min": float(ratio.min()),
+                        "np_deff_ratio_p25": float(qs[0]),
+                        "np_deff_ratio_p50": float(qs[1]),
+                        "np_deff_ratio_p75": float(qs[2]),
+                        "np_deff_ratio_max": float(ratio.max()),
+                    })
 
         # ---- spatial application -------------------------------------------
         backend_removal_vol = 0.0
@@ -1498,6 +1601,11 @@ class Engine:
             "backend_id": state.backend_id,
             "outputs": [],
         }
+        if getattr(self, "_np_cfg", None) is not None:
+            # Tier 0 provenance (PRD 4.6.4): which dw data produced this
+            # run's species diffusivities, and which species fell to the
+            # declared default — audit trail, spec §2.2 report duty
+            summary["species_transport"] = dict(self._np_provenance)
         if audit_hook is not None:
             audit_hook({
                 "event": "run_start",

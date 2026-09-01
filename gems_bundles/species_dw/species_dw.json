@@ -1,0 +1,362 @@
+{
+ "source": "phreeqc.dat (phreeqpython unknown)",
+ "source_path": "C:\\Users\\solmo\\miniforge3\\envs\\py313-xgems\\Lib\\site-packages\\phreeqpython\\database\\phreeqc.dat",
+ "source_sha256": "6bb5ebc1d0ecca0e921c13a2241d05d3a3333b142d1d740b2ed03a786442bdf5",
+ "temperature_C": 25.0,
+ "species": [
+  {
+   "species": "Al+3",
+   "z": 3,
+   "dw_25C_m2_s": 5.59e-10,
+   "source_line": 101
+  },
+  {
+   "species": "Ba+2",
+   "z": 2,
+   "dw_25C_m2_s": 8.48e-10,
+   "source_line": 106
+  },
+  {
+   "species": "Br-",
+   "z": -1,
+   "dw_25C_m2_s": 2.01e-09,
+   "source_line": 153
+  },
+  {
+   "species": "CH4",
+   "z": 0,
+   "dw_25C_m2_s": 1.85e-09,
+   "source_line": 222
+  },
+  {
+   "species": "CO2",
+   "z": 0,
+   "dw_25C_m2_s": 1.92e-09,
+   "source_line": 213
+  },
+  {
+   "species": "CO3-2",
+   "z": -2,
+   "dw_25C_m2_s": 9.55e-10,
+   "source_line": 122
+  },
+  {
+   "species": "Ca+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.93e-10,
+   "source_line": 72
+  },
+  {
+   "species": "CaCO3",
+   "z": 0,
+   "dw_25C_m2_s": 4.46e-10,
+   "source_line": 334
+  },
+  {
+   "species": "CaHCO3+",
+   "z": 1,
+   "dw_25C_m2_s": 5.06e-10,
+   "source_line": 341
+  },
+  {
+   "species": "CaSO4",
+   "z": 0,
+   "dw_25C_m2_s": 4.71e-10,
+   "source_line": 346
+  },
+  {
+   "species": "Cd+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.17e-10,
+   "source_line": 160
+  },
+  {
+   "species": "Cl-",
+   "z": -1,
+   "dw_25C_m2_s": 2.03e-09,
+   "source_line": 118
+  },
+  {
+   "species": "Cu+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.33e-10,
+   "source_line": 167
+  },
+  {
+   "species": "F-",
+   "z": -1,
+   "dw_25C_m2_s": 1.46e-09,
+   "source_line": 145
+  },
+  {
+   "species": "Fe+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.19e-10,
+   "source_line": 91
+  },
+  {
+   "species": "H+",
+   "z": 1,
+   "dw_25C_m2_s": 9.31e-09,
+   "source_line": 67
+  },
+  {
+   "species": "H2",
+   "z": 0,
+   "dw_25C_m2_s": 5.13e-09,
+   "source_line": 200
+  },
+  {
+   "species": "H2PO4-",
+   "z": -1,
+   "dw_25C_m2_s": 8.46e-10,
+   "source_line": 313
+  },
+  {
+   "species": "H2S",
+   "z": 0,
+   "dw_25C_m2_s": 2.1e-09,
+   "source_line": 245
+  },
+  {
+   "species": "H2Sg",
+   "z": 0,
+   "dw_25C_m2_s": 2.1e-09,
+   "source_line": 184
+  },
+  {
+   "species": "H3BO3",
+   "z": 0,
+   "dw_25C_m2_s": 1.1e-09,
+   "source_line": 137
+  },
+  {
+   "species": "H4SiO4",
+   "z": 0,
+   "dw_25C_m2_s": 1.1e-09,
+   "source_line": 113
+  },
+  {
+   "species": "HCO3-",
+   "z": -1,
+   "dw_25C_m2_s": 1.18e-09,
+   "source_line": 207
+  },
+  {
+   "species": "HPO4-2",
+   "z": -2,
+   "dw_25C_m2_s": 6.9e-10,
+   "source_line": 307
+  },
+  {
+   "species": "HS-",
+   "z": -1,
+   "dw_25C_m2_s": 1.73e-09,
+   "source_line": 239
+  },
+  {
+   "species": "HSO4-",
+   "z": -1,
+   "dw_25C_m2_s": 1.33e-09,
+   "source_line": 228
+  },
+  {
+   "species": "HSg-",
+   "z": -1,
+   "dw_25C_m2_s": 2.1e-09,
+   "source_line": 251
+  },
+  {
+   "species": "Hdg",
+   "z": 0,
+   "dw_25C_m2_s": 5.13e-09,
+   "source_line": 171
+  },
+  {
+   "species": "K+",
+   "z": 1,
+   "dw_25C_m2_s": 1.96e-09,
+   "source_line": 87
+  },
+  {
+   "species": "KSO4-",
+   "z": -1,
+   "dw_25C_m2_s": 7.46e-10,
+   "source_line": 434
+  },
+  {
+   "species": "Li+",
+   "z": 1,
+   "dw_25C_m2_s": 1.03e-09,
+   "source_line": 149
+  },
+  {
+   "species": "Mg+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.05e-10,
+   "source_line": 76
+  },
+  {
+   "species": "MgCO3",
+   "z": 0,
+   "dw_25C_m2_s": 4.21e-10,
+   "source_line": 374
+  },
+  {
+   "species": "MgHCO3+",
+   "z": 1,
+   "dw_25C_m2_s": 4.78e-10,
+   "source_line": 381
+  },
+  {
+   "species": "MgSO4",
+   "z": 0,
+   "dw_25C_m2_s": 4.45e-10,
+   "source_line": 386
+  },
+  {
+   "species": "Mn+2",
+   "z": 2,
+   "dw_25C_m2_s": 6.88e-10,
+   "source_line": 96
+  },
+  {
+   "species": "Mtg",
+   "z": 0,
+   "dw_25C_m2_s": 1.85e-09,
+   "source_line": 177
+  },
+  {
+   "species": "N2",
+   "z": 0,
+   "dw_25C_m2_s": 1.96e-09,
+   "source_line": 262
+  },
+  {
+   "species": "NH3",
+   "z": 0,
+   "dw_25C_m2_s": 2.28e-09,
+   "source_line": 276
+  },
+  {
+   "species": "NH4+",
+   "z": 1,
+   "dw_25C_m2_s": 1.98e-09,
+   "source_line": 268
+  },
+  {
+   "species": "NO2-",
+   "z": -1,
+   "dw_25C_m2_s": 1.91e-09,
+   "source_line": 257
+  },
+  {
+   "species": "NO3-",
+   "z": -1,
+   "dw_25C_m2_s": 1.9e-09,
+   "source_line": 130
+  },
+  {
+   "species": "Na+",
+   "z": 1,
+   "dw_25C_m2_s": 1.33e-09,
+   "source_line": 81
+  },
+  {
+   "species": "NaCO3-",
+   "z": -1,
+   "dw_25C_m2_s": 5.85e-10,
+   "source_line": 409
+  },
+  {
+   "species": "NaHCO3",
+   "z": 0,
+   "dw_25C_m2_s": 6.73e-10,
+   "source_line": 414
+  },
+  {
+   "species": "NaSO4-",
+   "z": -1,
+   "dw_25C_m2_s": 6.18e-10,
+   "source_line": 420
+  },
+  {
+   "species": "Ntg",
+   "z": 0,
+   "dw_25C_m2_s": 1.96e-09,
+   "source_line": 181
+  },
+  {
+   "species": "O2",
+   "z": 0,
+   "dw_25C_m2_s": 2.35e-09,
+   "source_line": 195
+  },
+  {
+   "species": "OH-",
+   "z": -1,
+   "dw_25C_m2_s": 5.27e-09,
+   "source_line": 190
+  },
+  {
+   "species": "Oxg",
+   "z": 0,
+   "dw_25C_m2_s": 2.35e-09,
+   "source_line": 174
+  },
+  {
+   "species": "PO4-3",
+   "z": -3,
+   "dw_25C_m2_s": 6.12e-10,
+   "source_line": 141
+  },
+  {
+   "species": "Pb+2",
+   "z": 2,
+   "dw_25C_m2_s": 9.45e-10,
+   "source_line": 163
+  },
+  {
+   "species": "S-2",
+   "z": -2,
+   "dw_25C_m2_s": 7.31e-10,
+   "source_line": 234
+  },
+  {
+   "species": "SO4-2",
+   "z": -2,
+   "dw_25C_m2_s": 1.07e-09,
+   "source_line": 126
+  },
+  {
+   "species": "Sr+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.94e-10,
+   "source_line": 110
+  },
+  {
+   "species": "Zn+2",
+   "z": 2,
+   "dw_25C_m2_s": 7.15e-10,
+   "source_line": 157
+  }
+ ],
+ "aliases": {
+  "CH4@": "CH4",
+  "CO2@": "CO2",
+  "Ca(CO3)@": "CaCO3",
+  "Ca(HCO3)+": "CaHCO3+",
+  "Ca(SO4)@": "CaSO4",
+  "H2@": "H2",
+  "H2S@": "H2S",
+  "K(SO4)-": "KSO4-",
+  "Mg(CO3)@": "MgCO3",
+  "Mg(HCO3)+": "MgHCO3+",
+  "MgSO4@": "MgSO4",
+  "Na(CO3)-": "NaCO3-",
+  "Na(HCO3)@": "NaHCO3",
+  "Na(SO4)-": "NaSO4-",
+  "O2@": "O2",
+  "SiO2@": "H4SiO4"
+ }
+}

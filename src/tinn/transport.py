@@ -12,8 +12,8 @@ both supported); a cluster holding inventory with zero overlap is a dryout.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -285,6 +285,159 @@ def boundary_coupling(domain_id: np.ndarray, n_domains: int, g: np.ndarray,
             out += np.bincount(d[m], weights=2.0 * gv[m],
                                minlength=n_domains)
     return out
+
+
+# ---------------------------------------------------------------- Tier 0 (NP)
+# RT-P0 (PRD 4.6.4): per-element effective conductance from frozen aqueous
+# speciation under the Nernst-Planck zero-current projection. Pure functions;
+# the BE solver stays in element space and reuses its block CG per column.
+
+# small-|dc_el| guard: below this relative element-concentration difference
+# the F/dc quotient is ill-conditioned and the weighted-Fick fallback is used
+NP_DC_REL_EPS = 1e-9
+
+# water dynamic viscosity, mPa*s, 0..100 C in 5 C steps (IAPWS-anchored
+# tabulation, e.g. CRC Handbook); linear interpolation between nodes
+_WATER_VISC_T_C = np.arange(0.0, 101.0, 5.0)
+_WATER_VISC_MPA_S = np.array([
+    1.7914, 1.5192, 1.3077, 1.1382, 1.0016, 0.8900, 0.7972, 0.7191,
+    0.6527, 0.5958, 0.5465, 0.5036, 0.4660, 0.4329, 0.4035, 0.3774,
+    0.3540, 0.3330, 0.3142, 0.2971, 0.2816])
+
+
+def stokes_einstein_factor(temperature_k: float) -> float:
+    """D(T)/D(298.15 K) = (T/298.15) * (eta(298.15)/eta(T)) — first-order
+    temperature correction of the 25 C dw table (PRD 4.6.4). Exactly 1.0 at
+    298.15 K; refuses outside the 0-100 C tabulation."""
+    t_c = float(temperature_k) - 273.15
+    if not (0.0 <= t_c <= 100.0):
+        raise ValueError(
+            f"stokes_einstein_factor needs 0..100 C, got {t_c:.2f} C")
+    if temperature_k == 298.15:
+        return 1.0
+    eta = float(np.interp(t_c, _WATER_VISC_T_C, _WATER_VISC_MPA_S))
+    eta_25 = float(np.interp(25.0, _WATER_VISC_T_C, _WATER_VISC_MPA_S))
+    return (float(temperature_k) / 298.15) * (eta_25 / eta)
+
+
+@dataclass
+class NPConductance:
+    """Per-edge, per-element transmissibilities from one frozen speciation
+    state. t_edge/t_bnd are what exchange_be consumes in place of
+    d0 * edge_g / d0 * g_bnd; deff_edge is diagnostics (vox^2/h)."""
+    t_edge: np.ndarray                    # (n_edges, n_elem) vox^3/h
+    t_bnd: Optional[np.ndarray]           # (n_domains, n_elem) or None
+    deff_edge: np.ndarray                 # (n_edges, n_elem) vox^2/h
+    counts: Dict[str, int] = field(default_factory=dict)
+    charge_flux_rel_max: float = 0.0      # zero-current witness (unclamped)
+
+
+def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
+    """Clamp-laddered effective diffusivity (rows, n_elem) for one batch of
+    faces. dc_s/cbar_s are (rows, S) species concentration difference and
+    face-mean; dc_el is the BE driving force per element (the caller's
+    convention: species collapse for interior edges, x - c_res for bath
+    faces); cmax_el scales the small-difference guard. Returns
+    (deff, counts, charge_rel_max). PRD 4.6.4 ladder: (1) |dc_el| dust ->
+    weighted-Fick D-bar; (2) F_NP / dc_el; (3) negative -> drop the Phi term
+    (pure Fick); (4) still negative -> D-bar; (5) cap at D_max over the
+    species present on the face. 0 <= deff <= D_max keeps the M-matrix."""
+    rows, n_elem = dc_el.shape
+    counts = {"np_smalldc": 0, "np_phi_clamped": 0, "np_fick_clamped": 0,
+              "np_cap_clamped": 0, "np_empty_el": 0}
+    if rows == 0:
+        return np.zeros((0, n_elem)), counts, 0.0
+    zd = z * dw
+    den = cbar_s @ (z * zd)                        # (rows,) sum z^2 D cbar
+    num = dc_s @ zd                                # (rows,) sum z D dc
+    ok_den = den > 0.0
+    phi = np.where(ok_den, num / np.where(ok_den, den, 1.0), 0.0)
+    s1 = (dc_s * dw[None, :]) @ nu                 # (rows, n_elem) Fick part
+    s2 = (cbar_s * zd[None, :]) @ nu               # migration weight
+    cbar_el = cbar_s @ nu
+    dbar_num = (cbar_s * dw[None, :]) @ nu
+    has_el = cbar_el > 0.0
+    dbar = np.where(has_el, dbar_num / np.where(has_el, cbar_el, 1.0), 0.0)
+    dmax = np.where(cbar_s > 0.0, dw[None, :], 0.0).max(axis=1)  # (rows,)
+
+    small = np.abs(dc_el) <= NP_DC_REL_EPS * cmax_el
+    safe_dc = np.where(small, 1.0, dc_el)
+    full = (s1 - phi[:, None] * s2) / safe_dc      # rung 2
+    fick = s1 / safe_dc                            # rung 3 fallback
+    neg_full = (~small) & (full < 0.0)
+    neg_fick = neg_full & (fick < 0.0)             # rung 4
+    deff = np.where(small, dbar,
+                    np.where(neg_full, np.where(neg_fick, dbar, fick), full))
+    # rung 5 — relative tolerance so exact-equality cases (all-equal D, where
+    # deff == dmax to rounding) do not count as clamps
+    over = deff > dmax[:, None] * (1.0 + 1e-12)
+    deff = np.where(over, dmax[:, None], deff)
+    deff = np.where(has_el, np.maximum(deff, 0.0), 0.0)
+
+    counts["np_smalldc"] = int(np.count_nonzero(small & has_el))
+    counts["np_phi_clamped"] = int(np.count_nonzero(neg_full & ~neg_fick))
+    counts["np_fick_clamped"] = int(np.count_nonzero(neg_fick))
+    counts["np_cap_clamped"] = int(np.count_nonzero(over & has_el))
+    counts["np_empty_el"] = int(np.count_nonzero(~has_el))
+
+    # zero-current witness on the species-level projected flux, faces where
+    # the projection actually applied (den > 0): sum_i z_i J_i must vanish
+    f_s = dc_s * dw[None, :] - phi[:, None] * (cbar_s * zd[None, :])
+    q_net = np.abs(f_s @ z)
+    q_abs = np.abs(f_s * z[None, :]).sum(axis=1)
+    wit = ok_den & (q_abs > 0.0)
+    charge_rel_max = float((q_net[wit] / q_abs[wit]).max()) if wit.any() else 0.0
+    return deff, counts, charge_rel_max
+
+
+def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
+                             water: np.ndarray, dw_vox2_h: np.ndarray,
+                             z: np.ndarray, nu: np.ndarray,
+                             g_bnd: Optional[np.ndarray] = None,
+                             c_res: Optional[np.ndarray] = None
+                             ) -> NPConductance:
+    """Edge- and element-resolved transmissibilities from one frozen
+    speciation state (PRD 4.6.4). species_mol is (D, S) aqueous species mol
+    per domain (solvent excluded), water the domain liquid volume (vox^3;
+    c = n/W units), dw_vox2_h the species diffusivities ALREADY carrying the
+    Stokes-Einstein factor and the geometry factor. Interior faces use the
+    harmonic face mean (the existing face mixing rule); bath faces use the
+    one-sided domain state (the reservoir is pure water by config, and a
+    harmonic mean against zero would kill the migration term identically).
+    Bath O/H in c_res only shifts the element driving force, matching the
+    BE's (x - c_res) form exactly."""
+    ea, eb = graph.edge_a, graph.edge_b
+    n_elem = nu.shape[1]
+    w = np.maximum(np.asarray(water, dtype=np.float64), 0.0)
+    with np.errstate(invalid="ignore"):
+        c = np.where(w[:, None] > 0.0,
+                     np.maximum(species_mol, 0.0)
+                     / np.where(w[:, None] > 0.0, w[:, None], 1.0), 0.0)
+    ca, cb = c[ea], c[eb]
+    dc_s = ca - cb
+    ssum = ca + cb
+    cbar_s = np.where(ssum > 0.0, 2.0 * ca * cb / np.where(ssum > 0.0, ssum, 1.0),
+                      0.0)
+    dc_el = dc_s @ nu
+    cmax_el = np.maximum(ca @ nu, cb @ nu)
+    deff, counts, qrel = _np_deff(dc_s, cbar_s, dc_el, cmax_el,
+                                  dw_vox2_h, z, nu)
+    t_edge = graph.edge_g[:, None] * deff
+
+    t_bnd = None
+    if g_bnd is not None:
+        res = (np.zeros(n_elem) if c_res is None
+               else np.asarray(c_res, dtype=np.float64))
+        dc_el_b = c @ nu - res[None, :]
+        cmax_b = np.maximum(c @ nu, np.abs(res)[None, :])
+        deff_b, counts_b, qrel_b = _np_deff(c, c, dc_el_b, cmax_b,
+                                            dw_vox2_h, z, nu)
+        t_bnd = np.asarray(g_bnd, dtype=np.float64)[:, None] * deff_b
+        for k, v in counts_b.items():
+            counts[k] += v
+        qrel = max(qrel, qrel_b)
+    return NPConductance(t_edge=t_edge, t_bnd=t_bnd, deff_edge=deff,
+                         counts=counts, charge_flux_rel_max=qrel)
 
 
 @dataclass

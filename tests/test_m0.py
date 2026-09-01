@@ -80,6 +80,12 @@ def test_domain_partition_config_validation_and_hash():
     ok = TinnConfig.model_validate(_base_config(
         transport={"domains": {"tile_vox": 8, "d0_m2_s": 1e-9}}))
     assert ok.config_hash() != base
+    # RT-P0a: species: null is hash-invisible (the domains None-sweep), so
+    # every pre-Tier-0 config keeps its hash
+    assert TinnConfig.model_validate(_base_config(
+        transport={"domains": {"tile_vox": 8, "d0_m2_s": 1e-9,
+                               "species": None}})).config_hash() \
+        == ok.config_hash()
     for bad in ({"tile_vox": 7, "d0_m2_s": 1e-9},      # does not divide 32
                 {"tile_vox": 8},                        # d0 required
                 {"tile_vox": 8, "d0_m2_s": 0.0},

@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
 SUPPRESSED_CLINKER_PHASES = ("Alite", "Belite", "Aluminate", "Ferrite")
+# Worker wire-protocol version. 2 (RT-P0a): responses carry
+# protocol_version, info() carries species_charge, equilibrate responses
+# carry aqueous_species_mol. Older workers simply omit the keys — the
+# parent tolerates that (response.get defaults) unless species transport
+# is configured, in which case GemsWorker.require_speciation() refuses.
+PROTOCOL_VERSION = 2
 SUCCESS_STATUSES = (
     "No GEM re-calculation needed",
     "OK after GEM calculation with LPP AIA",
@@ -86,6 +92,60 @@ def audit_bundle(dat_lst_path: str) -> Dict[str, str]:
     return digests
 
 
+@dataclass(frozen=True)
+class SpeciesDwTable:
+    """Vendored per-species diffusion data (RT-P0a, PRD 4.6.4).
+
+    dw: 25 C self-diffusion coefficient (m^2/s) by phreeqc species name;
+    z: ionic charge by phreeqc species name; aliases: GEMS DC name ->
+    phreeqc species name (hand-curated identities only)."""
+    dw: Dict[str, float]
+    z: Dict[str, float]
+    aliases: Dict[str, str]
+    sha256: str          # of the json file itself (audit trail)
+    source: str
+
+    def lookup(self, gems_dc: str):
+        """(dw_m2_s, z) for a GEMS DC name, or None when unmapped."""
+        name = gems_dc if gems_dc in self.dw else self.aliases.get(gems_dc)
+        if name is None or name not in self.dw:
+            return None
+        return self.dw[name], self.z[name]
+
+
+def load_species_dw(path: str) -> SpeciesDwTable:
+    p = Path(path)
+    if not p.is_file():
+        raise GemsError(f"species dw table not found: {p}", kind="config")
+    raw = p.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
+    rows = payload.get("species")
+    if not rows:
+        raise GemsError(f"species dw table {p} has no species rows",
+                        kind="config")
+    dw: Dict[str, float] = {}
+    z: Dict[str, float] = {}
+    for row in rows:
+        name = str(row["species"])
+        val = float(row["dw_25C_m2_s"])
+        if name in dw:
+            raise GemsError(f"duplicate species {name!r} in {p}", kind="config")
+        if not math.isfinite(val) or not (0.0 < val < 1e-7):
+            raise GemsError(f"implausible dw {val!r} for {name!r} in {p}",
+                            kind="config")
+        dw[name] = val
+        z[name] = float(row["z"])
+    aliases = {str(k): str(v) for k, v in (payload.get("aliases") or {}).items()}
+    dangling = sorted(v for v in set(aliases.values()) if v not in dw)
+    if dangling:
+        raise GemsError(
+            f"dw table aliases point at unknown species: {dangling}",
+            kind="config")
+    return SpeciesDwTable(dw=dw, z=z, aliases=aliases,
+                          sha256=hashlib.sha256(raw).hexdigest(),
+                          source=str(payload.get("source", "unknown")))
+
+
 @dataclass
 class GemsResult:
     status: str
@@ -102,6 +162,10 @@ class GemsResult:
     aqueous_h2o_mol: Optional[float] = None  # solvent split of the aqueous phase
     element_input: Dict[str, object] = field(default_factory=dict)
     xgems_version: str = "not_available"
+    # RT-P0a: full aqueous per-species mols (H2O@ included); empty when the
+    # worker predates PROTOCOL_VERSION 2 (tolerated unless species transport
+    # is configured — see GemsWorker.require_speciation)
+    aqueous_species_mol: Dict[str, float] = field(default_factory=dict)
 
     def floor_adjust_max_rel(self) -> float:
         """Largest cleared-state floor clamp relative to the requested inventory —
@@ -151,6 +215,7 @@ class GemsWorker:
         self._proc = None
         self._serve_dir: Optional[Path] = None
         self._req_counter = 0
+        self._info_cache: Optional[Dict] = None
         self.baseline_audit = audit_bundle(self.bundle_lst)
 
     # ------------------------------------------------------- persistent server
@@ -232,6 +297,25 @@ class GemsWorker:
         result = self._raw_call({"mode": "info", "dat_lst": self.bundle_lst}, run_dir)
         return result
 
+    def _cached_info(self) -> Dict:
+        """info(), fetched once — the bundle is audit-immutable, so caching is
+        exact. Internal (info() itself stays a fresh call: cheap, and tests
+        rely on it exercising the worker round-trip)."""
+        if self._info_cache is None:
+            self._info_cache = self.info()
+        return self._info_cache
+
+    def require_speciation(self) -> None:
+        """Refuse to serve species transport with a pre-v2 worker (spec §2.3:
+        old response + Tier 0 active = error; inactive = ignore)."""
+        got = int(self._cached_info().get("protocol_version", 1))
+        if got < 2:
+            raise GemsError(
+                f"species transport needs worker protocol >= 2 "
+                f"(aqueous speciation in responses); this worker speaks "
+                f"{got}. Rebuild/redeploy the worker environment.",
+                kind="protocol")
+
     def equilibrate_stored(self) -> GemsResult:
         """Re-equilibrate the bundle's stored DBR node (PRD §6.2 anchor 1)."""
         return self._call({"mode": "stored", "dat_lst": self.bundle_lst})
@@ -252,6 +336,16 @@ class GemsWorker:
             if not math.isfinite(v) or v < 0.0:
                 raise GemsError(f"element amount {el}={v} must be finite and >= 0",
                                 kind="config")
+        # Filter the DEFAULT suppression list to phases the bundle declares —
+        # the engine path (GemsBackend.__init__) and run_0d_probe already do,
+        # and without it a hydrates-only bundle (CNASH Test) hard-errored on
+        # every 0D call (measured 2026-09-01). An EXPLICIT caller-provided
+        # list is passed through unfiltered: the worker's unknown-name error
+        # stays a typo guard for deliberate suppression requests.
+        if suppressed_phases is SUPPRESSED_CLINKER_PHASES:
+            present = set(self._cached_info()["phase_names"])
+            suppressed_phases = tuple(
+                p for p in SUPPRESSED_CLINKER_PHASES if p in present)
         return self._call({
             "mode": "elements",
             "dat_lst": self.bundle_lst,
@@ -281,6 +375,7 @@ class GemsWorker:
             aqueous_h2o_mol=response.get("aqueous_h2o_mol"),
             element_input=response.get("element_input", {}),
             xgems_version=response.get("xgems_version", "not_available"),
+            aqueous_species_mol=response.get("aqueous_species_mol", {}),
         )
 
     def _raw_call(self, request: Dict, run_dir: Path) -> Dict:
@@ -440,6 +535,27 @@ class GemsBackend:
                     if el in el_idx:  # charge (Zz) already dropped worker-side
                         vec[el_idx[el]] = float(coeff)
                 self.endmember_elements[dc] = vec
+        # RT-P0a: run-scoped aqueous species universe for the NP weighting —
+        # names (solvent excluded: transported solutes only), charges (DCH Zz
+        # column, worker protocol >= 2; empty dict on older workers, refused
+        # later by require_speciation when species transport is configured),
+        # and element rows over ELEMENT_IDS. Never hardcoded.
+        aq_all = tuple(info["phase_species"].get(AQUEOUS_PHASE, ()))
+        self.aq_species_ids = tuple(dc for dc in aq_all if dc != "H2O@")
+        charge_map = info.get("species_charge") or {}
+        self.aq_species_charge = _np.array(
+            [float(charge_map.get(dc, 0.0)) for dc in self.aq_species_ids])
+        self.aq_species_elements = _np.zeros(
+            (len(self.aq_species_ids), len(ELEMENT_IDS)))
+        for k, dc in enumerate(self.aq_species_ids):
+            row = species_elements.get(dc)
+            if row is None:
+                raise GemsError(
+                    f"DCH has no stoichiometry row for aqueous species {dc!r}",
+                    kind="config")
+            for el, coeff in row.items():
+                if el in el_idx:
+                    self.aq_species_elements[k, el_idx[el]] = float(coeff)
         # the RUN's registry: a config-declared SCM composition (PRD 1.2
         # v3.0) must reach the elements this backend is actually fed
         reg = registry or default_registry()
@@ -595,6 +711,11 @@ class GemsBackend:
             ionic_strength_status=r.ionic_strength_status,
             aqueous_h2o_mol=h2o_out,
             aqueous_elements=aqueous_elements,
+            # RT-P0a: unscale by the same 1/s as every other extensive output;
+            # empty dict from a pre-v2 worker propagates as None
+            aqueous_species_mol=({dc: m / s
+                                  for dc, m in r.aqueous_species_mol.items()}
+                                 if r.aqueous_species_mol else None),
         )
 
 
@@ -649,6 +770,9 @@ def run_0d_probe(config, worker: GemsWorker,
             "phase_masses_kg": result.phase_masses_kg,
             "phase_elements_mol": result.phase_elements_mol,
             "phase_species_mol": result.phase_species_mol,
+            # RT-P0a: aqueous speciation for cross-engine comparison (spike);
+            # getattr — probe tests fake the result object without the field
+            "aqueous_species_mol": getattr(result, "aqueous_species_mol", {}),
             # solver self-consistency vs the effective (floor-clamped) input
             "element_closure_max_rel": result.element_closure_max_rel(),
             # divergence of the effective input from the physical ledger
@@ -660,11 +784,13 @@ def run_0d_probe(config, worker: GemsWorker,
 
 # ------------------------------------------------------------ worker process
 
-def _dch_species_elements(dat_lst: Path) -> Dict[str, Dict[str, float]]:
-    """Per-DC element coefficients from the bundle's DCH file (the -f "..."
-    list in the .lst names it first). Returns {dc_name: {element: coeff}} for
-    ALL DCs; the charge row (Zz) is dropped — the element ledger carries no
-    charge. Raises on malformed bundles (no guessing)."""
+def _dch_species_elements(dat_lst: Path):
+    """Per-DC element coefficients AND charges from the bundle's DCH file (the
+    -f "..." list in the .lst names it first). Returns
+    ({dc_name: {element: coeff}}, {dc_name: charge}) for ALL DCs; the element
+    rows drop the charge column (Zz) — the element ledger carries no charge —
+    while the charge map keeps it for the Tier 0 NP weighting (RT-P0a).
+    Raises on malformed bundles (no guessing)."""
     lst_text = dat_lst.read_text(encoding="utf-8", errors="replace")
     import re
     names = re.findall(r'"([^"]+)"', lst_text)
@@ -692,20 +818,24 @@ def _dch_species_elements(dat_lst: Path) -> Dict[str, Dict[str, float]]:
             f"DCH stoichiometry matrix shape mismatch in {dch_path.name}: "
             f"len(A)={len(a)} != nDC({len(dc_names)}) x nIC({n_ic})")
     out: Dict[str, Dict[str, float]] = {}
+    charges: Dict[str, float] = {}
     for j, dc in enumerate(dc_names):
         row = a[j * n_ic:(j + 1) * n_ic]
         entry = {ic: float(v) for ic, v in zip(ic_names, row)
                  if ic != CHARGE_ELEMENT_ID and float(v) != 0.0}
+        z = next((float(v) for ic, v in zip(ic_names, row)
+                  if ic == CHARGE_ELEMENT_ID), 0.0)
         # Cemdata bundles legitimately repeat a DC name across phases (e.g.
         # C4AH13 as pure phase AND AFm endmember) with IDENTICAL rows; a
         # same-named DC with a DIFFERENT stoichiometry would silently
         # mis-map the ledger, so refuse it (no guessing)
-        if dc in out and out[dc] != entry:
+        if dc in out and (out[dc] != entry or charges[dc] != z):
             raise ValueError(
                 f"DCH declares DC {dc!r} twice with differing stoichiometry "
                 f"- endmember rows would be ambiguous")
         out[dc] = entry
-    return out
+        charges[dc] = z
+    return out, charges
 
 
 def _worker_execute(request: Mapping,
@@ -739,13 +869,17 @@ def _worker_execute(request: Mapping,
         # matrix (E1, PRD 2.3 rev.3): the SAME matrix xGEMS solves with, read
         # from the JSON rather than guessed from formulas — endmember ledgers
         # close against it by construction
-        species_elements = _dch_species_elements(dat)
+        species_elements, species_charge = _dch_species_elements(dat)
         return {
             "ok": True,
+            "protocol_version": PROTOCOL_VERSION,
             "phase_names": [str(p) for p in engine.phase_names],
             "element_names": [str(e) for e in engine.bulk_composition],
             "phase_species": phase_species,
             "species_elements": species_elements,
+            # Zz column of the same DCH matrix (RT-P0a) — the NP weighting's
+            # charge source, never guessed from species names
+            "species_charge": species_charge,
             "xgems_version": version,
         }
 
@@ -836,6 +970,7 @@ def _worker_execute(request: Mapping,
     # response — the parent's endmember ledger is fed by the same numbers the
     # sum verification just checked.
     aqueous_h2o = None
+    aqueous_species: Dict[str, float] = {}
     phase_species_mol: Dict[str, Dict[str, float]] = {}
     for phase_name, total in phase_amounts.items():
         species = {str(k): float(v)
@@ -850,6 +985,9 @@ def _worker_execute(request: Mapping,
             aqueous_h2o = species.get("H2O@")
             if aqueous_h2o is None:
                 raise ValueError("aqueous phase lacks the H2O@ solvent species")
+            # RT-P0a: the full aqueous split rides the response (it was
+            # computed here all along and discarded save for the solvent)
+            aqueous_species = species
         elif phase_name != GAS_PHASE:
             phase_species_mol[phase_name] = species
 
@@ -871,6 +1009,7 @@ def _worker_execute(request: Mapping,
 
     result = {
         "ok": True,
+        "protocol_version": PROTOCOL_VERSION,
         "status": status,
         "pH": _nullable(engine.pH),
         "ionic_strength": _nullable(engine.IS),
@@ -880,6 +1019,7 @@ def _worker_execute(request: Mapping,
         "phase_elements_mol": phase_elements,
         "phase_species_mol": phase_species_mol,
         "aqueous_h2o_mol": aqueous_h2o,
+        "aqueous_species_mol": aqueous_species,
         "element_input": element_input,
         "xgems_version": version,
     }

@@ -64,6 +64,11 @@ class ReactionResult:
     aqueous_h2o_mol: float = math.nan
     aqueous_elements: np.ndarray = field(
         default_factory=lambda: np.zeros(len(ELEMENT_IDS)))
+    # Tier 0 (RT-P0a, PRD 4.6.4): per-species mols of the aqueous phase
+    # (solvent H2O@ included), unscaled. None for backends without
+    # speciation (synthetic); the engine only reads it when species
+    # transport is configured.
+    aqueous_species_mol: Optional[Dict[str, float]] = None
 
 
 class ReactionBackend(Protocol):

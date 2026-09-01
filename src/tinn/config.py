@@ -498,6 +498,38 @@ class BoundaryReservoirConfig(BaseModel):
         return self
 
 
+class SpeciesDiffusionConfig(BaseModel):
+    """Tier 0 (RT-P0, PRD 4.6.4): per-element effective diffusivities from
+    aqueous speciation and per-species self-diffusion coefficients under the
+    Nernst-Planck zero-current projection. Mutually exclusive with the
+    scalar d0_m2_s unless diagnostics_only."""
+    model_config = _STRICT
+    # vendored table (scripts/make_species_dw_table.py output) with the
+    # GEMS-DC alias map; audited by sha256 in the run summary
+    dw_table: str
+    # dw for GEMS species with no table mapping. None = a run whose bundle
+    # declares an unmapped aqueous species REFUSES to start (no silent
+    # defaults); a value is recorded per species in the run summary.
+    default_dw_m2_s: Optional[float] = Field(default=None, gt=0.0)
+    # porous-medium reduction applied uniformly on top of the graph's
+    # geometric resistance. REQUIRED and explicit (d0 precedent): 1.0 means
+    # the graph carries all geometry, exactly like the scalar path.
+    geometry_factor: float = Field(gt=0.0)
+    phi_clamp_report: bool = True
+    # RT-P0a: keep the scalar d0 physics and only REPORT the NP effective
+    # diffusivities per step. False (active transport) lands with RT-P0b.
+    diagnostics_only: bool = False
+
+    @model_validator(mode="after")
+    def _check(self) -> "SpeciesDiffusionConfig":
+        if not math.isfinite(self.geometry_factor):
+            raise ValueError("geometry_factor must be finite")
+        if (self.default_dw_m2_s is not None
+                and not math.isfinite(self.default_dw_m2_s)):
+            raise ValueError("default_dw_m2_s must be finite")
+        return self
+
+
 class DomainPartitionConfig(BaseModel):
     """Mode C (PRD 4.6.2): sub-cluster equilibration domains from a static
     axis-aligned tiling, coupled by implicit diffusion on the domain graph."""
@@ -517,7 +549,13 @@ class DomainPartitionConfig(BaseModel):
     # conventional single-D compromise (PRD 4.6.2: the elemental state
     # carries no speciation, so a per-element D would be an invented
     # speciation; the graph carries the geometry, D0 is the bulk scale).
-    d0_m2_s: float = Field(gt=0.0)
+    # Optional since RT-P0 ONLY to admit the species alternative below; a
+    # config without `species` (or with diagnostics_only) still REQUIRES it
+    # (validated) — every earlier config carries the field, hash unchanged.
+    d0_m2_s: Optional[float] = Field(default=None, gt=0.0)
+    # Tier 0 species-resolved diffusion (PRD 4.6.4). None keeps the scalar
+    # path and every earlier config hash (the transport-section None sweep).
+    species: Optional[SpeciesDiffusionConfig] = None
     # GEM-call economy (PRD 4.6.2). dirty_rtol = 0.0 equilibrates every
     # wet domain every step - the pure mode-C reference.
     dirty_rtol: float = Field(default=0.0, ge=0.0)
@@ -526,12 +564,27 @@ class DomainPartitionConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> "DomainPartitionConfig":
-        if not math.isfinite(self.d0_m2_s):
+        if self.d0_m2_s is not None and not math.isfinite(self.d0_m2_s):
             raise ValueError("d0_m2_s must be finite")
         if not math.isfinite(self.dirty_rtol):
             raise ValueError("dirty_rtol must be finite")
         if self.tile_zyx is not None and any(t < 1 for t in self.tile_zyx):
             raise ValueError("tile_zyx entries must be >= 1")
+        # d0 XOR active species (PSD precedent: one source of truth, both =
+        # error); diagnostics ride the scalar physics so they need d0 too
+        active = self.species is not None and not self.species.diagnostics_only
+        if active and self.d0_m2_s is not None:
+            raise ValueError(
+                "d0_m2_s and active transport.domains.species are mutually "
+                "exclusive - the per-element conductances replace the scalar")
+        if not active and self.d0_m2_s is None:
+            raise ValueError(
+                "transport.domains needs d0_m2_s (species diagnostics and "
+                "the scalar path both run on it; no invented default)")
+        if active:
+            raise ValueError(
+                "active species transport lands with RT-P0b - set "
+                "diagnostics_only: true (RT-P0a) for now")
         return self
 
     def tiles(self, grid_size: int) -> Tuple[int, int, int]:
@@ -776,6 +829,28 @@ class TinnConfig(BaseModel):
                         f"schedule.dt_min_h {floor} h keeps that channel at "
                         f"f = 1 always (use 0.0 for an explicit fully-"
                         f"offered channel)")
+        if (self.transport is not None and self.transport.domains is not None
+                and self.transport.domains.species is not None):
+            # Tier 0 (PRD 4.6.4): the speciation source is the GEMS worker
+            # response - the stoichiometric backend has none (no silent
+            # empty-speciation run, diagnostics included)
+            if self.chemistry.backend != "gems3k":
+                raise ValueError(
+                    "transport.domains.species needs the gems3k backend - "
+                    "aqueous speciation comes from the GEMS responses")
+            # bath speciation is undefined for solute-bearing reservoirs:
+            # only water-derived elements (O, H - the aerated-water bath)
+            # may appear alongside species transport
+            if self.transport.boundary is not None:
+                bad = sorted(
+                    el for el, v
+                    in self.transport.boundary.composition_mol_per_m3.items()
+                    if v != 0.0 and el not in ("O", "H"))
+                if bad:
+                    raise ValueError(
+                        f"transport.domains.species with a solute-bearing "
+                        f"bath ({bad}) is unsupported - the reservoir has "
+                        f"no speciation state (pure/aerated water only)")
         if self.transport is not None and self.transport.domains is not None:
             for name, t in zip(("tile_zyx[z]", "tile_zyx[y]", "tile_zyx[x]"),
                                self.transport.domains.tiles(
