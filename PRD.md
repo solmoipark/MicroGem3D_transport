@@ -1204,6 +1204,46 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   고정값과 비트 동일. 미결: S1c/S1d/S1e의 황산염 기록은 배제 없이 측정됨(PC
   번들에선 pyrite로 빠져 영향이 총 S의 <1%로 작지만, 재측정을 병합 후 항목으로
   둠); 배제 후 사다리 재실측은 RT-Cl-3에 기록.
+- **RT-Cl-3 — 28 d 염화물 결합 등온선 사다리 (2026-09-03, 실측)**:
+  `examples/qualification/chloride_binding_28d_{0.1M,0.5M,1.0M}.json`(OPC
+  32³·w/c 0.5, PC-Cl 번들, 672 h 수화 후 NaCl 배스 0.4 h — RVE는 수 초 내
+  충수되므로 노출 길이는 평형 도달용; RT-S3 환원 S 배제 적용; S+Cl 수착,
+  CH 완충) + `_noS`(SO4 반응 제거 대조). 관측(0.4 h, 결합 = 유입−자유 =
+  Friedel+수착; `analyze_chloride_ingress.py`의 시멘트 질량 정규화
+  4.03e-8 g, 페이스트 = ÷1.5):
+
+  | 자유 Cl (M) | 결합 mg/g cement | 페이스트 mg/g | 수착(Surf_c) | Friedel | 문헌 밴드 mg/g paste·gel |
+  |---|---|---|---|---|---|
+  | 0.100 | 2.37 | **1.58** | 1.83 | 0.54 | 3–6 (Tang&Nilsson 5.8·gel, Thomas 4.1, Zhang 3.0–5.2) |
+  | 0.500 | 11.00 | **7.33** | 4.87 | 6.13 | 7–15 (T&N 10.6, Thomas 6.8, Zhang 11.8–14.7) |
+  | 1.000 | 15.06 | **10.04** | 6.33 | 8.73 | 8.5–24 (T&N 13.8, Thomas 8.5, Zhang 17.5–24) |
+
+  (문헌: 사용자 TDM db — Tang & Nilsson 1993 CCR 23 Freundlich mg/g-gel;
+  Thomas et al. 2012 CCR 42 `Cb = 8.51 Cf^0.32` mg/g sample; Zhang 2022
+  CCC 104793 Langmuir/Freundlich mg/g paste.) 판정: 0.5·1.0 M은 밴드 안쪽
+  하단, **0.1 M은 밴드의 ½ (Cl-OPEN-3)** — 모델 등온선의 log-log 기울기
+  0.80(0.1→1.0 M)이 문헌 0.3–0.6보다 가파름. 분해: Surf_c 수착은 Hirao
+  Langmuir대로 포화형(상대 0.29/0.77/1.0)이고, 부족분은 **Friedel 쪽**(0.54 →
+  6.1 → 8.7: 저농도에서 거의 선형) — 이 배합(SO3 당량 5.4%)의 28 d 조합이
+  AFt 3298·AFm 118 vox로 AFm-빈곤이라 Cl/SO4 교환 대상이 작고 Kuzel염은 0.
+  문헌 페이스트는 AFm이 더 많다 → 배합 의존 화학이지 수착 보정 문제가
+  아님; 저농도 앵커는 AFm-풍부 배합(저 SO3 또는 C3A 높은 시멘트)으로
+  별도 측정할 것. 대조: noS 0.5 M 10.97 vs S 포함 11.00 — RT-S3 이후
+  황산염 저장소(총 S의 4.2%)는 Cl 결합에 무관; 배제 전 기준선(HS⁻ 아티팩트,
+  noS) 1.9/8.2/11.1 mg/g paste는 폐기. **Cl-OPEN-1 종결**: 168 h 스모크의
+  Cl 역류(황산염 탈착→AFt→Friedel 용해)는 실제 결합 사슬이었으나 그 크기는
+  RT-S3 아티팩트(HS⁻ 재산화로 부푼 95% 저장소)에서 왔다 — 배제 후 0.5/1.0 M
+  모두 단조 수렴(Friedel 0.3 h 이후 정체). 도중 발견·수정 3건: ① BE 음수
+  먼지 수리의 기준 스케일이 스텝 전 열 최대값이라 배스가 막 채우는 Cl
+  열(미량 1e-23 → 1e-12 유입)의 반올림 먼지를 3.6e-9 "초과"로 오판 →
+  전/후 최대값 기준 + 원소명 보고(회귀 테스트); ② 0.1 M 개시에서 고립 dust
+  포켓(물 1e-12/총량)이 죽으며 수착 행(저장소의 2.6e-4)이 젖은 후계자 없음
+  → 9회 dt-무관 거부: 저장소는 고체 표면에 있으므로 죽은 클러스터 복셀의
+  젖은 이웃(최대 액체 접촉 라벨, 복셀 수 가중)으로 폴드하고, 이웃 없는
+  고립 포켓은 §4.6.3 surrender 두 증인(행/풀, 물/총량 < 1e-3)을 통과하면
+  경계 원장으로 surrender(정확 부동소수, 폐합 항등), 물질 행이면 하드 거부
+  유지; `StepReject.detail`로 거부 진단 기록(익명 거부 금지); ③ RT-S3.
+  벽시계: 케이스당 25–35 분(672 h 수화 + 286 노출 스텝).
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올

@@ -158,6 +158,11 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       통합 스모크(NaCl 0.5 M, 11 분): 원장 폐합, Cl 분배 Friedel 51 / 수착 27 /
       자유 22 %; 황산염 탈착→에트링가이트→Friedel 용해 역류 관찰(Cl-OPEN-1).
       Cl 담체 NaCl→KCl→HCl.
+- [x] **RT-Cl-3 (2026-09-03)** — 28 d 염화물 결합 등온선 사다리(PRD 4.6.5,
+      `chloride_binding_28d_*`): 자유 0.1/0.5/1.0 M에서 결합 1.6/7.3/10.0 mg/g
+      paste(수착+Friedel) vs 문헌 밴드 3–6/7–15/8.5–24 — 0.5·1.0 M 밴드 안쪽,
+      0.1 M ½(AFm-빈곤 배합, Cl-OPEN-3). Cl-OPEN-1 종결(RT-S3 아티팩트).
+      수정: BE 수리 스케일, 죽은 포켓의 수착 저장소 폴드/surrender, 거부 진단.
 - [x] **RT-S3 (2026-09-03)** — GEMS 산화환원 바닥 발견·배제(PRD 4.6.5): 원장
       O/H가 산화물-정확이라 황산염 일부가 환원됨(PC: pyrite 미량, PC-Cl: HS⁻
       53 mM → 수착 연산자가 재산화해 저장소 95%). `chemistry.suppressed_species/
