@@ -384,6 +384,14 @@ def test_sorption_wetness_dust_contract():
     # healthy CH-buffered pore solution (ratio ~55) -> wet
     pore = offer(Ca=2e-6, S=5e-7, K=1e-6, O=1e-5)
     assert not sorption_reactor_dry(2e-4, pore, floor)
+    assert not sorption_reactor_dry(2e-4, pore, floor, sites_mol=2e-3)
+    # measured sulfate-exposure pocket: ~100 water molecules under 5e-14
+    # mol of sites (ratio 2.7e5) passes the solute tests but is no
+    # aqueous phase -> dry
+    pocket = offer(S=1.0731403065660104e-23, Na=2.5764464160582435e-23,
+                   Ca=3.977023222846777e-25, O=1e-22)
+    assert sorption_reactor_dry(1.870032995508385e-19, pocket, 1e-24,
+                                sites_mol=5.0473800668586434e-14)
     # water<=0 always dry; negative element dust never flips the sign
     assert sorption_reactor_dry(0.0, pore, floor)
     assert sorption_reactor_dry(-1.0, pore, floor)

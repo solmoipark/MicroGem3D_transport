@@ -112,15 +112,18 @@ _SORB_SOLUTE_COLS = [i for i, el in enumerate(ELEMENT_IDS)
 
 
 def sorption_reactor_dry(water_mol: float, offer: np.ndarray,
-                         dust_floor: float) -> bool:
+                         dust_floor: float, sites_mol: float = 0.0) -> bool:
     """S-stage wetness/dust contract (RT-S1c, PRD 4.6.5): a reactor is an
-    aqueous phase only when water dominates the solutes (mol ratio >= 10)
-    AND the solute total sits above the ledger noise floor. Pure function
-    so the contract stays unit-testable against the measured failure
-    inputs (the femto-water dust cluster, the solute-noise micro-pocket)."""
+    aqueous phase only when water dominates the solutes (mol ratio >= 10),
+    the solute total sits above the ledger noise floor, AND the surface it
+    carries is not absurd against its water (sites <= 100 x water; a
+    measured 2.7e5 ratio - ~100 water molecules under 5e-14 mol of sites -
+    scaled to a 140 mol surface on microlitres and broke IPhreeqc). Pure
+    function so the contract stays unit-testable against the measured
+    failure inputs."""
     solute = float(np.clip(offer[_SORB_SOLUTE_COLS], 0.0, None).sum())
     return (water_mol <= 0.0 or water_mol < 10.0 * solute
-            or solute <= dust_floor)
+            or solute <= dust_floor or sites_mol > 100.0 * water_mol)
 
 
 class Engine:
@@ -1130,7 +1133,7 @@ class Engine:
             for c in range(n_clusters):
                 offer = inv_eff[c] + sorb_in[c]
                 if sorption_reactor_dry(float(water_mol_c[c]), offer,
-                                        dust_floor):
+                                        dust_floor, float(sites[c])):
                     sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
                     n_sorb_dry += int(water_mol_c[c] > 0.0)
                     continue
