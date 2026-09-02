@@ -10,6 +10,16 @@
 > (config 해시·체크포인트)에 얽혀 있어 리네임은 별도 작업으로 남겨 둔다. 아래
 > 명령의 `tinn`은 오타가 아니다.
 
+## 버전 계보 (transport 도입 전/후)
+
+| 선 | 브랜치 | 태그 | 내용 |
+|---|---|---|---|
+| **v3 — transport 도입 전** | `main` | `v3.0-paper` (= `paper-ccr-v1`) | 논문(CCR)에 사용한 수화 플랫폼. 동결 — 논문 관련 수정만 |
+| **v4 — reactive transport** | `rt` | `v4.0-rt-tier1` … | `main`(f7be88b)에서 분기한 개발선: 모드 B/C 수송, 경계 저수조, Tier 0 종별 NP, Tier 1 PHREEQC 수착 |
+
+`transport` 섹션이 없는 config는 `rt`에서도 v3와 비트 동일하게 동작한다(PRD 헌법).
+두 선의 PRD/README는 각 브랜치가 따로 가진다.
+
 ## 요구 사항
 
 - Python ≥ 3.11, `numpy`, `pydantic` (테스트는 `pytest`)
