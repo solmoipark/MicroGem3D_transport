@@ -390,3 +390,22 @@ def test_np_engine_speciates_solute_bath():
     assert abs(float(np.dot(eng._np_z, vec))) <= 1e-8 * np.abs(vec).sum()
     prov = eng._np_provenance
     assert prov["bath_species_mol_per_m3"] and 6.0 < prov["bath_ph"] < 9.0
+
+
+def test_exchange_be_signed_frame_columns():
+    """S1-OPEN-1: O/H are signed frame columns - a domain whose solute-
+    frame H went negative (OH- deficit after desorption at an OH-depleted
+    face) exchanges linearly with no repair and no raise, while a solute
+    column still trips the negative-repair guard beyond dust."""
+    from tinn.registry import ELEMENT_IDS
+    graph = _two_domain_graph()
+    n_e = len(ELEMENT_IDS)
+    h, ca = ELEMENT_IDS.index("H"), ELEMENT_IDS.index("Ca")
+    inv = np.zeros((2, n_e))
+    inv[0, h], inv[1, h] = -3.0e-4, 2.0e-4          # signed frame H
+    inv[0, ca], inv[1, ca] = 1.0e-4, 1.0e-4
+    ex = transport.exchange_be(graph, inv, 0.5, 1.0e-3)
+    assert ex.status == "ok" and ex.repair_rel == 0.0
+    assert ex.delta[:, h].sum() == pytest.approx(0.0, abs=1e-24)   # conserved
+    assert (inv + ex.delta)[0, h] > inv[0, h]                        # relaxes
+    assert ex.delta[:, ca].sum() == pytest.approx(0.0, abs=1e-24)

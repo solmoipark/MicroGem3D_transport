@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .registry import ELEMENT_IDS
+
 LIQ_EPS = 1e-9
 _AXES = ((0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1))
 # transport-frozen dust threshold: a domain whose liquid volume is below this
@@ -73,6 +75,11 @@ class RemapResult:
     inventory: np.ndarray            # (K_new, E)
     events: List[Tuple[int, int, float]]  # (prev, new, overlap_vox)
     dryout: List[int]                # prev cluster ids with inventory but no overlap
+
+
+# O and H are the solute FRAME (values relative to H2O): they may carry
+# either sign in the pore-solution ledger (PRD 4.6.5 S1-OPEN-1)
+_FRAME_COLS = frozenset(ELEMENT_IDS.index(el) for el in ("O", "H"))
 
 
 def remap_inventories(prev_labels: np.ndarray, prev_liquid: np.ndarray,
@@ -576,10 +583,17 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         if f_out.size:
             max_flux = max(max_flux, float(np.abs(f_out).max()))
 
-    # deterministic negative-dust repair: clip, charge the largest entry
+    # deterministic negative-dust repair: clip, charge the largest entry.
+    # O and H are FRAME elements (solute-frame values relative to H2O):
+    # a negative entry there is water-frame acid (an OH- deficit), a
+    # legitimate state after ligand exchange desorbs at an OH-depleted
+    # face (PRD 4.6.5 S1-OPEN-1) - the BE solve is linear and signed, so
+    # those columns skip the repair; solutes stay amounts (>= 0).
     new = inventory + delta
     repair_rel = 0.0
     for e in range(n_elem):
+        if e in _FRAME_COLS:
+            continue
         col = new[:, e]
         neg = col < 0.0
         if not neg.any():

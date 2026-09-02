@@ -1032,6 +1032,27 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   (확정)**: O/H를 부호 있는 프레임 원소로 원장(용질-프레임 H<0 허용)·BE
   (음수 보정 제외)·overdraw 가드(용질 원소만)에서 일관 취급. 봉인 런은
   OH⁻가 충분해 영향 없음(calibrated 168 h 주 도메인 점유 99.6%).
+- **미해결 이슈 S1-OPEN-2 (2026-09-02 실측, S1c·알칼리 28d 기록 재해석,
+  S1d 설계 항목)** — **황산염 트랩 아티팩트**. snapshot 재제공(오퍼 = 용액
+  + 저장소 원소행)은 리간드 교환 저장소를 SO3(산 무수물)로 되돌리는데,
+  흡착 시 방출됐던 OH⁻는 R 단계가 CH 등 고체로 침전시켜 부분계(용액+표면)
+  밖에 있다. 실측(주 클러스터 재제공 부분계를 PHREEQC로 직접 풀어 pH):
+  calibrated 672 h **용액 13.06 → 재제공 0.72**, 알칼리 바인더 672 h
+  **13.53 → −0.26**. 극산성 부분계에서 OH⁻ 방출형 교환은 전량 흡착 쪽으로
+  구동되므로 연산자는 **일방향 황산염 싱크**가 된다: 초기 수화 중 S 단계를
+  통과한 수용성 황산염이 잡혀 되돌아오지 않는다. 그 결과 calibrated 28d의
+  "수착 11.1%·점유율 4.8%"는 Langmuir 평형이 아니라 싱크 누적량이며(앞서
+  "점유율 4.8%는 pH ~11.9가 필요"로 드러났던 불일치가 바로 이것; [SO4]
+  0.37 mmol/L의 Barbarulo 일치는 GEMS 잔여 수용액의 우연), 알칼리
+  바인더 28d(`runs/sorption_so4_results_calibrated_alkali.json`: 수착
+  **81%**, 점유율 40%, 벽시계 2138 s)는 알칼리 황산염 즉시 용해로 싱크가
+  극대화된 진단값이다. S1c의 0D 보정(염기가 있는 실제 배치 재현) 자체는
+  유효하다. 형식 B(OH 무방출)는 해결책이 아니다 — 원소적으로 음이온 제거는
+  어느 형식이든 용액에 염기를 남기고 R이 이를 침전시킨다. **설계 방향
+  S1d(확정)**: S 단계 부분계에 반응기 소유 **포틀랜다이트를 완충 평형상**
+  으로 포함(양 = 소유 CH, 공동 스케일), CH 델타를 용액↔CH 풀에 기입해
+  R이 재결정하도록(상 권위는 GEMS 유지, S는 완충만) — CH 부재계(용출·SCM)
+  는 C-S-H 완충 후속. S1-OPEN-1(부호 프레임)은 이 위에서도 필요하다.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
@@ -1051,7 +1072,9 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   (no_edl은 불가)하나 크기 ~1.5–2× 과대. **판정: SO4 프로덕션 상수는 no_edl 국소 보정
   (S1c) 유지; ddl은 능력으로 탑재하되 정전 지배 이온(Cl 배제, 알칼리
   Donnan)용으로 보류** — 메커니즘 표 항목.
-- **28d 실측 런** (`scripts/run_sorption_so4.py calibrated`, Deschner
+- **28d 실측 런 — 재해석 주의(S1-OPEN-2)**: 아래 수치는 S1d 이전
+  연산자의 싱크 누적량이지 pH 13 Langmuir 평형이 아니다 (같은 날 실측).
+  (`scripts/run_sorption_so4.py calibrated`, Deschner
   OPC 32³ 봉인 dt 0.6 h, 296.15 K, 벽시계 766 s,
   `runs/sorption_so4_results_calibrated.json`): 수착 S 24 h 1.68e-12 →
   168 h 1.75e-12 → **672 h 1.85e-12 mol = 총 S(1.665e-11)의 11.1%**

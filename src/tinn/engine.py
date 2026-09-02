@@ -1121,7 +1121,11 @@ class Engine:
                 sorb_new[c] = res.sorbed_mol
             s_delta = sorb_new - sorb_in
             inv_eff = inv_eff - s_delta
+            # O/H are signed frame columns (S1-OPEN-1): desorption at an
+            # OH-depleted face legitimately drives the solute-frame H
+            # below zero (water-frame acid); only SOLUTES can overdraw
             neg = inv_eff < 0.0
+            neg[:, [ELEMENT_IDS.index("O"), ELEMENT_IDS.index("H")]] = False
             if np.any(neg):
                 worst = float(inv_eff[neg].min())
                 scale = float(np.abs(inv_eff).max())
