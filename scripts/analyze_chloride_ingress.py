@@ -39,9 +39,17 @@ def main() -> None:
     axis = {"z": 0, "y": 1, "x": 2}[cfg.transport.boundary.axis]
     other = tuple(a for a in range(3) if a != axis)
     cl_idx = ELEMENT_IDS.index("Cl")
+    # cement mass in the RVE from the initial anhydrous clinker mol (the
+    # four P&K phases carry 0.913 of the recipe mass; the salts ride the
+    # fifth channel and are folded in by that ratio)
+    CLINKER_G_MOL = (228.32, 172.24, 270.19, 485.96)      # C3S C2S C3A C4AF
+    mf = cfg.binder.mass_fractions
+    clinker_frac = sum(mf.get(k, 0.0) for k in ("C3S", "C2S", "C3A", "C4AF"))
+    vox_m3 = (cfg.rve.voxel_size_um * 1e-6) ** 3
     rows = []
     for ck in ckpts:
         st = load_checkpoint(str(ck), reg)
+        cement_g = float(np.dot(st.initial_phase_mol[:4], CLINKER_G_MOL)) / clinker_frac
         hyd = list(st.hydrate_ids)
         cl_phases = tuple(h for h in hyd
                           if "Friedel" in h or "Kuzel" in h or "Cl" in h)
@@ -52,13 +60,20 @@ def main() -> None:
                     axis=other).tolist()
         sorbed = (float(st.domain_sorbed_mol[:, cl_idx].sum())
                   if st.domain_sorbed_mol.size else 0.0)
+        cl_in = float(st.boundary_exchanged_elements[cl_idx])
+        cl_aq = float(st.cluster_inventory[:, cl_idx].sum())
+        liq_m3 = float(st.capillary_liquid.sum()) * vox_m3
+        bound = cl_in - cl_aq                      # solids + sorbed, by balance
         rows.append({
             "ckpt": ck.name,
             "time_h": float(st.time_h),
-            "Cl_in_from_bath_mol": float(
-                st.boundary_exchanged_elements[cl_idx]),
+            "Cl_in_from_bath_mol": cl_in,
             "Cl_sorbed_mol": sorbed,
-            "Cl_aqueous_mol": float(st.cluster_inventory[:, cl_idx].sum()),
+            "Cl_aqueous_mol": cl_aq,
+            "cement_g": cement_g,
+            "free_Cl_mol_L": cl_aq / liq_m3 / 1e3 if liq_m3 > 0 else None,
+            "bound_Cl_mg_per_g_cement": bound * 35.453 * 1e3 / cement_g,
+            "sorbed_Cl_mg_per_g_cement": sorbed * 35.453 * 1e3 / cement_g,
             "cl_phases": list(cl_phases),
             "layer_profiles_vox": prof,
             "layer_liquid_vox": st.capillary_liquid.sum(axis=other).tolist(),
@@ -80,6 +95,13 @@ def main() -> None:
         print(f"{r['time_h']:8.2f} {r['time_h']-start:8.3f} "
               f"{r['Cl_in_from_bath_mol']:10.3e} {r['Cl_sorbed_mol']:10.3e} "
               f"{r['Cl_aqueous_mol']:10.3e}  {seg}")
+    last = rows[-1]
+    fc = last["free_Cl_mol_L"]
+    print(f"final: cement {last['cement_g']:.3e} g, free Cl "
+          f"{fc if fc is None else round(fc, 4)} mol/L, bound "
+          f"{last['bound_Cl_mg_per_g_cement']:.2f} mg/g cement (sorbed "
+          f"{last['sorbed_Cl_mg_per_g_cement']:.2f}; per g paste x1/(1+w/c) "
+          f"= {last['bound_Cl_mg_per_g_cement']/(1+cfg.w_c):.2f})")
     print(f"saved {out}")
 
 

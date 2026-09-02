@@ -591,6 +591,7 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     # those columns skip the repair; solutes stay amounts (>= 0).
     new = inventory + delta
     repair_rel = 0.0
+    repairs = []
     for e in range(n_elem):
         if e in _FRAME_COLS:
             continue
@@ -599,9 +600,18 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         if not neg.any():
             continue
         shortfall = float(col[neg].sum())           # < 0
-        scale = float(np.abs(inventory[:, e]).max())
+        # the dust reference is the column's magnitude BEFORE OR AFTER the
+        # step: a column the bath is just filling (chloride at exposure
+        # onset, trace 1e-23 mol in the pores, 1e-12 mol arriving) has a
+        # pre-step maximum a dozen decades below the numbers the CG
+        # rounds, and the old pre-step-only reference called that dust a
+        # logic error (measured: RT-Cl-3 0.1 M ladder, 3.6e-9 "excess")
+        scale = max(float(np.abs(inventory[:, e]).max()),
+                    float(np.abs(col).max()))
         if scale > 0.0:
-            repair_rel = max(repair_rel, -shortfall / scale)
+            rel = -shortfall / scale
+            repair_rel = max(repair_rel, rel)
+            repairs.append((ELEMENT_IDS[e], shortfall, scale))
         col[neg] = 0.0
         top = int(np.argmax(col))
         col[top] = max(col[top] + shortfall, 0.0)
@@ -609,6 +619,7 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     if repair_rel > 1e-11:
         raise RuntimeError(
             f"exchange_be negative repair {repair_rel:.3e} exceeds dust - "
-            f"logic error, not absorbable")
+            f"logic error, not absorbable; (element, shortfall mol, column "
+            f"scale mol): {repairs}")
     return ExchangeResult(delta, "ok", iters, max_flux, repair_rel,
                           boundary_net)

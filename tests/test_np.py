@@ -448,3 +448,35 @@ def test_ledger_superset_bundle_contract():
         assert r.aqueous_species_mol.get("Cl-", 0.0) > 0.0
     finally:
         w.close()
+
+
+def test_exchange_be_repair_scale_follows_bath_filled_column():
+    """RT-Cl-3: the negative-dust repair judges dust against the column's
+    magnitude before OR after the step. A column the bath is just
+    filling (trace 1e-23 mol in every domain, 1e-12 mol arriving) must
+    not have its CG rounding dust measured against the trace - a chain
+    of domains fed from one face completes with status ok, every column
+    non-negative, and the repair stays at dust level."""
+    from tinn.registry import ELEMENT_IDS
+    n = 24
+    graph = transport.DomainGraph(
+        n_domains=n, edge_a=np.arange(n - 1), edge_b=np.arange(1, n),
+        edge_g=np.full(n - 1, 0.7), water=np.full(n, 3.0),
+        dust=np.zeros(n, dtype=bool))
+    n_elem = len(ELEMENT_IDS)
+    cl = ELEMENT_IDS.index("Cl")
+    inv = np.full((n, n_elem), 1e-23)
+    inv[:, ELEMENT_IDS.index("K")] = 2e-12
+    inv[:, ELEMENT_IDS.index("Na")] = 5e-13
+    g_bnd = np.zeros(n)
+    g_bnd[0] = 2.0
+    c_res = np.zeros(n_elem)
+    c_res[cl] = 4e-13
+    c_res[ELEMENT_IDS.index("Na")] = 4e-13
+    bath = transport.BoundaryBath(g_bnd=g_bnd, c_res=c_res)
+    ex = transport.exchange_be(graph, inv.copy(), 0.9, 0.5, bath=bath)
+    assert ex.status == "ok"
+    new = inv + ex.delta
+    assert np.all(new >= 0.0)
+    assert ex.repair_rel <= 1e-11
+    assert new[:, cl].max() > 1e-13           # the column really filled
