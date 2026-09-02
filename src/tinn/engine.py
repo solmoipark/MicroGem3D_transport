@@ -145,8 +145,10 @@ class Engine:
                 python_executable=(os.environ.get("TINN_GEMS_PYTHON")
                                    or config.chemistry.gems_worker_python),
                 work_root=None)
-            self.backend = GemsBackend(worker, config.temperature_K,
-                                       registry=self.registry)
+            self.backend = GemsBackend(
+                worker, config.temperature_K, registry=self.registry,
+                suppressed_species=tuple(config.chemistry.suppressed_species or ()),
+                suppressed_phases=tuple(config.chemistry.suppressed_phases or ()))
         self.kinetics = kinetics or make_kinetics(config)
         self.hydrate_ids = tuple(self.backend.hydrate_ids)
         # E1 endmember metadata (PRD 2.3 rev.3): backend-declared; a backend
@@ -424,8 +426,10 @@ class Engine:
         names = worker.info()["phase_names"]
         solids = tuple(p for p in names
                        if not p.lower().startswith(("aq", "gas")))
-        res = worker.equilibrate_elements(elements, temperature_k=t_k,
-                                          suppressed_phases=solids)
+        res = worker.equilibrate_elements(
+            elements, temperature_k=t_k, suppressed_phases=solids,
+            suppressed_species=tuple(
+                self.config.chemistry.suppressed_species or ()))
         ids = tuple(self.backend.aq_species_ids)
         spec = res.aqueous_species_mol or {}
         vec = np.zeros(len(ids))

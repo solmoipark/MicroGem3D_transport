@@ -25,7 +25,17 @@
   "chemistry": {
     "backend": "gems3k",
     "gems_bundle_lst": "gems_bundles/PC-Cl/MySystem-dat.lst",
-    "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe"
+    "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe",
+    "suppressed_species": [
+      "HS-",
+      "H2S@",
+      "S-2",
+      "S2O3-2",
+      "HSO3-",
+      "SO3-2",
+      "H2S",
+      "Sulfur"
+    ]
   },
   "schedule": {
     "output_times_h": [

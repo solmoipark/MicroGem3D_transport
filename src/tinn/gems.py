@@ -45,6 +45,12 @@ BULK_VERIFY_RTOL = 1e-10
 # input scale keeps the injected mass ~1e-7 relative (below the ledger's 1e-6
 # injected-excess bound) while still converging (1e-10 does not)
 O2_SEED_MOL_O = 1e-9
+# RT-S3: the reduced-sulfur species of cemdata18 (aqueous + native sulfur)
+# and the sulfide phases of the PC bundle - the S(VI)-only exclusion set a
+# config declares via chemistry.suppressed_species / suppressed_phases
+REDUCED_SULFUR_SPECIES = ("HS-", "H2S@", "S-2", "S2O3-2", "HSO3-", "SO3-2",
+                          "H2S", "Sulfur")
+SULFIDE_PHASES = ("Pyrite", "Troilite")
 
 
 class GemsError(RuntimeError):
@@ -323,9 +329,12 @@ class GemsWorker:
     def equilibrate_elements(self, element_mol: Mapping[str, float],
                              temperature_k: float, pressure_pa: float = 1e5,
                              suppressed_phases: Sequence[str] = SUPPRESSED_CLINKER_PHASES,
+                             suppressed_species: Sequence[str] = (),
                              ) -> GemsResult:
         """Cold-start equilibration of an authoritative element inventory with
-        clinker phases suppressed (bound=0)."""
+        clinker phases suppressed (bound=0). suppressed_species (RT-S3) are
+        dependent components excluded the same way (typo-guarded by the
+        worker, leak-witnessed here)."""
         for el, v in element_mol.items():
             if el == CHARGE_ELEMENT_ID:
                 if v != 0.0:
@@ -353,6 +362,7 @@ class GemsWorker:
             "temperature_k": float(temperature_k),
             "pressure_pa": float(pressure_pa),
             "suppressed_phases": list(suppressed_phases),
+            "suppressed_species": [str(s) for s in suppressed_species],
         })
         # suppression witness, mirroring the engine path (gems.py react):
         # bound=0 leaves numerical dust, anything material means the
@@ -373,6 +383,19 @@ class GemsWorker:
                     f"(known xgems issue for some solid solutions, e.g. "
                     f"CO3_SO4_AFt); drop it from the request or treat the "
                     f"result as unsuppressed", kind="internal")
+        for sp in suppressed_species:
+            # aqueous species travel in aqueous_species_mol (protocol v2),
+            # the others per phase - a witness reading one map only would
+            # be blind to the very HS- this exclusion exists for
+            amt = float((result.aqueous_species_mol or {}).get(sp, 0.0))
+            for d in (result.phase_species_mol or {}).values():
+                if isinstance(d, dict):
+                    amt += float(d.get(sp, 0.0))
+            if amt > 1e-9 * total_in:
+                raise GemsError(
+                    f"suppressed species {sp} formed {amt!r} mol (input total "
+                    f"{total_in!r}) - species suppression leaked",
+                    kind="internal")
         return result
 
     # --------------------------------------------------------------- private
@@ -507,7 +530,8 @@ class GemsBackend:
     mode = "snapshot"
 
     def __init__(self, worker: GemsWorker, temperature_k: float,
-                 registry=None):
+                 registry=None, suppressed_species: Sequence[str] = (),
+                 suppressed_phases: Sequence[str] = ()):
         from collections import OrderedDict
         from .registry import (ELEMENT_IDS, KINETIC_PHASE_IDS, default_registry,
                                element_vector)
@@ -533,6 +557,11 @@ class GemsBackend:
         # hard-errors on unknown suppression names by design (typo guard)
         self._suppressed = tuple(p for p in SUPPRESSED_CLINKER_PHASES
                                  if p in set(info["phase_names"]))
+        # RT-S3: config-declared exclusions ride the same request; unknown
+        # names are the worker's typo guard, leaks are witnessed per call
+        self._suppressed = self._suppressed + tuple(
+            p for p in suppressed_phases if p not in self._suppressed)
+        self._suppressed_species = tuple(suppressed_species)
         # E1 (PRD 2.3 rev.3): endmember universe per hydrate channel and each
         # endmember's element row — both straight from the bundle (info's
         # phase_species + DCH stoichiometry matrix), never hardcoded
@@ -638,7 +667,8 @@ class GemsBackend:
         else:
             try:
                 r = self._worker.equilibrate_elements(
-                    scaled, self.temperature_k, suppressed_phases=self._suppressed)
+                    scaled, self.temperature_k, suppressed_phases=self._suppressed,
+                    suppressed_species=self._suppressed_species)
             except GemsError as e:
                 if e.kind in ("nonconvergence", "timeout"):
                     raise BackendTransientError(str(e)) from e
@@ -662,7 +692,7 @@ class GemsBackend:
         for phase, mol_scaled in r.phase_amounts_mol.items():
             if phase in (AQUEOUS_PHASE, GAS_PHASE) or mol_scaled <= 0.0:
                 continue
-            if phase in SUPPRESSED_CLINKER_PHASES:
+            if phase in self._suppressed:
                 # suppression (bound=0) can leave numerical dust; dust elements
                 # stay in solution, anything material is precipitating clinker.
                 # The threshold is relative to the call's own input magnitude so
@@ -764,6 +794,10 @@ def run_0d_probe(config, worker: GemsWorker,
     kin = make_kinetics(config)
     present = set(worker.info()["phase_names"])
     suppressed = tuple(p for p in SUPPRESSED_CLINKER_PHASES if p in present)
+    suppressed = suppressed + tuple(
+        p for p in (config.chemistry.suppressed_phases or ())
+        if p not in suppressed)
+    suppressed_species = tuple(config.chemistry.suppressed_species or ())
     times = list(times_h if times_h is not None else config.schedule.output_times_h)
     n0 = {p: config.binder.mass_fractions.get(p, 0.0) / reg.get(p).molar_mass_g_mol
           for p in KINETIC_PHASE_IDS}  # mol per g binder
@@ -789,7 +823,8 @@ def run_0d_probe(config, worker: GemsWorker,
             elements[el] = elements.get(el, 0.0) + water_mol * count
 
         result = worker.equilibrate_elements(elements, config.temperature_K,
-                                             suppressed_phases=suppressed)
+                                             suppressed_phases=suppressed,
+                                             suppressed_species=suppressed_species)
         rows.append({
             "time_h": t,
             "alpha": {p: float(alpha[k]) for k, p in enumerate(KINETIC_PHASE_IDS)},
@@ -931,7 +966,34 @@ def _worker_execute(request: Mapping,
         missing = sorted(set(suppressed) - {str(p) for p in engine.phase_names})
         if missing:
             raise ValueError(f"bundle lacks phases requested for suppression: {missing}")
+        # a cached engine KEEPS phase suppression across clear()/cold_start()
+        # too (measured, RT-S3: a request that suppressed Pyrite left it
+        # suppressed for the next plain request) - re-activate the previous
+        # request's set so every request starts from one activation state
+        phase_key = str(dat) + "#suppressed_phases"
+        if engine_cache is not None and engine_cache.get(phase_key):
+            engine.activate_multiple_phases(list(engine_cache[phase_key]))
         engine.suppress_multiple_phases(suppressed)
+        if engine_cache is not None:
+            engine_cache[phase_key] = list(suppressed)
+        # RT-S3 species exclusion. A cached engine KEEPS species suppression
+        # across clear()/cold_start() (measured), unlike the per-request
+        # phase list, so the previous request's set is re-activated first -
+        # every request then starts from the same activation state.
+        species_req = [str(s) for s in request.get("suppressed_species", [])]
+        meta_key = str(dat) + "#suppressed_species"
+        if engine_cache is not None and engine_cache.get(meta_key):
+            engine.activate_multiple_species(list(engine_cache[meta_key]))
+        if species_req:
+            names = engine.species_names
+            names = {str(s) for s in (names() if callable(names) else names)}
+            missing = sorted(set(species_req) - names)
+            if missing:
+                raise ValueError(
+                    f"bundle lacks species requested for suppression: {missing}")
+            engine.suppress_multiple_species(species_req)
+        if engine_cache is not None:
+            engine_cache[meta_key] = list(species_req)
 
         requested = {str(k): float(v) for k, v in request["element_mol"].items()}
         if requested.get(CHARGE_ELEMENT_ID, 0.0) != 0.0:

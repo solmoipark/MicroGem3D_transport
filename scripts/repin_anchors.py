@@ -27,7 +27,7 @@ ANCHORS = {
     "A": ("examples/c3s_32.json", 3,
           "1490c624"),           # PRD 6.2 dense-hash authority prefix
     "B": ("examples/qualification/deschner_opc_q32_smoke_24h.json", 1,
-          "26df94e7"),
+          "83b0c6d9"),   # v6 (E=12) dense authority, PRD 6.2 (RT-Cl-1)
 }
 
 

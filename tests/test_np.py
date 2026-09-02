@@ -480,3 +480,65 @@ def test_exchange_be_repair_scale_follows_bath_filled_column():
     assert np.all(new >= 0.0)
     assert ex.repair_rel <= 1e-11
     assert new[:, cl].max() > 1e-13           # the column really filled
+
+
+# ------------------------------------------------ RT-S3: GEMS redox exclusions
+
+def test_chemistry_suppression_config_hash():
+    """RT-S3: undeclared exclusions keep every earlier gems3k hash; a
+    declared list changes it; the stoichiometric backend refuses them."""
+    from tinn.config import TinnConfig
+    raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"] = {"backend": "gems3k"}
+    h0 = TinnConfig.model_validate(raw).config_hash()
+    raw["chemistry"]["suppressed_species"] = None
+    raw["chemistry"]["suppressed_phases"] = None
+    assert TinnConfig.model_validate(raw).config_hash() == h0
+    raw["chemistry"]["suppressed_species"] = ["HS-"]
+    assert TinnConfig.model_validate(raw).config_hash() != h0
+    raw["chemistry"]["suppressed_species"] = []
+    with pytest.raises(ValueError, match="non-empty"):
+        TinnConfig.model_validate(raw)
+    raw["chemistry"] = {"backend": "stoichiometric",
+                        "suppressed_species": ["HS-"]}
+    with pytest.raises(ValueError, match="gems3k"):
+        TinnConfig.model_validate(raw)
+
+
+@needs_gems
+def test_gems_reduced_sulfur_suppression():
+    """RT-S3 (measured 2026-09-03): a 24 h OPC hydrate+solution system sits
+    at the H2/H2O redox floor and puts reduced sulfur into pyrite (PC) or
+    HS- (PC-Cl). Declaring the reduced-sulfur species and sulfide phases
+    keeps sulfur as S(VI): the witness sees them at dust level, sulfate
+    rises, and the cached worker engine restores activation for the next
+    plain request. An unknown species name is a hard error."""
+    from tinn.gems import (GemsError, REDUCED_SULFUR_SPECIES,
+                           SULFIDE_PHASES, SUPPRESSED_CLINKER_PHASES)
+    el = {"Ca": 1.785, "Si": 0.5057, "Al": 0.0982, "Fe": 0.0466,
+          "S": 0.1367, "K": 0.02311, "H": 20.60, "O": 13.72 + 1e-9}
+    w = GemsWorker(str(PC_BUNDLE), python_executable=str(GEMS_PYTHON))
+    try:
+        def s_species(r, name):
+            return float((r.aqueous_species_mol or {}).get(name, 0.0)) + sum(
+                float(d.get(name, 0.0))
+                for d in (r.phase_species_mol or {}).values()
+                if isinstance(d, dict))
+        present = set(w.info()["phase_names"])
+        clinker = tuple(p for p in SUPPRESSED_CLINKER_PHASES if p in present)
+        r0 = w.equilibrate_elements(el, 296.15)
+        pyrite0 = (r0.phase_amounts_mol or {}).get("Pyrite", 0.0)
+        assert pyrite0 > 1e-6 or s_species(r0, "HS-") > 1e-6
+        r1 = w.equilibrate_elements(
+            el, 296.15, suppressed_species=REDUCED_SULFUR_SPECIES,
+            suppressed_phases=clinker + SULFIDE_PHASES)
+        assert (r1.phase_amounts_mol or {}).get("Pyrite", 0.0) <= 1e-9 * sum(el.values())
+        assert s_species(r1, "HS-") <= 1e-9 * sum(el.values())
+        assert s_species(r1, "SO4-2") > s_species(r0, "SO4-2")
+        r2 = w.equilibrate_elements(el, 296.15)          # activation restored
+        assert (r2.phase_amounts_mol or {}).get("Pyrite", 0.0) == pytest.approx(pyrite0, rel=1e-6)
+        with pytest.raises(GemsError, match="lacks species"):
+            w.equilibrate_elements(el, 296.15, suppressed_species=("NoSuchSpecies",))
+    finally:
+        w.close()

@@ -108,15 +108,6 @@
     },
     "surface_species": [
       {
-        "reaction": "Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
-        "log_k": 0.5,
-        "sorbed_elements": {
-          "S": 1.0,
-          "O": 3.0,
-          "H": -1.0
-        }
-      },
-      {
         "reaction": "Surf_cOH + Cl- = Surf_cOHCl-",
         "log_k": 0.6,
         "sorbed_elements": {
@@ -125,7 +116,6 @@
       }
     ],
     "elements": [
-      "S",
       "Cl"
     ],
     "buffer_phase": "Portlandite"

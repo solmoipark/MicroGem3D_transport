@@ -316,9 +316,30 @@ class ChemistryConfig(BaseModel):
     # declared gel porosity per GEMS solid phase; phases absent from the map are
     # crystalline (0.0). GEMS volumes are solid skeletons; envelope = skel/(1-eps).
     gems_gel_porosity: Optional[Dict[str, float]] = None
+    # RT-S3 (2026-09-03): config-declared GEMS exclusions beyond the clinker
+    # phases. The ledger's O/H are oxide-exact, so the GEM system sits at the
+    # H2/H2O redox floor and reduces sulfate: with the PC bundle the reduced
+    # sulfur leaves as pyrite (measured 3-35 vox), with the user's PC-Cl
+    # export (no sulfide phases) it stays as 53 mM HS- in the pore solution
+    # and the sorption operator re-oxidised it into a 95 % sulfate store.
+    # Cement thermodynamics treats sulfur as S(VI): declare the reduced
+    # species (e.g. HS-, H2S@, S-2, S2O3-2, HSO3-, SO3-2, H2S, Sulfur) and
+    # sulfide phases (Pyrite, Troilite) here. Names are typo-guarded against
+    # the bundle; a suppressed name that still precipitates is an error.
+    # None keeps every earlier config hash.
+    suppressed_species: Optional[List[str]] = None
+    suppressed_phases: Optional[List[str]] = None
 
     @model_validator(mode="after")
     def _check(self) -> "ChemistryConfig":
+        for label, lst in (("suppressed_species", self.suppressed_species),
+                           ("suppressed_phases", self.suppressed_phases)):
+            if lst is not None:
+                if not lst or len(set(lst)) != len(lst) or any(
+                        not isinstance(x, str) or not x for x in lst):
+                    raise ValueError(
+                        f"chemistry.{label} must be a non-empty list of "
+                        f"distinct names (omit it instead of an empty list)")
         if self.backend == "gems3k":
             if self.stoichiometric_rules is not None:
                 raise ValueError("gems3k backend does not take stoichiometric_rules")
@@ -331,8 +352,11 @@ class ChemistryConfig(BaseModel):
                     raise ValueError(f"gel porosity of {phase} must be in [0, 1)")
             return self
         if (self.gems_bundle_lst is not None or self.gems_worker_python is not None
-                or self.gems_gel_porosity is not None):
-            raise ValueError("gems_* fields only apply to the gems3k backend")
+                or self.gems_gel_porosity is not None
+                or self.suppressed_species is not None
+                or self.suppressed_phases is not None):
+            raise ValueError("gems_* / suppressed_* fields only apply to the "
+                             "gems3k backend")
         if self.stoichiometric_rules is None:
             self.stoichiometric_rules = _default_rules()
         unknown = set(self.stoichiometric_rules) - set(KINETIC_PHASE_IDS)
@@ -1073,6 +1097,10 @@ class TinnConfig(BaseModel):
         # (override at runtime with the TINN_GEMS_PYTHON environment variable)
         if payload.get("chemistry"):
             payload["chemistry"].pop("gems_worker_python", None)
+            # RT-S3: undeclared GEMS exclusions keep the earlier hash
+            for key in ("suppressed_species", "suppressed_phases"):
+                if payload["chemistry"].get(key) is None:
+                    payload["chemistry"].pop(key, None)
             # legacy hash compatibility: configs that omit the gel-porosity map
             # hashed the pre-CNASH default, and the CNASH entry is inert for
             # bundles without that phase — canonicalize the built-in default
