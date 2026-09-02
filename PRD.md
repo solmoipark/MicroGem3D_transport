@@ -1104,6 +1104,50 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   수출 dbr을 정확 재현(pH 12.607/12.607, I 0.0597/0.0597, 상 조합 일치,
   폐합 4e-16; `gems_bundles/PC-Cl/PROVENANCE.md`). 후속: Cl 표면 수착
   보정(문헌), NaCl 배스 침투 qualification(결합 등온선 산출), 혼입 담체.
+- **RT-Cl-2 — Cl 표면 수착 보정 + 두 번째 사이트 풀 (2026-09-02)**:
+  문헌(`literature/chloride/`, rt-dev 색인). Hirao, Yamada, Takahashi & Zibara
+  2005 (J. Adv. Concr. Technol. 3(1) 77–84): C-S-H(C3S 수화, w/s 10, 56 d)
+  염화물 등온선 — 1 g 수화물/10 cm³ NaCl(0–5 M), 2 d, 20 °C, 흡인 여과;
+  CH 보정 Langmuir **q = 0.616·2.649C/(1+2.649C) mmol/g**(Fig. 7).
+  Elakneswaran, Nawa & Kurumisawa 2009 (CCR 39, 340–344): PHREEQC 표면착화
+  반응형 ≡SiOH+Cl⁻⇌≡SiOHCl⁻(DDL log K −0.35, ζ 피팅), Ca-매개
+  ≡SiOH+Ca²⁺+Cl⁻⇌≡SiOCaCl+H⁺, 실란올 −12.7/Ca −9.4(모두 DDL 고유값 —
+  no_edl에 이식 불가, S1c와 같은 이유). Plusquellec & Nonat 2016 (CCR 90,
+  89–96, in-situ ISE): Cl⁻·Br⁻·NO3⁻는 C-S-H에 특이 흡착하지 **않고** 확산층에
+  축적될 뿐이며 여과법의 "흡착"은 확산층 이온이 함께 걸린 것 — Hirao와
+  해석 상충. **결정**: 전달 계산에 필요한 양은 자유 용액에서 제거되는
+  총량이므로 Hirao를 **유효 등온선**(확산층 축적 포함)으로 채택하고 상충
+  해석을 기록. 포화 0.616 mmol/g은 실란올 총량(Labbez, 2.79 mmol/g)의
+  22%뿐 → 단일 풀 Langmuir로는 형상 재현 불가(q_max 2.79로 5 M 점을 맞추면
+  0.5 M에서 5배 과소) → Elakneswaran의 Ca-매개 사이트 해석에 따라 **독립
+  두 번째 사이트 풀 `Surf_c`**(Ca-장식 실란올) 도입. 스키마:
+  `sorption.site_density_c_mol_per_mol`(optional; None = 풀 없음, 기존 해시
+  불변 — 테스트), 반응은 `Surf_c` 참조로 풀 귀속(`SurfaceReaction.site_pool`),
+  한 반응이 두 풀에 걸치면·풀 밀도 없이 Surf_c 반응·반응 없이 밀도·ddl 하
+  Surf_c(전하 모형 미정의) 모두 거부. 연산자: SURFACE_MASTER_SPECIES에
+  `Surf_c`, SURFACE 블록의 두 번째 사이트 라인(면적·질량은 첫 줄만 —
+  PHREEQC 문법, no_edl에서 무관), 스케일 앵커·메모 키에 풀 합·c 사이트
+  편입, 빈 풀 생략, 폐합 증인은 행 합산이므로 무변경. 엔진: `site_em @
+  density_c` → `sites_c_mol`, 습윤/사이트 계약은 풀 합, 지표
+  `sorption_sites_c_mol`. 테스트 2(게이트·해시, 풀 독립성: c 사이트 0이면 Cl
+  0·SO4 결과 단일 풀과 1e-6 일치, c 사이트 있으면 Cl 상한 = 풀·점유 행
+  부기·증인 폐합, 미선언 풀 사이트 거부). **보정 실측**
+  (`scripts/fit_cl_logk.py`, 연산자 재현, CH 완충, 293.15 K, Surf_s 유휴):
+  Surf_c 총량을 Hirao 플래토로 고정(0.616 mmol/g = **0.119/Si = 0.070/Ca**,
+  Ca/Si 1.7·193 g/mol-Si), ≤1 M 4점 피팅 → **log K = +0.60**(SSE 2.9e-4;
+  ±0.05에서 3–5배). 재현 0.10/0.25/0.50/1.0 M: 0.138/0.249/0.345/0.434 vs
+  Hirao 0.129/0.245/0.351/0.447 mmol/g; 2/3/5 M 외삽 0.505/0.536/0.565 vs
+  0.518/0.547/0.573(2% 내 — 활동도 모형 범위 밖이므로 참고만). 교차 밴드:
+  Tang & Nilsson 1993 OPC 페이스트 Freundlich(사용자 TDM db,
+  mg/g-gel → mmol/g) 0.25/0.5/1/2 M에서 0.230/0.299/0.389/0.506 — 같은
+  자릿수, ±20%. Rd(20–50 mM) 1.6–1.8 L/kg. 엔드멤버 밀도(Ca 비례
+  0.070/Ca): TobH 0.0467, TobD 0.0583, JenH 0.0933, JenD 0.105;
+  KSiOH/NaSiOH 0(Ca 없음; s 풀은 Si 0.2 → 0.0953). 예제
+  `examples/qualification/chloride_ingress_opc32.json`(PC-Cl 번들, NaCl
+  0.5 M 배스 168→168.2 h, S+Cl 수착, CH 완충). 미결: Ca/Si 의존(Plusquellec는
+  Ca/Si 0.8–1.42에서 흡착 없음 — Tob 계열 풀 밀도는 Ca 비례 가정일 뿐),
+  온도 의존, AFm→Friedel/Kuzel은 GEMS(PC-Cl) 담당 — 수착은 C-S-H 풀만이라
+  중복 계상 없음.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올

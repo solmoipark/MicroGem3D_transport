@@ -400,9 +400,11 @@ def test_sorption_wetness_dust_contract():
 
 
 def test_sorption_nacl_carrier_decomposition():
-    """RT-S2a: chloride rides the NaCl carrier in the reactant
-    decomposition (E3 precursor). Exact closure round-trips; a Cl
-    surplus over Na is refused - no other carrier is declared."""
+    """RT-S2a/RT-Cl-2: chloride rides the NaCl carrier in the reactant
+    decomposition (E3 precursor), then KCl, and any remainder goes as
+    HCl whose proton the signed frame absorbs - exact closure round-trips
+    in every branch (the carriers are neutral, so PHREEQC's totals are
+    unchanged by the split)."""
     from tinn.backend import _decompose_to_reactants
 
     r = _decompose_to_reactants(
@@ -416,8 +418,14 @@ def test_sorption_nacl_carrier_decomposition():
     assert r2["NaCl"] == pytest.approx(0.05)
     assert r2["H2O"] == pytest.approx(0.0125)
     assert "O2" not in r2
-    with pytest.raises(ValueError, match="NaCl carrier"):
-        _decompose_to_reactants({"Cl": 0.5, "Na": 0.1, "O": 0.1, "H": 0.1})
+    r3 = _decompose_to_reactants(
+        {"Cl": 0.5, "Na": 0.1, "K": 0.15, "O": 0.1, "H": 0.1})
+    assert r3["NaCl"] == pytest.approx(0.1)
+    assert r3["KCl"] == pytest.approx(0.15)
+    assert r3["HCl"] == pytest.approx(0.25)
+    assert r3["H2O"] == pytest.approx((0.1 - 0.25) / 2.0)   # signed frame
+    assert r3["O2"] == pytest.approx((0.1 + 0.075) / 2.0)
+    assert "Na2O" not in r3 and "K2O" not in r3
 
 
 @needs_iphreeqc
@@ -492,3 +500,72 @@ def test_sorption_buffer_phase_desorbs_acid_reoffer():
     assert TinnConfig.model_validate(base).config_hash() == h0
     base["sorption"]["buffer_phase"] = "Portlandite"
     assert TinnConfig.model_validate(base).config_hash() != h0
+
+
+# ------------------------------------------------- RT-Cl-2: second site pool
+CL_RX = {"reaction": "Surf_cOH + Cl- = Surf_cOHCl-", "log_k": 0.5,
+         "sorbed_elements": {"Cl": 1.0}}
+
+
+def test_sorption_second_pool_config_gates():
+    """RT-Cl-2: the Surf_c pool is declared or it is not - a Surf_c
+    reaction without its density map, a map without a Surf_c reaction, a
+    reaction spanning both pools, and Surf_c under 'ddl' are refused; an
+    unset pool keeps every earlier sorption config hash."""
+    both = {"surface_species": [dict(SO4_RX), dict(CL_RX)],
+            "elements": ["S", "Cl"]}
+    with pytest.raises(ValueError, match="site_density_c_mol_per_mol"):
+        _sorption_cfg(**both)
+    with pytest.raises(ValueError, match="no reaction uses the Surf_c"):
+        _sorption_cfg(site_density_c_mol_per_mol={"CSHQ-JenH": 0.1})
+    with pytest.raises(ValueError, match="spans both"):
+        _sorption_cfg(surface_species=[dict(SO4_RX), {
+            "reaction": "Surf_cOH + Surf_sOH + Cl- = Surf_cOHCl- + Surf_sOH",
+            "log_k": 0.0, "sorbed_elements": {"Cl": 1.0}}],
+            elements=["S", "Cl"],
+            site_density_c_mol_per_mol={"CSHQ-JenH": 0.1})
+    with pytest.raises(ValueError, match="no_edl only"):
+        _sorption_cfg(**both, site_density_c_mol_per_mol={"CSHQ-JenH": 0.1},
+                      surface_model="ddl",
+                      specific_area_m2_per_mol_site=1.254e5)
+    cfg = _sorption_cfg(**both, site_density_c_mol_per_mol={"CSHQ-JenH": 0.1})
+    assert [rx.site_pool for rx in cfg.surface_species] == ["s", "c"]
+    assert cfg.surface_species[1].bound_species == "Surf_cOHCl-"
+    base = json.loads((REPO / "examples" / "qualification"
+                       / "deschner_opc_q32_dt06_28d.json"
+                       ).read_text(encoding="utf-8"))
+    base["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.05},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"]}
+    h0 = TinnConfig.model_validate(base).config_hash()
+    base["sorption"]["site_density_c_mol_per_mol"] = None
+    assert TinnConfig.model_validate(base).config_hash() == h0
+
+
+@needs_iphreeqc
+def test_sorption_second_pool_operator_independent():
+    """RT-Cl-2: Cl- binds on the Surf_c pool only - zero Surf_c sites sorb
+    no Cl and reproduce the single-pool SO4 result on Surf_s; with sites
+    the Cl uptake is bounded by the pool, the occupancy row books it, and
+    the closure witness holds; sites for an undeclared pool are refused."""
+    from tinn.backend import SorptionOperator
+    cl, s_i = ELEMENT_IDS.index("Cl"), ELEMENT_IDS.index("S")
+    e = _solution()
+    e[ELEMENT_IDS.index("Na")] += 1.0e-3
+    e[cl] += 1.0e-3
+    two = SorptionOperator(_sorption_cfg(
+        surface_species=[dict(SO4_RX), dict(CL_RX)], elements=["S", "Cl"],
+        site_density_c_mol_per_mol={"CSHQ-JenH": 0.1}), 298.15)
+    one = SorptionOperator(_sorption_cfg(), 298.15)
+    r0 = two.sorb(e, 2.0, 3.0e-4, sites_c_mol=0.0)
+    assert r0.sorbed_mol[cl] == 0.0
+    assert r0.sorbed_mol[s_i] == pytest.approx(
+        one.sorb(e, 2.0, 3.0e-4).sorbed_mol[s_i], rel=1e-6)
+    r1 = two.sorb(e, 2.0, 3.0e-4, sites_c_mol=1.0e-4)
+    assert 0.0 < r1.sorbed_mol[cl] <= 1.0e-4
+    assert r1.site_occupancy["Surf_cOHCl-"] == pytest.approx(r1.sorbed_mol[cl])
+    assert r1.sorbed_mol[s_i] == pytest.approx(r0.sorbed_mol[s_i], rel=5e-2)
+    with pytest.raises(ValueError, match="Surf_c pool"):
+        one.sorb(e, 2.0, 3.0e-4, sites_c_mol=1.0e-4)

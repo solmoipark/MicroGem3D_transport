@@ -685,10 +685,16 @@ class SurfaceReaction(BaseModel):
     def _check(self) -> "SurfaceReaction":
         if not math.isfinite(self.log_k):
             raise ValueError("surface reaction log_k must be finite")
-        if "=" not in self.reaction or "Surf_s" not in self.reaction:
+        pools = [p for p in ("Surf_s", "Surf_c") if p in self.reaction]
+        if "=" not in self.reaction or not pools:
             raise ValueError(
                 "surface reaction must be a PHREEQC equation over the "
-                "Surf_s site (e.g. 'Surf_sOH + SO4-2 = Surf_sSO4- + OH-')")
+                "Surf_s site (e.g. 'Surf_sOH + SO4-2 = Surf_sSO4- + OH-') "
+                "or the Surf_c pool (RT-Cl-2)")
+        if len(pools) == 2:
+            raise ValueError(
+                f"surface reaction {self.reaction!r} spans both site pools "
+                "- one reaction, one pool (Surf_s or Surf_c)")
         unknown = sorted(set(self.sorbed_elements) - set(ELEMENT_IDS))
         if unknown:
             raise ValueError(
@@ -709,9 +715,14 @@ class SurfaceReaction(BaseModel):
         rhs = self.reaction.split("=", 1)[1]
         for term in rhs.split(" + "):
             term = term.strip()
-            if term.startswith("Surf_s"):
+            if term.startswith("Surf_"):
                 return term
-        raise ValueError(f"no Surf_s product in {self.reaction!r}")
+        raise ValueError(f"no Surf_ product in {self.reaction!r}")
+
+    @property
+    def site_pool(self) -> str:
+        """'s' (silanol, Surf_s) or 'c' (RT-Cl-2 second pool, Surf_c)."""
+        return "c" if "Surf_c" in self.reaction else "s"
 
 
 class SorptionConfig(BaseModel):
@@ -743,6 +754,13 @@ class SorptionConfig(BaseModel):
     # Uncovered pool mass takes the global endmember fractions (the E2
     # feeding fallback), so the coverage gap adds no new assumption.
     site_density_mol_per_mol: Dict[str, float]
+    # RT-Cl-2: OPTIONAL second, independent site pool Surf_c - the
+    # Ca-decorated silanol sub-population that binds Cl- (Elakneswaran
+    # 2009 eq. 6). Hirao 2005 saturates C-S-H at 0.616 mmol/g = 22 % of
+    # the silanol total, so ONE pool cannot reproduce the isotherm shape.
+    # Same keys/units as site_density_mol_per_mol; None = no pool, and
+    # every earlier sorption config keeps its hash.
+    site_density_c_mol_per_mol: Optional[Dict[str, float]] = None
     surface_species: List[SurfaceReaction] = Field(min_length=1)
     # elements the operator may move (solutes only; O/H ride implicitly as
     # the protonation frame). A delta outside this list is a hard error.
@@ -767,6 +785,28 @@ class SorptionConfig(BaseModel):
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(
                     f"site_density_mol_per_mol[{k!r}] must be finite >= 0")
+        c_rxs = [rx for rx in [*self.surface_species, *self.charging_reactions]
+                 if rx.site_pool == "c"]
+        if self.site_density_c_mol_per_mol is not None:
+            if not self.site_density_c_mol_per_mol:
+                raise ValueError(
+                    "site_density_c_mol_per_mol must not be empty")
+            for k, v in self.site_density_c_mol_per_mol.items():
+                if not math.isfinite(v) or v < 0.0:
+                    raise ValueError(
+                        f"site_density_c_mol_per_mol[{k!r}] must be finite >= 0")
+            if not c_rxs:
+                raise ValueError(
+                    "site_density_c_mol_per_mol given but no reaction uses "
+                    "the Surf_c pool (no silent ignore)")
+            if self.surface_model == "ddl":
+                raise ValueError(
+                    "the Surf_c pool is no_edl only - its charging is not "
+                    "modelled under 'ddl' (refused, no silent ignore)")
+        elif c_rxs:
+            raise ValueError(
+                f"reaction {c_rxs[0].reaction!r} uses the Surf_c pool but "
+                "site_density_c_mol_per_mol is not declared")
         allowed = set(self.elements) | {"O", "H"}
         for rx in [*self.surface_species, *self.charging_reactions]:
             bad = sorted(set(rx.sorbed_elements) - allowed)
@@ -1063,6 +1103,9 @@ class TinnConfig(BaseModel):
                 sorp.pop("charging_reactions", None)
             if sorp.get("buffer_phase") is None:
                 sorp.pop("buffer_phase", None)
+            # RT-Cl-2: the optional second site pool follows the same rule
+            if sorp.get("site_density_c_mol_per_mol") is None:
+                sorp.pop("site_density_c_mol_per_mol", None)
         # Piecewise timesteps were added after checkpoint format v3. An absent
         # schedule keeps every legacy config/checkpoint hash unchanged.
         if payload.get("schedule", {}).get("dt_windows") is None:

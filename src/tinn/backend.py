@@ -173,19 +173,27 @@ def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
     """elements -> {neutral reactant: mol}; exact-closure audited."""
     reactants: Dict[str, float] = {}
     o_used = 0.0
-    # Cl rides the NaCl carrier (E3 salt-carrier precedent): chloride has
-    # no neutral oxide, so it consumes Na 1:1 BEFORE the oxide sweep. A
-    # Cl surplus over Na is refused - no other carrier is declared.
+    # Cl has no neutral oxide: it rides the alkali it finds (NaCl, then
+    # KCl - E3 salt-carrier precedent) BEFORE the oxide sweep, and any
+    # remainder goes as HCl, whose proton the signed O/H frame below
+    # absorbs exactly. PHREEQC sees element TOTALS only and every carrier
+    # is neutral, so the split cannot change the equilibrium (RT-Cl-2;
+    # measured: bundle IC traces put ~1e-23 mol Cl into reactors whose
+    # Na is 1e-30, and the former NaCl-only rule refused the step).
     elements = dict(elements)
     cl = elements.pop("Cl", 0.0)
+    _CL_CARRIERS = (("Na", "NaCl"), ("K", "KCl"), ("H", "HCl"))
     if cl > 0.0:
-        na = elements.get("Na", 0.0)
-        if na + 1e-12 * max(na, cl) < cl:
-            raise ValueError(
-                f"Cl {cl} exceeds Na {na} - the NaCl carrier cannot "
-                f"represent this solution (no HCl/KCl carrier declared)")
-        reactants["NaCl"] = cl
-        elements["Na"] = na - cl
+        rest = cl
+        for cat, formula in _CL_CARRIERS[:2]:
+            take = min(max(elements.get(cat, 0.0), 0.0), rest)
+            if take > 0.0:
+                reactants[formula] = take
+                elements[cat] = elements.get(cat, 0.0) - take
+                rest -= take
+        if rest > 0.0:
+            reactants["HCl"] = rest
+            elements["H"] = elements.get("H", 0.0) - rest
     for formula, el, n_el, n_o in _SORB_OXIDES:
         amount = elements.get(el, 0.0)
         if amount <= 0.0:
@@ -211,14 +219,17 @@ def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
     if abs(o_left) > 1e-15 * scale:
         reactants["O2"] = o_left / 2.0
     rebuilt: Dict[str, float] = {el: 0.0 for el in elements}
-    nacl = reactants.get("NaCl", 0.0)
-    if nacl:
-        rebuilt["Cl"] = nacl
-        rebuilt["Na"] = rebuilt.get("Na", 0.0) + nacl
-    rebuilt["Cl"] = rebuilt.get("Cl", 0.0)
+    rebuilt["Cl"] = 0.0
+    for cat, formula in _CL_CARRIERS:
+        n = reactants.get(formula, 0.0)
+        if n:
+            rebuilt["Cl"] += n
+            rebuilt[cat] = rebuilt.get(cat, 0.0) + n
     if cl:
         elements["Cl"] = cl
-        elements["Na"] = elements["Na"] + cl
+        for cat, formula in _CL_CARRIERS:
+            elements[cat] = (elements.get(cat, 0.0)
+                             + reactants.get(formula, 0.0))
     for formula, el, n_el, n_o in _SORB_OXIDES:
         mol = reactants.get(formula, 0.0)
         rebuilt[el] = rebuilt.get(el, 0.0) + mol * n_el
@@ -281,6 +292,8 @@ class SorptionOperator:
             for el, v in rx.sorbed_elements.items():
                 self._rows[i, ELEMENT_IDS.index(el)] = float(v)
         self._whitelist = tuple(config.elements)
+        # RT-Cl-2: optional second binding-site pool of the same surface
+        self._has_c = config.site_density_c_mol_per_mol is not None
 
     # ------------------------------------------------------------- private
     def _instance(self):
@@ -290,10 +303,15 @@ class SorptionOperator:
             self._pp = PhreeqPython(database=dat.name,
                                     database_directory=dat.parent)
             lines = ["SURFACE_MASTER_SPECIES",
-                     "    Surf_s Surf_sOH",
-                     "SURFACE_SPECIES",
-                     "    Surf_sOH = Surf_sOH",
-                     "        log_k 0"]
+                     "    Surf_s Surf_sOH"]
+            if self._has_c:
+                lines.append("    Surf_c Surf_cOH")
+            lines += ["SURFACE_SPECIES",
+                      "    Surf_sOH = Surf_sOH",
+                      "        log_k 0"]
+            if self._has_c:
+                lines += ["    Surf_cOH = Surf_cOH",
+                          "        log_k 0"]
             for rx in [*self._cfg.surface_species,
                        *self._cfg.charging_reactions]:
                 lines += [f"    {rx.reaction}",
@@ -317,7 +335,8 @@ class SorptionOperator:
     def sorb(self, aqueous_elements: np.ndarray, water_mol: float,
              sorbent_sites_mol: float,
              temperature_k: Optional[float] = None,
-             buffer_mol: float = 0.0) -> SorptionResult:
+             buffer_mol: float = 0.0,
+             sites_c_mol: float = 0.0) -> SorptionResult:
         e = np.asarray(aqueous_elements, dtype=np.float64)
         zeros = np.zeros(len(ELEMENT_IDS))
         if buffer_mol < 0.0 or not math.isfinite(buffer_mol):
@@ -325,7 +344,13 @@ class SorptionOperator:
         if buffer_mol > 0.0 and self._cfg.buffer_phase is None:
             raise ValueError("buffer_mol given but the config declares no "
                              "sorption.buffer_phase")
-        if (sorbent_sites_mol <= 0.0 or water_mol <= 0.0
+        if sites_c_mol < 0.0 or not math.isfinite(sites_c_mol):
+            raise ValueError(f"sites_c_mol must be finite >= 0: {sites_c_mol}")
+        if sites_c_mol > 0.0 and not self._has_c:
+            raise ValueError("sites_c_mol given but the config declares no "
+                             "site_density_c_mol_per_mol (Surf_c pool)")
+        sites_all = float(sorbent_sites_mol) + float(sites_c_mol)
+        if (sites_all <= 0.0 or water_mol <= 0.0
                 or not np.any(e > 0.0)):
             # null fast path: no sites / no water / no solutes - identical
             # to the operator being absent (the S1a null gate)
@@ -341,6 +366,7 @@ class SorptionOperator:
                           "w": float(water_mol).hex(),
                           "s": float(sorbent_sites_mol).hex(),
                           "b": float(buffer_mol).hex(),
+                          "c": float(sites_c_mol).hex(),
                           "t": t_k.hex()})
         hit = self._memo.get(key)
         if hit is not None:
@@ -367,7 +393,7 @@ class SorptionOperator:
         # the deviation symmetrically; the joint factor keeps the
         # site/solution ratio - the physics - exact.
         peak = math.sqrt(float(e.max())
-                         * max(float(sorbent_sites_mol), float(buffer_mol)))
+                         * max(sites_all, float(buffer_mol)))
         s_fac = 1e-2 / peak
         e_s = e * s_fac
         # solutes: positive amounts only (fold dust below zero is dropped -
@@ -403,11 +429,19 @@ class SorptionOperator:
                       f"    Surf_sOH {sites_s!r} {area_m2!r} 1.0",
                       "END"]
         else:
-            lines += ["    1.0 moles",
-                      "SURFACE 1",
-                      f"    Surf_sOH {sites_s!r} 600.0 1.0",
-                      "    -no_edl",
-                      "END"]
+            lines += ["    1.0 moles", "SURFACE 1"]
+            # RT-Cl-2: the pools are independent binding sites of ONE
+            # surface; area/mass ride on the first site line only (PHREEQC
+            # syntax) and are inert under -no_edl. An empty pool is omitted.
+            first = True
+            for name, n in (("Surf_sOH", sites_s),
+                            ("Surf_cOH", sites_c_mol * s_fac)):
+                if n <= 0.0:
+                    continue
+                lines.append(f"    {name} {n!r} 600.0 1.0" if first
+                             else f"    {name} {n!r}")
+                first = False
+            lines += ["    -no_edl", "END"]
         if buffer_mol > 0.0:
             # RT-S1d: the reactor's owned buffer phase equilibrates WITH the
             # surface, so desorption can draw the base it needs from CH

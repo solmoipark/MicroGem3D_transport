@@ -306,6 +306,7 @@ class Engine:
         # the reactor, same as the chemistry.
         self._sorb_op = None
         self._sorb_density = None
+        self._sorb_density_c = None
         if config.sorption is not None:
             if "CSHQ" not in self.hydrate_ids:
                 raise RuntimeError(
@@ -327,6 +328,15 @@ class Engine:
             self._sorb_density = np.array(
                 [config.sorption.site_density_mol_per_mol.get(dc, 0.0)
                  for dc in cshq_dcs])
+            dens_c = config.sorption.site_density_c_mol_per_mol
+            if dens_c is not None:
+                unknown = sorted(set(dens_c) - set(cshq_dcs))
+                if unknown:
+                    raise RuntimeError(
+                        f"site_density_c_mol_per_mol names endmembers "
+                        f"{unknown} the bundle's CSHQ does not declare")
+                self._sorb_density_c = np.array(
+                    [dens_c.get(dc, 0.0) for dc in cshq_dcs])
             self._sorb_buffer_h = None
             if config.sorption.buffer_phase is not None:
                 if config.sorption.buffer_phase not in self.hydrate_ids:
@@ -941,6 +951,7 @@ class Engine:
                 f_ch = f
 
         sorb_sites_mol = None
+        sorb_sites_c_mol = None
         sorb_cov_frac = 0.0
         own_vol = np.zeros((n_clusters, n_h))
         owned_elem = np.zeros((n_clusters, n_h, len(ELEMENT_IDS)))
@@ -1031,6 +1042,8 @@ class Engine:
                                + (amounts_full - covered_full)[:, None]
                                * g_ratio[None, :])
                     sorb_sites_mol = site_em @ self._sorb_density
+                    if self._sorb_density_c is not None:
+                        sorb_sites_c_mol = site_em @ self._sorb_density_c
                     sorb_cov_frac = (float(covered_full.sum())
                                      / max(float(amounts_full.sum()), 1e-30))
         if snapshot and dom_to_cl is not None and n_clusters > 0:
@@ -1111,6 +1124,8 @@ class Engine:
                     "the owned endmember split)")
             sites = (sorb_sites_mol if sorb_sites_mol is not None
                      else np.zeros(n_clusters))
+            sites_c = (sorb_sites_c_mol if sorb_sites_c_mol is not None
+                       else np.zeros(n_clusters))
             sorb_new = np.zeros_like(sorb_in)
             # S-stage wetness contract: a reactor is an aqueous phase only
             # when water dominates the solutes (mol ratio >= 10; real pore
@@ -1133,7 +1148,8 @@ class Engine:
             for c in range(n_clusters):
                 offer = inv_eff[c] + sorb_in[c]
                 if sorption_reactor_dry(float(water_mol_c[c]), offer,
-                                        dust_floor, float(sites[c])):
+                                        dust_floor,
+                                        float(sites[c] + sites_c[c])):
                     sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
                     n_sorb_dry += int(water_mol_c[c] > 0.0)
                     continue
@@ -1142,7 +1158,8 @@ class Engine:
                     buf_mol = max(float(owned_mol[c, self._sorb_buffer_h]),
                                   0.0)
                 res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
-                                         float(sites[c]), buffer_mol=buf_mol)
+                                         float(sites[c]), buffer_mol=buf_mol,
+                                         sites_c_mol=float(sites_c[c]))
                 sorb_new[c] = res.sorbed_mol
                 if buf_mol > 0.0 and res.buffer_delta_mol is not None:
                     # RT-S1d booking: what the buffer released into the
@@ -1197,6 +1214,7 @@ class Engine:
             exchange_metrics["sorbed_delta_mol"] = float(
                 np.abs(s_delta).sum())
             exchange_metrics["sorption_sites_mol"] = float(sites.sum())
+            exchange_metrics["sorption_sites_c_mol"] = float(sites_c.sum())
             exchange_metrics["sorption_pool_coverage"] = sorb_cov_frac
             exchange_metrics["sorption_dry_reactors"] = n_sorb_dry
             exchange_metrics["sorption_buffer_dissolved_mol"] = n_buffer_mol
