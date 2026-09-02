@@ -1,0 +1,123 @@
+{
+  "binder": {
+    "mass_fractions": {
+      "C3S": 0.571,
+      "C2S": 0.172,
+      "C3A": 0.04,
+      "C4AF": 0.13,
+      "hemihydrate": 0.026,
+      "anhydrite": 0.028,
+      "arcanite": 0.005
+    }
+  },
+  "w_c": 0.5,
+  "temperature_K": 296.15,
+  "kinetics": {
+    "kind": "pk",
+    "preset": "pk_elakneswaran_2018",
+    "blaine_m2_kg": 381.8
+  },
+  "rve": {
+    "grid_size": 32,
+    "voxel_size_um": 1.0,
+    "seed": 20260731
+  },
+  "chemistry": {
+    "backend": "gems3k",
+    "gems_bundle_lst": "gems_bundles/PC-Cl/MySystem-dat.lst",
+    "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe"
+  },
+  "schedule": {
+    "output_times_h": [
+      24.0,
+      168.0,
+      672.0,
+      672.05,
+      672.1,
+      672.2,
+      672.3,
+      672.4
+    ],
+    "dt_initial_h": 2.0,
+    "dt_min_h": 0.0005,
+    "max_retries": 8,
+    "dt_windows": [
+      {
+        "until_h": 24.0,
+        "dt_h": 2.0
+      },
+      {
+        "until_h": 672.0,
+        "dt_h": 6.0
+      },
+      {
+        "until_h": 672.4,
+        "dt_h": 0.0014
+      }
+    ]
+  },
+  "transport": {
+    "domains": {
+      "tile_vox": 8,
+      "tile_zyx": [
+        2,
+        32,
+        32
+      ],
+      "d0_m2_s": 1e-09,
+      "dirty_rtol": 0.001,
+      "eq_max_age_steps": 20
+    },
+    "boundary": {
+      "axis": "z",
+      "side": "low",
+      "start_h": 672.0,
+      "composition_mol_per_m3": {
+        "Na": 500.0,
+        "Cl": 500.0,
+        "O": 0.5
+      }
+    }
+  },
+  "sorption": {
+    "operator": "phreeqc_surface",
+    "phreeqc_dat": "gems_bundles/PHREEQC-cemdata18/cemdata18.dat",
+    "site_density_mol_per_mol": {
+      "CSHQ-TobH": 0.4766,
+      "CSHQ-TobD": 0.3178,
+      "CSHQ-JenH": 0.4766,
+      "CSHQ-JenD": 0.3178,
+      "KSiOH": 0.0953,
+      "NaSiOH": 0.0953
+    },
+    "site_density_c_mol_per_mol": {
+      "CSHQ-TobH": 0.0467,
+      "CSHQ-TobD": 0.0583,
+      "CSHQ-JenH": 0.0933,
+      "CSHQ-JenD": 0.105
+    },
+    "surface_species": [
+      {
+        "reaction": "Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+        "log_k": 0.5,
+        "sorbed_elements": {
+          "S": 1.0,
+          "O": 3.0,
+          "H": -1.0
+        }
+      },
+      {
+        "reaction": "Surf_cOH + Cl- = Surf_cOHCl-",
+        "log_k": 0.6,
+        "sorbed_elements": {
+          "Cl": 1.0
+        }
+      }
+    ],
+    "elements": [
+      "S",
+      "Cl"
+    ],
+    "buffer_phase": "Portlandite"
+  }
+}

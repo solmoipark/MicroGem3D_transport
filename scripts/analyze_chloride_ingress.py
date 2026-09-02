@@ -25,14 +25,16 @@ TRACK = ("Portlandite", "CSHQ")
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
-    run_dir = Path(sys.argv[1] if len(sys.argv) > 1
-                   else REPO / "runs" / "chloride_ingress_opc32")
+    args = [a for a in sys.argv[1:] if not a.startswith("cfg=")]
+    run_dir = Path(args[0] if args else REPO / "runs" / "chloride_ingress_opc32")
+    cfg_path = next((a[4:] for a in sys.argv[1:] if a.startswith("cfg=")),
+                    str(REPO / "examples" / "qualification"
+                        / "chloride_ingress_opc32.json"))
     ckpts = sorted(run_dir.glob("ckpt_*"))
     if not ckpts:
         raise SystemExit(f"no checkpoints under {run_dir}")
     cfg = TinnConfig.model_validate(json.loads(
-        (REPO / "examples" / "qualification" / "chloride_ingress_opc32.json")
-        .read_text(encoding="utf-8")))
+        Path(cfg_path).read_text(encoding="utf-8")))
     reg = registry_for(cfg)
     axis = {"z": 0, "y": 1, "x": 2}[cfg.transport.boundary.axis]
     other = tuple(a for a in range(3) if a != axis)
