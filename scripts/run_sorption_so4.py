@@ -58,10 +58,14 @@ def main() -> None:
     tag = "demo"
     density_map = None
     base = BASE
+    buffer = False
     for arg in sys.argv[1:]:
         key, _, val = arg.partition("=")
         if key == "base":
             base = (REPO / val).resolve()
+        elif key == "buffer":
+            # RT-S1d: the reactor's owned portlandite buffers the S stage
+            buffer = val not in ("0", "false", "")
         elif arg == "calibrated":
             log_k = CAL_LOG_K
             density_map = {dc: CAL_SITES_PER_SI * si
@@ -88,6 +92,9 @@ def main() -> None:
                              "sorbed_elements": dict(SO4_ROW)}],
         "elements": ["S"],
     }
+    if buffer:
+        raw["sorption"]["buffer_phase"] = "Portlandite"
+        tag = f"{tag}_buf"
     cfg = TinnConfig.model_validate(raw)
     out_dir = REPO / "runs" / f"sorption_so4_{tag}"
     if out_dir.exists():

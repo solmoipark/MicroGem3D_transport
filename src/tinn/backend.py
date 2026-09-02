@@ -166,6 +166,7 @@ _SORB_OXIDES = (
     ("K2O", "K", 2.0, 1.0), ("MgO", "Mg", 1.0, 1.0), ("CO2", "C", 1.0, 2.0),
 )
 _H2O_G_MOL = 18.015
+_BUFFER_ROWS = {"Portlandite": {"Ca": 1.0, "O": 2.0, "H": 2.0}}
 
 
 def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
@@ -238,6 +239,9 @@ class SorptionResult:
     status: str                       # "ok" (nonconvergence raises instead)
     sorbed_mol: np.ndarray            # (E,) equilibrium surface-bound elements
     site_occupancy: Dict[str, float]  # bound species -> mol (diagnostics)
+    # (E,) elements the pH BUFFER phase released INTO the solution (RT-S1d;
+    # negative = precipitated); zeros without a buffer
+    buffer_delta_mol: Optional[np.ndarray] = None
 
 
 class SorptionOperator:
@@ -301,22 +305,31 @@ class SorptionOperator:
                       "    -high_precision true",
                       "    -water true",
                       f"    -totals {punch_tot}",
-                      f"    -molalities {punch_mol}",
-                      "END"]
+                      f"    -molalities {punch_mol}"]
+            if self._cfg.buffer_phase is not None:
+                lines.append(
+                    f"    -equilibrium_phases {self._cfg.buffer_phase}")
+            lines.append("END")
             self._pp.ip.run_string("\n".join(lines))
         return self._pp
 
     # -------------------------------------------------------------- public
     def sorb(self, aqueous_elements: np.ndarray, water_mol: float,
              sorbent_sites_mol: float,
-             temperature_k: Optional[float] = None) -> SorptionResult:
+             temperature_k: Optional[float] = None,
+             buffer_mol: float = 0.0) -> SorptionResult:
         e = np.asarray(aqueous_elements, dtype=np.float64)
         zeros = np.zeros(len(ELEMENT_IDS))
+        if buffer_mol < 0.0 or not math.isfinite(buffer_mol):
+            raise ValueError(f"buffer_mol must be finite >= 0: {buffer_mol}")
+        if buffer_mol > 0.0 and self._cfg.buffer_phase is None:
+            raise ValueError("buffer_mol given but the config declares no "
+                             "sorption.buffer_phase")
         if (sorbent_sites_mol <= 0.0 or water_mol <= 0.0
                 or not np.any(e > 0.0)):
             # null fast path: no sites / no water / no solutes - identical
             # to the operator being absent (the S1a null gate)
-            return SorptionResult("ok", zeros, {})
+            return SorptionResult("ok", zeros, {}, zeros.copy())
         before = self._audit(self._dat)
         if before != self.baseline_audit:
             raise RuntimeError(
@@ -327,12 +340,15 @@ class SorptionOperator:
         key = json.dumps({"e": [v.hex() for v in e],
                           "w": float(water_mol).hex(),
                           "s": float(sorbent_sites_mol).hex(),
+                          "b": float(buffer_mol).hex(),
                           "t": t_k.hex()})
         hit = self._memo.get(key)
         if hit is not None:
             self._memo.move_to_end(key)
             return SorptionResult(hit.status, hit.sorbed_mol.copy(),
-                                  dict(hit.site_occupancy))
+                                  dict(hit.site_occupancy),
+                                  None if hit.buffer_delta_mol is None
+                                  else hit.buffer_delta_mol.copy())
 
         # equilibrium is intensive: scale (solution, water, sites) jointly
         # to the canonical magnitude where IPhreeqc converges - RVE ledger
@@ -350,7 +366,8 @@ class SorptionOperator:
         # (A(H2O) nonconvergence, measured). The geometric mean splits
         # the deviation symmetrically; the joint factor keeps the
         # site/solution ratio - the physics - exact.
-        peak = math.sqrt(float(e.max()) * float(sorbent_sites_mol))
+        peak = math.sqrt(float(e.max())
+                         * max(float(sorbent_sites_mol), float(buffer_mol)))
         s_fac = 1e-2 / peak
         e_s = e * s_fac
         # solutes: positive amounts only (fold dust below zero is dropped -
@@ -391,6 +408,15 @@ class SorptionOperator:
                       f"    Surf_sOH {sites_s!r} 600.0 1.0",
                       "    -no_edl",
                       "END"]
+        if buffer_mol > 0.0:
+            # RT-S1d: the reactor's owned buffer phase equilibrates WITH the
+            # surface, so desorption can draw the base it needs from CH
+            # instead of acidifying a closed pseudo-solution; its delta is
+            # returned for the engine to book solution <-> CH pool.
+            lines.insert(len(lines) - 1,
+                         "EQUILIBRIUM_PHASES 1\n"
+                         f"    {self._cfg.buffer_phase} 0.0 "
+                         f"{buffer_mol * s_fac!r}")
         pp = self._instance()
         try:
             pp.ip.run_string("\n".join(lines))
@@ -416,6 +442,13 @@ class SorptionOperator:
             n_i = float(last[col[f"m_{sp}(mol/kgw)"]]) * kgw / s_fac
             occupancy[sp] = n_i
             sorbed += n_i * self._rows[i]
+        buffer_delta = np.zeros(len(ELEMENT_IDS))
+        if buffer_mol > 0.0:
+            # d_<phase> = moles of the phase formed (+) / dissolved (-)
+            d_phase = float(last[col[f"d_{self._cfg.buffer_phase}"]]) / s_fac
+            for el, v in _BUFFER_ROWS[self._cfg.buffer_phase].items():
+                buffer_delta[ELEMENT_IDS.index(el)] = -d_phase * v
+            occupancy["_buffer_dissolved_mol"] = -d_phase
         # closure witness: for every whitelisted element the config-declared
         # rows must reproduce PHREEQC's own solution balance - a wrong
         # sorbed_elements declaration is refused, never absorbed
@@ -424,7 +457,7 @@ class SorptionOperator:
         for el in self._whitelist:
             k = ELEMENT_IDS.index(el)
             aq_after = float(last[col[f"{el}(mol/kgw)"]]) * kgw / s_fac
-            drift = abs((e[k] - aq_after) - sorbed[k])
+            drift = abs((e[k] + buffer_delta[k] - aq_after) - sorbed[k])
             if drift > 1e-8 * scale + 1e-18:
                 raise RuntimeError(
                     f"sorbed_elements for {el} disagrees with PHREEQC's "
@@ -434,9 +467,10 @@ class SorptionOperator:
         after = self._audit(self._dat)
         if after != self.baseline_audit:
             raise RuntimeError("sorption dat changed during the call")
-        result = SorptionResult("ok", sorbed, occupancy)
+        result = SorptionResult("ok", sorbed, occupancy, buffer_delta)
         self._memo[key] = SorptionResult("ok", sorbed.copy(),
-                                         dict(occupancy))
+                                         dict(occupancy),
+                                         buffer_delta.copy())
         if len(self._memo) > self.memo_cap:
             self._memo.popitem(last=False)
         return result

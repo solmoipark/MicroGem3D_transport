@@ -324,6 +324,22 @@ class Engine:
             self._sorb_density = np.array(
                 [config.sorption.site_density_mol_per_mol.get(dc, 0.0)
                  for dc in cshq_dcs])
+            self._sorb_buffer_h = None
+            if config.sorption.buffer_phase is not None:
+                if config.sorption.buffer_phase not in self.hydrate_ids:
+                    raise RuntimeError(
+                        f"sorption.buffer_phase {config.sorption.buffer_phase!r}"
+                        f" is not a hydrate channel of this bundle")
+                self._sorb_buffer_h = self.hydrate_ids.index(
+                    config.sorption.buffer_phase)
+                if (config.transport is not None and getattr(
+                        config.transport, "exchange_tau_h", None)
+                        is not None):
+                    raise RuntimeError(
+                        "sorption.buffer_phase with mode B "
+                        "(exchange_tau_h) is not supported yet - the "
+                        "buffer delta would bypass the withheld/offered "
+                        "split (refused, no silent inconsistency)")
             from .backend import SorptionOperator
             self._sorb_op = SorptionOperator(config.sorption,
                                              config.temperature_K)
@@ -1102,6 +1118,8 @@ class Engine:
             # dust cluster scaled to a ~7e4 mol/kg "solution" and broke
             # IPhreeqc's A(H2O) convergence).
             n_sorb_dry = 0
+            n_buffer_mol = 0.0
+            sorb_buffer_bd = np.zeros_like(inv_eff)
             # dust clause: an offer whose solute total sits at the ledger's
             # float-noise floor (same style as the overdraw guard below)
             # is not a chemical system either - water-rich micro-reactors
@@ -1116,9 +1134,26 @@ class Engine:
                     sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
                     n_sorb_dry += int(water_mol_c[c] > 0.0)
                     continue
+                buf_mol = 0.0
+                if self._sorb_buffer_h is not None:
+                    buf_mol = max(float(owned_mol[c, self._sorb_buffer_h]),
+                                  0.0)
                 res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
-                                         float(sites[c]))
+                                         float(sites[c]), buffer_mol=buf_mol)
                 sorb_new[c] = res.sorbed_mol
+                if buf_mol > 0.0 and res.buffer_delta_mol is not None:
+                    # RT-S1d booking: what the buffer released into the
+                    # solution is taken off the SOLIDS the R stage receives
+                    # (not off owned_elem - the solids ledger is updated as
+                    # parcels minus the owned/fed amounts, so touching the
+                    # fed amount double-counts; measured: balance_element
+                    # Ca,H,O reject at 6 h). R then sees solids + solution
+                    # as one conserved system and re-decides the assemblage.
+                    bd = res.buffer_delta_mol
+                    inv_eff[c] = inv_eff[c] + bd
+                    sorb_buffer_bd[c] = bd
+                    # Portlandite = Ca(OH)2: one Ca per mol of buffer
+                    n_buffer_mol += float(bd[ELEMENT_IDS.index("Ca")])
             s_delta = sorb_new - sorb_in
             inv_eff = inv_eff - s_delta
             # O/H are signed frame columns (S1-OPEN-1): desorption at an
@@ -1161,6 +1196,7 @@ class Engine:
             exchange_metrics["sorption_sites_mol"] = float(sites.sum())
             exchange_metrics["sorption_pool_coverage"] = sorb_cov_frac
             exchange_metrics["sorption_dry_reactors"] = n_sorb_dry
+            exchange_metrics["sorption_buffer_dissolved_mol"] = n_buffer_mol
 
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
@@ -1170,12 +1206,20 @@ class Engine:
                 # economy deferral: element-exact, assemblage frozen, no
                 # water consumed; supersaturation accumulates in the
                 # inventory until the dirty trigger or age bound fires
+                if sorb_new is not None and np.any(sorb_buffer_bd[c] != 0.0):
+                    # RT-S1d: a frozen assemblage cannot consummate the
+                    # buffer transfer - take it back (same rule as the
+                    # failed-GEM pocket below)
+                    inv_eff[c] = inv_eff[c] - sorb_buffer_bd[c]
+                    sorb_buffer_bd[c] = 0.0
                 residual[c] = inv_eff[c] + released_elem[c]
                 continue
             has_solids = snapshot and offered_vol[c].sum() > 0.0
             has_inventory = bool(np.any(inv_eff[c] != 0.0))
             if not rel and not has_solids and not has_inventory:
-                residual[c] = inv_eff[c]
+                # RT-S1d: an unsolved reactor takes the buffer transfer back
+                residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
+                               if sorb_new is not None else inv_eff[c])
                 continue
             water_c = float(water_mol_c[c])
             inv_flushed = False
@@ -1197,6 +1241,10 @@ class Engine:
             transient_failures = 0
             failure_reason: Optional[str] = None
             solid_elem_c = owned_elem[c].sum(axis=0) if has_solids else None
+            if solid_elem_c is not None and sorb_new is not None:
+                # RT-S1d: the buffer's dissolved share already sits in the
+                # solution (inv_eff) - hand R the solids net of it
+                solid_elem_c = solid_elem_c - sorb_buffer_bd[c]
             for _ in range(60):
                 scaled = {p: v * s for p, v in rel.items()}
                 try:
@@ -1252,6 +1300,14 @@ class Engine:
             else:
                 failure_reason = backend_mod.STATUS_INSUFFICIENT_WATER
             if failure_reason is not None:
+                if sorb_new is not None and np.any(sorb_buffer_bd[c] != 0.0):
+                    # RT-S1d: the buffer transfer only exists through the R
+                    # stage consuming the reduced solids; a reactor whose
+                    # solids stay frozen here takes it back (conservation
+                    # first - measured: balance_element Ca,H,O at 24 h on a
+                    # trace-water pocket whose GEM call failed)
+                    inv_eff[c] = inv_eff[c] - sorb_buffer_bd[c]
+                    sorb_buffer_bd[c] = 0.0
                 # A nearly-dry pocket (e.g. dissolved inventory outweighing its
                 # trace water) can never equilibrate at ANY release scale. Its
                 # release goes back to the solid as honest unmet, its inventory
@@ -1259,7 +1315,9 @@ class Engine:
                 # a materially wet cluster failing this way rejects the trial.
                 if trace_water:
                     scale_c[c] = 0.0
-                    residual[c] = inv_eff[c]
+                    # RT-S1d: an unsolved reactor takes the buffer transfer back
+                    residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
+                                   if sorb_new is not None else inv_eff[c])
                     continue
                 if (dom_to_cl is not None and failure_reason
                         == backend_mod.STATUS_INSUFFICIENT_WATER):
@@ -1274,7 +1332,9 @@ class Engine:
                         exchange_metrics.get("water_frozen_domains", 0.0)
                         + 1.0)
                     scale_c[c] = 0.0
-                    residual[c] = inv_eff[c]
+                    # RT-S1d: an unsolved reactor takes the buffer transfer back
+                    residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
+                                   if sorb_new is not None else inv_eff[c])
                     continue
                 if (dom_to_cl is not None
                         and failure_reason == REJECT_BACKEND_FAILURE):
@@ -1294,7 +1354,9 @@ class Engine:
                         exchange_metrics.get("nonconv_frozen_domains", 0.0)
                         + 1.0)
                     scale_c[c] = 0.0
-                    residual[c] = inv_eff[c]
+                    # RT-S1d: an unsolved reactor takes the buffer transfer back
+                    residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
+                                   if sorb_new is not None else inv_eff[c])
                     continue
                 return None, StepReject(failure_reason), {}
             if snapshot:
@@ -1364,7 +1426,9 @@ class Engine:
                     freeze = deficit_est > gas_c_vol - 1e-12 * max(1.0, gas_c_vol)
                 if freeze:
                     scale_c[c] = 0.0
-                    residual[c] = inv_eff[c]
+                    # RT-S1d: an unsolved reactor takes the buffer transfer back
+                    residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
+                                   if sorb_new is not None else inv_eff[c])
                     continue
                 if dom_to_cl is not None:
                     cl_c = int(dom_to_cl[c])

@@ -731,6 +731,13 @@ class SorptionConfig(BaseModel):
     # complexation) - these SET the surface potential every ion feels; the
     # sorbed_elements rows book their solution deltas in the same ledger.
     charging_reactions: List[SurfaceReaction] = Field(default_factory=list)
+    # RT-S1d: pH buffer for the S-stage subsystem. The snapshot re-offer
+    # returns the store as SO3 while the base it released has gone to
+    # solids in the R stage, so without a buffer the operator solves an
+    # acid pseudo-solution (measured pH 0.7 / -0.3, PRD 4.6.5 S1-OPEN-2).
+    # "Portlandite" includes the reactor's OWNED CH as an equilibrium
+    # phase; its delta is booked solution <-> CH pool for the R stage.
+    buffer_phase: Optional[Literal["Portlandite"]] = None
     # sites per mol of each C-S-H endmember (bundle DC names; REQUIRED, no
     # defaults - the engine validates the keys against the bundle at S1b).
     # Uncovered pool mass takes the global endmember fractions (the E2
@@ -1054,6 +1061,8 @@ class TinnConfig(BaseModel):
                 sorp.pop("specific_area_m2_per_mol_site", None)
             if not sorp.get("charging_reactions"):
                 sorp.pop("charging_reactions", None)
+            if sorp.get("buffer_phase") is None:
+                sorp.pop("buffer_phase", None)
         # Piecewise timesteps were added after checkpoint format v3. An absent
         # schedule keeps every legacy config/checkpoint hash unchanged.
         if payload.get("schedule", {}).get("dt_windows") is None:

@@ -1053,6 +1053,24 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   으로 포함(양 = 소유 CH, 공동 스케일), CH 델타를 용액↔CH 풀에 기입해
   R이 재결정하도록(상 권위는 GEMS 유지, S는 완충만) — CH 부재계(용출·SCM)
   는 C-S-H 완충 후속. S1-OPEN-1(부호 프레임)은 이 위에서도 필요하다.
+- **RT-S1d — S 단계 완충 평형상 (2026-09-02, S1-OPEN-2 해법 구현)**:
+  `sorption.buffer_phase: "Portlandite"`(opt-in; null이면 해시·거동 불변).
+  S 단계 PHREEQC 계 = SOLUTION + SURFACE + **EQUILIBRIUM_PHASES
+  Portlandite(양 = 반응기 소유 CH, 공동 스케일 앵커에 포함)**. 연산자는
+  `d_Portlandite`를 읽어 `buffer_delta_mol`(용액으로 방출된 Ca1 O2 H2 벡터,
+  `_buffer_dissolved_mol` 진단)을 반환하고, 엔진은 같은 벡터를
+  `inv_eff[c]`(+)와 `owned_elem[c, CH]`(−)·`owned_mol[c, CH]`에 기입 — R
+  단계는 고체+용액을 하나의 보존계로 받아 상 조합을 재결정하므로 상 권위는
+  GEMS에 남고 S는 완충만 한다(폐합 자동). 폐합 증인은 완충 델타를 포함해
+  화이트리스트 원소를 대조. 모드 B(`exchange_tau_h`)와의 조합은 withheld/
+  offered 분할을 우회하므로 거부. CH 부재 반응기(용출·SCM)는 완충 0 → 이전
+  거동(후속: C-S-H 완충). **부기 규칙(실측으로 확정)**: ① 델타는 R에 넘기는
+  고체 원소에서만 빼고 `owned_elem`(급이량)은 건드리지 않는다 — 고체 원장은
+  "parcel − 급이량"으로 갱신되므로 급이량을 줄이면 이중 계상(6 h
+  balance_element Ca,H,O 실측); ② R이 고체를 소진하지 않는 반응기(GEM 실패
+  trace-water 포켓, 경제 모드 유예 도메인)는 전이를 되돌린다(24 h/37 h 실측).
+  게이트: 산성 재제공 오퍼가 완충 시 탈착·CH 용해(테스트), 엔진 폐합 런에
+  완충 동승(테스트), 해시 불가시(테스트). 실측은 아래 재실행 블록.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올

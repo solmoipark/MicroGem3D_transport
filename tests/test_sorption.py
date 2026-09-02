@@ -233,7 +233,10 @@ def test_sorption_engine_run_closes_and_restarts(tmp_path):
                            "CSHQ-TobH": 0.02, "CSHQ-TobD": 0.02,
                            "CSHQ-JenH": 0.02, "CSHQ-JenD": 0.02},
                        "surface_species": [dict(SO4_RX)],
-                       "elements": ["S"]}
+                       "elements": ["S"],
+                       # RT-S1d: the CH buffer rides the same run so the
+                       # closure gate covers its solution<->solids booking
+                       "buffer_phase": "Portlandite"}
     cfg = TinnConfig.model_validate(raw)
     straight, summary = Engine(cfg).run(out_dir=str(tmp_path / "run"))
     s_idx = ELEMENT_IDS.index("S")
@@ -433,3 +436,51 @@ def test_sorption_signed_oh_frame():
     assert res.status == "ok"
     assert res.site_occupancy["_frame_H2O_mol"] == pytest.approx(-1.0e-4)
     assert res.sorbed_mol[ELEMENT_IDS.index("S")] > 0.0
+
+
+@needs_iphreeqc
+def test_sorption_buffer_phase_desorbs_acid_reoffer():
+    """RT-S1d: a re-offered store whose released base has gone to solids
+    solves as an acid pseudo-solution and stays bound (S1-OPEN-2); with
+    the reactor's portlandite as a buffer equilibrium phase the same offer
+    desorbs, the buffer dissolves (delta booked, Ca released), and the
+    S witness still closes. buffer_phase null keeps the config hash."""
+    from tinn.backend import SorptionOperator
+
+    # a base-FREE re-offer (the released OH- went to solids): K2O + SO3 in
+    # excess of the base -> the closed pseudo-solution is acid and the
+    # OH-releasing exchange is driven to saturation
+    e = np.zeros(len(ELEMENT_IDS))
+    h = ELEMENT_IDS.index("H")
+    s_i, ca = ELEMENT_IDS.index("S"), ELEMENT_IDS.index("Ca")
+    e[ELEMENT_IDS.index("K")] = 1.0e-4
+    e[s_i] = 5.0e-4
+    e[ELEMENT_IDS.index("O")] = 0.5e-4 + 3.0 * 5.0e-4
+    e[h] = -2.0e-4
+    sites = 3.0e-4
+    plain = SorptionOperator(_sorption_cfg(), 298.15).sorb(e, 2.0, sites)
+    buf_cfg = _sorption_cfg(buffer_phase="Portlandite")
+    buffered = SorptionOperator(buf_cfg, 298.15).sorb(
+        e, 2.0, sites, buffer_mol=5.0e-3)
+    assert plain.sorbed_mol[s_i] > buffered.sorbed_mol[s_i]   # desorbs
+    bd = buffered.buffer_delta_mol
+    assert bd is not None and bd[ca] > 0.0                     # CH dissolved
+    assert bd[h] == pytest.approx(2.0 * bd[ca]) and bd[ELEMENT_IDS.index("O")] == pytest.approx(2.0 * bd[ca])
+    assert buffered.site_occupancy["_buffer_dissolved_mol"] == pytest.approx(bd[ca])
+    with pytest.raises(ValueError, match="buffer_phase"):
+        SorptionOperator(_sorption_cfg(), 298.15).sorb(e, 2.0, sites,
+                                                       buffer_mol=1e-3)
+
+    base = json.loads((REPO / "examples" / "qualification"
+                       / "deschner_opc_q32_dt06_28d.json"
+                       ).read_text(encoding="utf-8"))
+    base["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.05},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"]}
+    h0 = TinnConfig.model_validate(base).config_hash()
+    base["sorption"]["buffer_phase"] = None
+    assert TinnConfig.model_validate(base).config_hash() == h0
+    base["sorption"]["buffer_phase"] = "Portlandite"
+    assert TinnConfig.model_validate(base).config_hash() != h0
