@@ -329,6 +329,7 @@ class Engine:
                                              config.temperature_K)
         self._boundary = (config.transport.boundary
                           if config.transport is not None else None)
+        self._np_bath_species_vox = None
         if self._boundary is not None:
             self._b_axis = {"z": 0, "y": 1, "x": 2}[self._boundary.axis]
             self._b_low = self._boundary.side in ("low", "both")
@@ -351,6 +352,69 @@ class Engine:
             for el, c in self._boundary.composition_mol_per_m3.items():
                 c_res[ELEMENT_IDS.index(el)] = c * vox_m3
             self._c_res_vox = c_res
+            np_cfg = getattr(self, "_np_cfg", None)
+            solutes = any(v != 0.0 for el, v in
+                          self._boundary.composition_mol_per_m3.items()
+                          if el not in ("O", "H"))
+            if np_cfg is not None and not np_cfg.diagnostics_only and solutes:
+                self._np_bath_species_vox = self._speciate_bath(
+                    self._boundary.composition_mol_per_m3, vox_m3,
+                    config.temperature_K)
+
+    def _sorbent_weight(self, hydrate_fraction: np.ndarray,
+                        liquid: np.ndarray) -> np.ndarray:
+        """Remap weight field for the sorbed store: the voxel CSHQ volume
+        (the sorbent) with a 1e-9 x liquid floor so wet, C-S-H-free voxels
+        stay 'wet' for the remap helper but receive a negligible share."""
+        cshq = self.hydrate_ids.index("CSHQ")
+        return (np.asarray(hydrate_fraction[cshq], dtype=np.float64)
+                + 1e-9 * np.asarray(liquid, dtype=np.float64))
+
+    def _speciate_bath(self, comp_mol_per_m3, vox_m3: float,
+                       t_k: float) -> np.ndarray:
+        """RT-P0d: the fixed-composition reservoir gets ONE frozen aqueous
+        speciation (GEMS, every solid suppressed - the 0D suppression
+        witness refuses a leaking phase loudly) so the bath face can
+        carry species differences and a harmonic face mean like interior
+        edges. Returned in the frozen-speciation column order, per vox^3
+        of liquid (the c_res units)."""
+        worker = getattr(self.backend, "_worker", None)
+        if worker is None:
+            raise RuntimeError(
+                "a solute-bearing bath with species transport needs the "
+                "gems3k worker for the reservoir speciation")
+        # 1 L basis: solutes + 1 kg water, plus the relative O2 redox seed
+        # the 0D API needs on water-dominated systems (measured: sized on
+        # the solutes alone the GEM AIA fails)
+        elements = {el: float(c) * 1e-3
+                    for el, c in comp_mol_per_m3.items() if c != 0.0}
+        water_mol = 1000.0 / 18.015
+        elements["H"] = elements.get("H", 0.0) + 2.0 * water_mol
+        elements["O"] = elements.get("O", 0.0) + water_mol
+        elements["O"] += 1e-8 * sum(elements.values())
+        names = worker.info()["phase_names"]
+        solids = tuple(p for p in names
+                       if not p.lower().startswith(("aq", "gas")))
+        res = worker.equilibrate_elements(elements, temperature_k=t_k,
+                                          suppressed_phases=solids)
+        ids = tuple(self.backend.aq_species_ids)
+        spec = res.aqueous_species_mol or {}
+        vec = np.zeros(len(ids))
+        for k, dc in enumerate(ids):
+            vec[k] = float(spec.get(dc, 0.0)) * 1e3 * vox_m3   # /L -> /m3 -> /vox
+        z = np.asarray(self._np_z, dtype=np.float64)
+        charge = float(np.dot(z, vec))
+        scale = float(np.abs(z * vec).sum()) or 1.0
+        if abs(charge) > 1e-8 * scale:
+            raise RuntimeError(
+                f"bath speciation is not electroneutral (charge {charge!r} "
+                f"vs scale {scale!r}) - GEMS reservoir state rejected")
+        self._np_provenance["bath_species_mol_per_m3"] = {
+            dc: float(spec.get(dc, 0.0)) * 1e3 for dc in ids
+            if spec.get(dc, 0.0) > 0.0}
+        self._np_provenance["bath_ph"] = res.ph
+        self._np_provenance["bath_ionic_strength"] = res.ionic_strength
+        return vec
 
     # ------------------------------------------------------------------ setup
     def initial_state(self) -> SimulationState:
@@ -536,8 +600,16 @@ class Engine:
                         old_labels, prev_liquid, labels, prev_liquid,
                         spec_state_rows, n_clusters).inventory
                 if sorb_state_rows.shape[0] == old_n:
+                    # the sorbed store follows the SORBENT, not the water:
+                    # a liquid-weighted split hands a water-rich, C-S-H-
+                    # poor face reactor more store than it has sites, and
+                    # the forced desorption then consumes OH- the bath has
+                    # already leached (measured: H overdraw at the sulfate
+                    # exposure switch, 2026-09-02)
+                    sorb_w = self._sorbent_weight(state.hydrate_fraction,
+                                                  prev_liquid)
                     sorb_state_rows = transport.remap_inventories(
-                        old_labels, prev_liquid, labels, prev_liquid,
+                        old_labels, sorb_w, labels, sorb_w,
                         sorb_state_rows, n_clusters).inventory
 
         if inv_rows.shape[0] == n_clusters:
@@ -628,7 +700,9 @@ class Engine:
                     graph, spec_in, graph.water, self._np_dw_vox2_h,
                     self._np_z, self._np_nu,
                     g_bnd=(bath.g_bnd if bath is not None else None),
-                    c_res=(bath.c_res if bath is not None else None))
+                    c_res=(bath.c_res if bath is not None else None),
+                    c_res_species=(self._np_bath_species_vox
+                                   if bath is not None else None))
                 if self._np_cfg.phi_clamp_report:
                     for key, v in npc.counts.items():
                         exchange_metrics[key] = float(v)
@@ -1052,9 +1126,25 @@ class Engine:
                 worst = float(inv_eff[neg].min())
                 scale = float(np.abs(inv_eff).max())
                 if -worst > 1e-24 + 1e-12 * scale:
+                    rows_c, cols_e = np.nonzero(inv_eff < -(1e-24 + 1e-12 * scale))
+                    where = sorted({(int(c), ELEMENT_IDS[int(k)],
+                                     float(inv_eff[c, k]))
+                                    for c, k in zip(rows_c, cols_e)},
+                                   key=lambda t: t[2])[:4]
+                    c0 = where[0][0]
+                    pre = inv_eff[c0] + s_delta[c0]
+                    dump = {el: (float(pre[k]), float(sorb_in[c0, k]),
+                                 float(sorb_new[c0, k]))
+                            for k, el in enumerate(ELEMENT_IDS)
+                            if pre[k] != 0.0 or sorb_in[c0, k] != 0.0
+                            or sorb_new[c0, k] != 0.0}
                     raise RuntimeError(
                         f"sorption overdrew the pore solution by {worst:.3e}"
-                        f" mol - operator/config inconsistency (no clip)")
+                        f" mol - operator/config inconsistency (no clip); "
+                        f"worst (cluster, element, mol): {where}; cluster "
+                        f"{c0}: water {float(water_mol_c[c0])!r} mol, sites "
+                        f"{float(sites[c0])!r} mol, (pre-S inventory, "
+                        f"store in, store out) per element: {dump}")
                 inv_eff = np.where(neg, 0.0, inv_eff)
             sorption_bal = ledger.SorptionBalance(
                 applied_inventory_delta=(-s_delta).sum(axis=0),
@@ -1676,7 +1766,10 @@ class Engine:
             # mass with no wet successor anywhere - rejects the step like
             # the solution inventory does (mass must not vanish)
             sorb_remap = transport.remap_inventories(
-                labels, prev_liquid, new_labels, trial.capillary_liquid,
+                labels, self._sorbent_weight(state.hydrate_fraction,
+                                             prev_liquid),
+                new_labels, self._sorbent_weight(trial.hydrate_fraction,
+                                                 trial.capillary_liquid),
                 sorb_new, n_new)
             sorb_folds = []
             if sorb_remap.dryout:

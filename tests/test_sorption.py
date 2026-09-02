@@ -407,3 +407,29 @@ def test_sorption_nacl_carrier_decomposition():
     assert "O2" not in r2
     with pytest.raises(ValueError, match="NaCl carrier"):
         _decompose_to_reactants({"Cl": 0.5, "Na": 0.1, "O": 0.1, "H": 0.1})
+
+
+@needs_iphreeqc
+def test_sorption_signed_oh_frame():
+    """A re-offered ligand-exchange store can leave the offer's solute-
+    frame H negative (the released OH- precipitated in the R stage) or O
+    short of the oxide frame. Both encode EXACTLY as signed H2O/O2 terms
+    (closure round-trips), the operator accepts such an offer, reports
+    the frame terms, and its S witness still holds."""
+    from tinn.backend import SorptionOperator, _decompose_to_reactants
+
+    r = _decompose_to_reactants({"K": 1e-3, "S": 2e-3, "O": 6.5e-3,
+                                 "H": -1.5e-3})
+    assert r["H2O"] == pytest.approx(-7.5e-4)
+    # O: 6.5e-3 - (K2O 0.5e-3 + SO3 6e-3) - (-7.5e-4) = 7.5e-4 -> O2 +3.75e-4
+    assert r["O2"] == pytest.approx(3.75e-4)
+    r2 = _decompose_to_reactants({"K": 1e-3, "O": 3e-4, "H": 2e-4})
+    assert r2["O2"] == pytest.approx((3e-4 - 5e-4 - 1e-4) / 2.0)   # negative
+
+    op = SorptionOperator(_sorption_cfg(), 298.15)
+    e = _solution()
+    e[ELEMENT_IDS.index("H")] = -2.0e-4          # OH- owed to the frame
+    res = op.sorb(e, 2.0, 3e-4)
+    assert res.status == "ok"
+    assert res.site_occupancy["_frame_H2O_mol"] == pytest.approx(-1.0e-4)
+    assert res.sorbed_mol[ELEMENT_IDS.index("S")] > 0.0

@@ -969,19 +969,10 @@ class TinnConfig(BaseModel):
                 raise ValueError(
                     "transport.domains.species needs the gems3k backend - "
                     "aqueous speciation comes from the GEMS responses")
-            # bath speciation is undefined for solute-bearing reservoirs:
-            # only water-derived elements (O, H - the aerated-water bath)
-            # may appear alongside species transport
-            if self.transport.boundary is not None:
-                bad = sorted(
-                    el for el, v
-                    in self.transport.boundary.composition_mol_per_m3.items()
-                    if v != 0.0 and el not in ("O", "H"))
-                if bad:
-                    raise ValueError(
-                        f"transport.domains.species with a solute-bearing "
-                        f"bath ({bad}) is unsupported - the reservoir has "
-                        f"no speciation state (pure/aerated water only)")
+            # RT-P0d: a solute-bearing reservoir is speciated ONCE at engine
+            # init (GEMS aqueous-only equilibrium, frozen for the run, the
+            # 0D suppression witness guarding it) - no config-level refusal
+            # any more; a bath GEMS cannot speciate fails loudly at init.
         if self.transport is not None and self.transport.domains is not None:
             for name, t in zip(("tile_zyx[z]", "tile_zyx[y]", "tile_zyx[x]"),
                                self.transport.domains.tiles(

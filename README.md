@@ -135,12 +135,18 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       1998 0.1 M NaOH 등온선을 연산자 자체로 재현해 log_K +0.50 피팅
       (`scripts/fit_so4_logk.py`), Ochs Se(VI) 밴드 sanity. 정준 스케일
       앵커를 용액×사이트 기하평균으로 보강. 28d calibrated 실측
-      `runs/sorption_so4_results_calibrated.json`.
+      `runs/sorption_so4_results_calibrated.json`. 후속 실측 수정(같은 날):
+      재제공 O/H 프레임의 부호를 명시적 `H2O`/`O2` 반응 항으로 원소-정확
+      처리(음수 H 침묵 클립 제거, `_frame_*` 진단), 수착 저장소 리매핑을
+      물 가중→흡착제(CSHQ 부피) 가중으로 교체(황산염 노출 스위치 H overdraw).
 - [x] **RT-S2a (2026-09-02)** — ddl 표면 모형 능력(PRD 4.6.5): config 소유
       면적·하전 반응(탈양성자화/Ca 착화, 수착과 동일 원장 기계), NaCl 담체
       분해(E3 선행), 하전 종명 파서 수정. 공동 보정 실측(`fit_so4_ddl.py`):
       GC가 NaCl 경향 부호는 재현하나 pH 사다리 정량 실패 → SO4는 no_edl
       국소 보정 유지, ddl은 정전 지배 이온용으로 보류.
+- [x] **RT-P0d (2026-09-02)** — 종별 수송 + 용질 배스(PRD 4.6.4): 저수조를
+      초기화 시 1회 GEMS 스페시에이션(동결, 억제-증인 보호), 배스 면 조화/
+      one-sided 규칙, O/H 배스는 비트 동일. 외부 침식 케이스에 Tier 0 개방.
 - [x] **RT-P0a/P0b (2026-09-02)** — Tier 0 종별 NP 영전류 사영(PRD 4.6.4):
       dw 테이블 벤더링 + 워커 프로토콜 v2(스페시에이션 노출) + 원소별 BE
       전도도(FORMAT_VERSION 5, Tier 1 수착 배열 예약 동승). 실측: OPC 공극수

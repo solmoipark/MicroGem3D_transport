@@ -317,3 +317,76 @@ def test_np_engine_restart_bit_identity(tmp_path):
     assert FORMAT_VERSION == 5
     with pytest.raises(StorageError, match="species transport"):
         load_checkpoint(str(tmp_path / "v4ish"), reg)
+
+
+# ------------------------------------------------ P0d: speciated solute bath
+
+def test_np_bath_species_identity_and_harmonic():
+    """RT-P0d kernel contract: an all-zero bath species vector reproduces
+    the aerated-water path bitwise; a bath carrying the SAME species state
+    as the domain drives zero element difference (the small-dc rung, D-bar);
+    a solute bath keeps 0 <= t_bnd <= g * D_max (M-matrix)."""
+    rng = np.random.default_rng(11)
+    z = np.array([1.0, -1.0, 2.0, -2.0, 0.0])
+    nu = rng.integers(0, 3, size=(5, 4)).astype(float)
+    dw = np.array([1.3e-3, 2.0e-3, 0.8e-3, 1.1e-3, 1.7e-3])
+    graph = _two_domain_graph()
+    a = np.array([3.0, 1.0, 0.5, 1.5, 0.7])
+    b = np.array([1.0, 3.0, 1.5, 0.5, 0.2])
+    species = np.stack([a, b])
+    g_bnd = np.array([1.5, 0.0])
+    c_res = np.zeros(4)
+    ref = transport.np_effective_conductance(
+        graph, species, graph.water, dw, z, nu, g_bnd=g_bnd, c_res=c_res)
+    zero = transport.np_effective_conductance(
+        graph, species, graph.water, dw, z, nu, g_bnd=g_bnd, c_res=c_res,
+        c_res_species=np.zeros(5))
+    assert np.array_equal(ref.t_bnd, zero.t_bnd)            # bitwise
+    assert ref.counts == zero.counts
+    # bath == domain 0 state (per vox^3 of liquid): no driving force
+    s_res = a / graph.water[0]
+    same = transport.np_effective_conductance(
+        graph, species, graph.water, dw, z, nu, g_bnd=g_bnd,
+        c_res=s_res @ nu, c_res_species=s_res)
+    assert same.counts["np_smalldc"] >= ref.counts["np_smalldc"]
+    assert np.all(np.isfinite(same.t_bnd))
+    # a distinct electroneutral solute bath: bounded transmissibility
+    s_res = np.array([2.0, 0.0, 0.0, 1.0, 0.3]) / graph.water[0]   # z.s = 0
+    sol = transport.np_effective_conductance(
+        graph, species, graph.water, dw, z, nu, g_bnd=g_bnd,
+        c_res=s_res @ nu, c_res_species=s_res)
+    assert np.all(sol.t_bnd >= 0.0)
+    assert np.all(sol.t_bnd[0] <= g_bnd[0] * dw.max() * (1 + 1e-12))
+    assert np.all(sol.t_bnd[1] == 0.0)                     # uncoupled row
+
+
+@needs_gems
+def test_np_engine_speciates_solute_bath():
+    """RT-P0d engine contract: a Na2SO4 reservoir with species transport
+    is speciated once at init (frozen, electroneutral, provenance-
+    recorded) in the run's aqueous species order; the summed species
+    reproduce the declared element composition per vox^3."""
+    from tinn.config import TinnConfig
+    from tinn.engine import Engine
+    from tinn.registry import ELEMENT_IDS
+    raw = json.loads((REPO / "examples" / "qualification"
+                      / "leach_w4_opc32.json").read_text(encoding="utf-8"))
+    raw["transport"]["domains"].pop("d0_m2_s", None)
+    raw["transport"]["domains"]["species"] = {
+        "dw_table": "gems_bundles/species_dw/species_dw.json",
+        "default_dw_m2_s": 1.0e-9, "geometry_factor": 1.0}
+    raw["transport"]["boundary"]["composition_mol_per_m3"] = {
+        "Na": 704.0, "S": 352.0, "O": 1408.5}
+    raw["chemistry"]["gems_worker_python"] = str(GEMS_PYTHON)
+    cfg = TinnConfig.model_validate(raw)
+    eng = Engine(cfg)
+    vec = eng._np_bath_species_vox
+    assert vec is not None and vec.shape == (len(eng.backend.aq_species_ids),)
+    vox_m3 = (cfg.rve.voxel_size_um * 1e-6) ** 3
+    el = vec @ np.asarray(eng.backend.aq_species_elements, dtype=float)
+    for name, target in (("Na", 704.0), ("S", 352.0)):
+        assert el[ELEMENT_IDS.index(name)] == pytest.approx(target * vox_m3,
+                                                            rel=1e-6)
+    assert abs(float(np.dot(eng._np_z, vec))) <= 1e-8 * np.abs(vec).sum()
+    prov = eng._np_provenance
+    assert prov["bath_species_mol_per_m3"] and 6.0 < prov["bath_ph"] < 9.0

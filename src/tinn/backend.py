@@ -192,18 +192,22 @@ def _decompose_to_reactants(elements: Dict[str, float]) -> Dict[str, float]:
         mol = amount / n_el
         reactants[formula] = mol
         o_used += mol * n_o
+    # the O/H FRAME may carry either sign: a re-offered ligand-exchange
+    # store returns "solution minus the OH- it released" and that OH- may
+    # since have precipitated (R stage), so the offer's solute-frame H can
+    # be negative; likewise O can fall short of the oxide frame. Both are
+    # encoded EXACTLY as signed H2O / O2 reaction terms (PHREEQC accepts
+    # negative amounts; water is in vast excess so the equilibrium is
+    # insensitive) and reported by the operator - never dropped
+    # (measured 2026-09-02: the alkali-binder run failed on an O deficit
+    # and the calibrated run had been silently clipping negative H).
     h = elements.get("H", 0.0)
-    if h < -1e-15:
-        raise ValueError(f"negative H in sorption input: {h}")
     h2o = h / 2.0
     o_left = elements.get("O", 0.0) - o_used - h2o
     scale = max((abs(v) for v in elements.values()), default=0.0) or 1.0
-    if o_left < -1e-9 * scale:
-        raise ValueError(
-            f"element vector is not oxide-decomposable: O deficit {o_left}")
-    if h2o > 0.0:
+    if h2o != 0.0:
         reactants["H2O"] = h2o
-    if o_left > 1e-15 * scale:
+    if abs(o_left) > 1e-15 * scale:
         reactants["O2"] = o_left / 2.0
     rebuilt: Dict[str, float] = {el: 0.0 for el in elements}
     nacl = reactants.get("NaCl", 0.0)
@@ -349,9 +353,19 @@ class SorptionOperator:
         peak = math.sqrt(float(e.max()) * float(sorbent_sites_mol))
         s_fac = 1e-2 / peak
         e_s = e * s_fac
+        # solutes: positive amounts only (fold dust below zero is dropped -
+        # it is below every ledger tolerance); the O/H frame passes with
+        # its sign so the decomposition can encode it exactly
         elements = {el: float(e_s[i]) for i, el in enumerate(ELEMENT_IDS)
-                    if e_s[i] > 0.0}
-        reactants = _decompose_to_reactants(elements)
+                    if e_s[i] > 0.0 or (el in ("O", "H") and e_s[i] != 0.0)}
+        try:
+            reactants = _decompose_to_reactants(elements)
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc} | [input] s_fac={s_fac!r} water_mol={water_mol!r} "
+                f"sites_mol={sorbent_sites_mol!r} elements="
+                f"{ {el: float(e[i]) for i, el in enumerate(ELEMENT_IDS) if e[i] != 0.0} !r}"
+            ) from exc
         water_kg = (water_mol * s_fac) * _H2O_G_MOL / 1000.0
         lines = ["SOLUTION 1",
                  f"    temp {t_k - 273.15:.6f}",
@@ -393,6 +407,10 @@ class SorptionOperator:
         last = rows[-1]
         kgw = float(last[col["mass_H2O"]])
         occupancy: Dict[str, float] = {}
+        # frame diagnostics (unscaled mol): the signed water/oxygen terms
+        # that encoded the offer's O/H frame - visible, not swallowed
+        occupancy["_frame_H2O_mol"] = reactants.get("H2O", 0.0) / s_fac
+        occupancy["_frame_O2_mol"] = reactants.get("O2", 0.0) / s_fac
         sorbed = np.zeros(len(ELEMENT_IDS))
         for i, sp in enumerate(self._bound_species):
             n_i = float(last[col[f"m_{sp}(mol/kgw)"]]) * kgw / s_fac

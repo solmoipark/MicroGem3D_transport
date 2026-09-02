@@ -57,9 +57,12 @@ def main() -> None:
     density = 0.02
     tag = "demo"
     density_map = None
+    base = BASE
     for arg in sys.argv[1:]:
         key, _, val = arg.partition("=")
-        if arg == "calibrated":
+        if key == "base":
+            base = (REPO / val).resolve()
+        elif arg == "calibrated":
             log_k = CAL_LOG_K
             density_map = {dc: CAL_SITES_PER_SI * si
                            for dc, si in CAL_SI.items()}
@@ -75,7 +78,7 @@ def main() -> None:
     if density_map is None:
         density_map = {dc: density for dc in CAL_SI}
 
-    raw = json.loads(BASE.read_text(encoding="utf-8"))
+    raw = json.loads(base.read_text(encoding="utf-8"))
     raw["sorption"] = {
         "operator": "phreeqc_surface",
         "phreeqc_dat": str(REPO / "gems_bundles" / "PHREEQC-cemdata18"

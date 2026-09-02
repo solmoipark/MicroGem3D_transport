@@ -394,16 +394,21 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
                              water: np.ndarray, dw_vox2_h: np.ndarray,
                              z: np.ndarray, nu: np.ndarray,
                              g_bnd: Optional[np.ndarray] = None,
-                             c_res: Optional[np.ndarray] = None
+                             c_res: Optional[np.ndarray] = None,
+                             c_res_species: Optional[np.ndarray] = None
                              ) -> NPConductance:
     """Edge- and element-resolved transmissibilities from one frozen
     speciation state (PRD 4.6.4). species_mol is (D, S) aqueous species mol
     per domain (solvent excluded), water the domain liquid volume (vox^3;
     c = n/W units), dw_vox2_h the species diffusivities ALREADY carrying the
     Stokes-Einstein factor and the geometry factor. Interior faces use the
-    harmonic face mean (the existing face mixing rule); bath faces use the
-    one-sided domain state (the reservoir is pure water by config, and a
-    harmonic mean against zero would kill the migration term identically).
+    harmonic face mean (the existing face mixing rule). Bath faces: with no
+    reservoir speciation (c_res_species None - the aerated-water bath) the
+    one-sided domain state is used (a harmonic mean against zero would
+    kill the migration term identically); with a speciated solute bath
+    (RT-P0d) the species difference is c - s_res and the face mean is the
+    harmonic mean wherever BOTH sides carry the species, one-sided
+    otherwise - so an all-zero s_res reproduces the O/H path bitwise.
     Bath O/H in c_res only shifts the element driving force, matching the
     BE's (x - c_res) form exactly."""
     ea, eb = graph.edge_a, graph.edge_b
@@ -430,7 +435,16 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
                else np.asarray(c_res, dtype=np.float64))
         dc_el_b = c @ nu - res[None, :]
         cmax_b = np.maximum(c @ nu, np.abs(res)[None, :])
-        deff_b, counts_b, qrel_b = _np_deff(c, c, dc_el_b, cmax_b,
+        if c_res_species is None:
+            dc_b, cbar_b = c, c
+        else:
+            s_res = np.asarray(c_res_species, dtype=np.float64)[None, :]
+            dc_b = c - s_res
+            both = (c > 0.0) & (s_res > 0.0)
+            cbar_b = np.where(both,
+                              2.0 * c * s_res / np.where(both, c + s_res, 1.0),
+                              c)
+        deff_b, counts_b, qrel_b = _np_deff(dc_b, cbar_b, dc_el_b, cmax_b,
                                             dw_vox2_h, z, nu)
         t_bnd = np.asarray(g_bnd, dtype=np.float64)[:, None] * deff_b
         for k, v in counts_b.items():
