@@ -154,7 +154,10 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       (`sorption.site_density_c_mol_per_mol`, Ca-장식 실란올; None이면 해시
       불변) + Hirao 2005 C-S-H 등온선 재현 보정(`scripts/fit_cl_logk.py`):
       0.616 mmol/g = 0.119/Si 풀, **log K +0.60**, ≤1 M 3% 내, Tang&Nilsson
-      페이스트 밴드 ±20%. 예제 `examples/qualification/chloride_ingress_opc32.json`.
+      페이스트 밴드 ±20%. 예제 `examples/qualification/chloride_ingress_opc32.json`
+      통합 스모크(NaCl 0.5 M, 11 분): 원장 폐합, Cl 분배 Friedel 51 / 수착 27 /
+      자유 22 %; 황산염 탈착→에트링가이트→Friedel 용해 역류 관찰(Cl-OPEN-1).
+      Cl 담체 NaCl→KCl→HCl.
 - [x] **RT-S2a (2026-09-02)** — ddl 표면 모형 능력(PRD 4.6.5): config 소유
       면적·하전 반응(탈양성자화/Ca 착화, 수착과 동일 원장 기계), NaCl 담체
       분해(E3 선행), 하전 종명 파서 수정. 공동 보정 실측(`fit_so4_ddl.py`):

@@ -1147,7 +1147,32 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   0.5 M 배스 168→168.2 h, S+Cl 수착, CH 완충). 미결: Ca/Si 의존(Plusquellec는
   Ca/Si 0.8–1.42에서 흡착 없음 — Tob 계열 풀 밀도는 Ca 비례 가정일 뿐),
   온도 의존, AFm→Friedel/Kuzel은 GEMS(PC-Cl) 담당 — 수착은 C-S-H 풀만이라
-  중복 계상 없음.
+  중복 계상 없음. **통합 스모크 실측**(`runs/chloride_ingress_opc32`, 32³,
+  PC-Cl 번들, NaCl 0.5 M 배스 168→168.2 h, dt 0.0014 h, 벽시계 11 분;
+  `scripts/run_config.py`, `scripts/analyze_chloride_ingress.py`): 첫 실행은
+  첫 스텝에서 실패 — PC-Cl 번들 IC 미량(Mg/C/Cl 각 1.5e-23 mol)이 R 단계를
+  거쳐 Na 1e-30인 반응기 용액에 실려 "NaCl 담체만" 규칙에 걸림 → 담체를
+  **NaCl → KCl → HCl** 순으로 확장(HCl의 양성자는 부호 있는 O/H 프레임이
+  정확히 흡수; 담체가 모두 중성이라 PHREEQC는 원소 총량만 보므로 분할이
+  평형을 바꾸지 않음; 폐합 테스트). 결과(누적 배스 유입 / Surf_c 수착 /
+  자유 / Friedel): 0.05 h 1.77e-11 / 4.79e-12 / 3.82e-12 mol / 1232 vox,
+  0.10 h 1.61e-11 / 4.96e-12 / 3.66e-12 / 1024, 0.20 h 1.48e-11 / 4.99e-12 /
+  3.54e-12 / 857. 원장 폐합: Friedel 부피→mol(271.8 cm³/mol)×2 Cl이 잔차
+  Cl(유입−수착−자유) 9.07/7.53/6.29e-12와 3자리 일치. 0.05 h Cl 분배
+  Friedel 51% / Surf_c 27% / 자유 22%; Surf_c 점유 ≈35%(Hirao 0.5 M 57% —
+  세공수 이온강도·자유 Cl < 배스 농도, 2배 내). **관찰 Cl-OPEN-1 — 유입
+  Cl의 순 역류**: 32 μm RVE는 수 초 내 Cl로 충수되고(확산 시간 ~1 s) 이후
+  CH 용출(4200→2492 vox / 0.2 h)이 지배; 동시에 C-S-H 황산염 저장소가
+  탈착(1.51e-11 → 0.98e-12 mol S, −93%; 0.5 M NaCl에서 SO4²⁻ 활동도 계수
+  급감 + OH⁻ 유출)하고 풀린 SO4가 C3AH6·규산 hydrogarnet의 Al과
+  에트링가이트를 만들며(35→3311 vox) **Friedel을 녹여 Cl을 배스로
+  되돌림**(Al 수지: Friedel −209 vox ↔ 에트링가이트 +555 vox, 0.05→0.10 h).
+  염화물 노출 시 AFm/C-S-H 황산염 방출→에트링가이트 형성은 문헌상 알려진
+  현상(De Weerdt et al. 2014 등; 대조 필요)이나 크기는 S1c 수착 저장소
+  크기(황산염 11%)와 0.5 M에서의 활동도 모형에 걸려 있음 → 정량 판정은
+  rt-dev 병합 후 28 d 결합 등온선 qualification(배스 0.1/0.5/1 M 사다리,
+  S 저장소 유무 대조)에서. 스위트 294 green(담체 변경 전 트리) +
+  test_sorption 12 green(변경 후).
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
