@@ -1083,8 +1083,17 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   이완 저장소로 바뀐 것이 실측됨(672 h 상태를 완충 재제공하면 스텝당
   −0.6% 방출 — 완충 전 0% — 느린 이완이 계속되는 중). 남은 상수 해석 주의: 완충 계의 pH는 CH
   포화(~12.45)로 K-풍부 공극수(13.0)보다 낮아 K_L이 ~3× 크게 잡힌다 —
-  C-S-H·알칼리까지 포함한 완충(후속)이 정합 조건. 알칼리 바인더 재실행은
-  아래 추가.
+  C-S-H·알칼리까지 포함한 완충(후속)이 정합 조건.
+  **알칼리 바인더 재실행**(`base=examples/deschner2012_opc_alkali_32.json
+  buffer=1`, `runs/sorption_so4_results_calibrated_alkali2_buf.json`, 벽시계
+  3148 s): 수착 S 궤적 완충 전 1.04→1.08→1.27→**1.60e-11**(8/24/168/672 h,
+  단조 증가 — 총 S의 81%) vs 완충 후 6.71→4.42→0.25→**0.18e-12**(8 h 점유율
+  63% = 알칼리 황산염 즉시 용해기의 실제 흡착 → 672 h 점유율 **0.5%**, 총 S의
+  **0.93%**, 수용액 S 2.4e-14 ≈ 4 mmol/L). pH ~13.5·[SO4] ~4 mM에서 no_edl
+  Langmuir 기대치(θ ≈ K_L·a_SO4 ~ 1–2%)와 동일 차수이며, 알칼리-빈약계
+  (4.0%)보다 낮은 것도 OH⁻ 방출형(pH↑→수착↓)과 정합. **판정**: S1-OPEN-2
+  해소 — 두 바인더 모두 "싱크"가 "AFt와 경쟁하는 이완 저장소"로 전환됨.
+  S1c 문헌 보정 상수는 그대로 유효(0D 보정은 염기 존재 배치 재현이었음).
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
