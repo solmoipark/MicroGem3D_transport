@@ -1173,6 +1173,37 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   rt-dev 병합 후 28 d 결합 등온선 qualification(배스 0.1/0.5/1 M 사다리,
   S 저장소 유무 대조)에서. 스위트 294 green(담체 변경 전 트리) +
   test_sorption 12 green(변경 후).
+- **RT-S3 — GEMS 산화환원 바닥과 환원 황 배제 (2026-09-03, 실측으로 발견)**:
+  Cl 결합 사다리(RT-Cl-3, 28 d 수화 후 NaCl 노출)에서 S 포함 케이스가 28 d
+  시점에 에트링가이트 2 vox·C3AH6 740 vox·**수착 S 저장소 = 총 S의 95%**
+  (1.589e-11/1.665e-11 mol)라는 비물리 조합을 보임(PC 번들 S1d 기록은 4%).
+  진단 사슬(모두 실측): ① 0D에서는 PC/PC-Cl 두 번들이 동일하게 황산염을
+  AFm으로 보냄(잔류 2.9 mM) → 번들 자체 아님; ② 2-way 스왑(염화물 설정+PC
+  번들 → 13%, AFt 정상 / 황산염 설정+PC-Cl 번들 → 90%, 24 h AFt 1740 vox가
+  168 h에 32 vox로 용해, C3AH6 640) → 엔진 경로 안의 번들 의존성;
+  ③ 24 h 스텝 추적: PC-Cl+S에서 R 단계가 용액에 S 52 mM을 남김(PC 2.9,
+  PC-Cl 수착 없음 14.7 mM); ④ 24 h 수화물+용액 계의 0D 종분화: PC-Cl 용액의
+  S는 **HS⁻ 53 mM**(SO4²⁻ 0.14 mM), PC에서는 같은 환원 S가 **pyrite**(고체,
+  RT-S1e의 "pyrite 3–35 vox" 아티팩트가 바로 이것)로 빠짐 — 원장의 O/H가
+  산화물-정확이고 O2 시드가 1e-9뿐이라 GEM 계가 H2/H2O 산화환원 바닥에
+  놓여 황산염 일부가 환원되며, 사용자 PC-Cl 수출엔 황화물 상이 없어 HS⁻가
+  용액에 남는다. 수착 연산자는 원소 S를 SO3로 분해해 PHREEQC에 넘기므로 이
+  황화물을 황산염으로 "재산화"해 흡착 → 저장소가 매 스텝 자라고(24 h
+  추적: 델타 2–3e-12/스텝 지속 vs PC는 20 h에 포화 후 감소) AFt가 녹는다;
+  ⑤ 0D 대조: O 여유 ≥ 2×S이면 두 번들 모두 HS⁻ 소멸·pyrite 소멸·황산염만
+  잔류(0.3–0.8 mM)·AFt 증가. **결정**: 시멘트 열역학 관행대로 황을 S(VI)로만
+  두는 **config 선언 배제** — `chemistry.suppressed_species`(cemdata18 환원
+  S 종: HS-, H2S@, S-2, S2O3-2, HSO3-, SO3-2, H2S, Sulfur)와
+  `chemistry.suppressed_phases`(PC 번들: Pyrite, Troilite; PC-Cl엔 없음 —
+  이름은 번들별 오타 가드). None이면 기존 해시 불변(테스트). 워커: xgems
+  `suppress_multiple_species`; 캐시 엔진은 clear()/cold_start() 후에도 종·상
+  억제를 **유지**(실측)하므로 직전 요청의 종·상 집합을 먼저 재활성화해 모든
+  요청이 같은 활성 상태에서 출발(기존 코드는 상 목록이 항상 동일해 드러나지
+  않았음). 0D 증인은 `aqueous_species_mol`까지 읽어 누출을 잡음(상별 맵만
+  읽던 첫 판은 HS⁻에 눈이 멀었음 — 테스트가 잡음). 앵커 A/B dense·full v6
+  고정값과 비트 동일. 미결: S1c/S1d/S1e의 황산염 기록은 배제 없이 측정됨(PC
+  번들에선 pyrite로 빠져 영향이 총 S의 <1%로 작지만, 재측정을 병합 후 항목으로
+  둠); 배제 후 사다리 재실측은 RT-Cl-3에 기록.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올

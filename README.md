@@ -158,6 +158,11 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       통합 스모크(NaCl 0.5 M, 11 분): 원장 폐합, Cl 분배 Friedel 51 / 수착 27 /
       자유 22 %; 황산염 탈착→에트링가이트→Friedel 용해 역류 관찰(Cl-OPEN-1).
       Cl 담체 NaCl→KCl→HCl.
+- [x] **RT-S3 (2026-09-03)** — GEMS 산화환원 바닥 발견·배제(PRD 4.6.5): 원장
+      O/H가 산화물-정확이라 황산염 일부가 환원됨(PC: pyrite 미량, PC-Cl: HS⁻
+      53 mM → 수착 연산자가 재산화해 저장소 95%). `chemistry.suppressed_species/
+      suppressed_phases`(S(VI)-only 선언, None이면 해시 불변), 캐시 엔진 활성
+      복원, 0D 증인. 앵커 비트 불변.
 - [x] **RT-S2a (2026-09-02)** — ddl 표면 모형 능력(PRD 4.6.5): config 소유
       면적·하전 반응(탈양성자화/Ca 착화, 수착과 동일 원장 기계), NaCl 담체
       분해(E3 선행), 하전 종명 파서 수정. 공동 보정 실측(`fit_so4_ddl.py`):
