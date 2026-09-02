@@ -330,7 +330,7 @@ A행렬 행 그대로 — 하드코딩·고정 화학식 fallback 금지)를 둔
 저장과 동일함을 테스트로 고정). 행수 계약("행수 = 도메인 수 또는 0, 그 외 손상")과
 액체 겹침 리매핑은 클러스터 계약을 그대로 일반화한다. 모드 B는 **새 배열이 없다** —
 기존 풀의 갱신 규칙이 절대 교체에서 블렌드(f=1 경로는 현행 코드 경로 그대로)로
-바뀔 뿐이다. **FORMAT_VERSION 5는 RT-P0b에서 1회 단절**(2026-09-02): 동결
+바뀔 뿐이다. **FORMAT_VERSION 6은 RT-Cl에서 1회 단절**(2026-09-02): 원소 원장이 Cl 열을 얻는다(E=12, 마지막에 추가 — 기존 열 인덱스 불변, dense 해시 불변, full 해시만 재고정 §6.2; 레지스트리 ⊇ 번들 IC 계약 — Cl 없는 번들은 0열, Cl 질량이 실리면 하드 에러). **FORMAT_VERSION 5는 RT-P0b에서 1회 단절**(2026-09-02): 동결
 스페시에이션 `domain_species_mol (D,S)` + 헤더 `aq_species_ids` + **Tier 1
 예약** `domain_sorbed_mol (0,E)`(RT-S1a까지 제로행 — v4의 boundary_water_mol
 예약 전례: 단절 1회로 앵커 재고정 1회). 그 이전, **FORMAT_VERSION 4는
@@ -1094,6 +1094,16 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   (4.0%)보다 낮은 것도 OH⁻ 방출형(pH↑→수착↓)과 정합. **판정**: S1-OPEN-2
   해소 — 두 바인더 모두 "싱크"가 "AFt와 경쟁하는 이완 저장소"로 전환됨.
   S1c 문헌 보정 상수는 그대로 유효(0D 보정은 염기 존재 배치 재현이었음).
+- **RT-Cl-1 — 원장 Cl 확장 + PC-Cl 번들 (2026-09-02)**: `ELEMENT_IDS`에 Cl
+  추가(E=12, 마지막 열; FORMAT_VERSION 6). 백엔드 계약을 "번들은 원장 원소를
+  전부 선언"에서 **"원장 ⊇ 번들 IC"** 로 완화 — 번들에 없는 원소는 모든
+  행렬에서 0열이고, 그 원소에 질량을 실어 R에 넘기면 하드 에러(침묵 드롭
+  없음; 테스트). 사용자 GEMS 수출 `gems_bundles/PC-Cl`(cemdata18, NaCl 배경
+  전해질, Cl IC + Cl⁻/FeCl 종 + Friedel·Kuzel염 + 6-endmember CSHQ
+  [KSiOH/NaSiOH 포함], hydrates-only) 수용 게이트: 워커 경유 0D 평형이
+  수출 dbr을 정확 재현(pH 12.607/12.607, I 0.0597/0.0597, 상 조합 일치,
+  폐합 4e-16; `gems_bundles/PC-Cl/PROVENANCE.md`). 후속: Cl 표면 수착
+  보정(문헌), NaCl 배스 침투 qualification(결합 등온선 산출), 혼입 담체.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
@@ -1197,8 +1207,8 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
 | RT 해석 앵커 3 (v4.0/W3) | 슬래브 + 양끝 Dirichlet 배스: 도메인 그래프 정상 플럭스 = 네트워크 솔버(gin=2g_a) 플럭스 — G_AR 반셀 factor-2의 수치 고정(중복 곱이면 정확히 2× 실패) | 경계 결합 스케일 고정 |
 | RT 해석 앵커 4 (v4.0/W3) | 1-도메인+배스 BE 1스텝: c⁺−c_R = (c−c_R)/(1+Δt·λ_R), λ_R = D₀·G_AR/(p·W); 서브스텝 → exp(−λ_R t) 1차 수렴 | boundary exchange 단위 테스트 |
 | RT 해석 앵커 5 (Tier 0/P0) | Nernst–Hartley 2종 전해질: D_salt = (z₊−z₋)D₊D₋/(z₊D₊−z₋D₋) 정확 재현(rel 1e-10; NaCl≈1.61e-9·KCl≈1.99e-9 교차 확인) + 등-D 항등(Φ≡0, rel 1e-12) + 에지 전하플럭스 영(1e-12) | `np_effective_conductance` 단위 테스트 |
-| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df (버전 불변 권위), full_hash v3 원기록 1c7d2a10…, v4 재고정(RT-W2, boundary_water_mol 편입) fe100126…, **v5 재고정(RT-P0b 2026-09-02, domain_species_mol/aq_species_ids/예약 domain_sorbed_mol이 해시에 편입) 40e4760ed020fe619bc853beba9a91f37de108da1a93ee247fc1d4fb1129de12** — dense 동일 실측으로 물리 불변 입증 | 합성 경로 기본값 불변 감시 (GEMS 불요) |
-| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 (버전 불변 권위), full_hash v3 원기록 84751b8b…, v4 재고정(RT-W2) b30c6f1a…, **v5 재고정(RT-P0b) 78eeec4ef1d6b0ea86791edc62eaed63c97410d873aef7b89a5a6ddcc625e70d** — dense 동일 실측 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
+| RT-W0 기준 앵커 A (실측 2026-08-20, f7be88b+aqueous 포트) | `examples/c3s_32.json` → runs ckpt_003 (t=168 h): dense_hash 1490c624221ef5a109958815989faea840582cc8f543a7e5e2c3fb500d67a6df (버전 불변 권위), full_hash v3 원기록 1c7d2a10…, v4 재고정(RT-W2, boundary_water_mol 편입) fe100126…, **v5 재고정(RT-P0b 2026-09-02, domain_species_mol/aq_species_ids/예약 domain_sorbed_mol이 해시에 편입) 40e4760ed020fe619bc853beba9a91f37de108da1a93ee247fc1d4fb1129de12**, **v6 재고정(RT-Cl 2026-09-02, Cl 열 편입 E=12) 58f91012522bddc5eb84d6283079917b2ed84ebca55cf80ee1692d0d42392324** — dense 동일 실측으로 물리 불변 입증 | 합성 경로 기본값 불변 감시 (GEMS 불요) |
+| RT-W0 기준 앵커 B (실측 2026-08-20, 동일 빌드, xgems py313) | `examples/qualification/deschner_opc_q32_smoke_24h.json` → ckpt_001 (t=24 h): dense_hash 26df94e710619e5f116a607411a5d4197327c4a678b4effbcd1254eb70bfb6e1 (버전 불변 권위), full_hash v3 원기록 84751b8b…, v4 재고정(RT-W2) b30c6f1a…, **v5 재고정(RT-P0b) 78eeec4ef1d6b0ea86791edc62eaed63c97410d873aef7b89a5a6ddcc625e70d**, **v6 재고정(RT-Cl) full 2df003392b70b70e36dc05c1818749df87f51b961b8da974c5a6bcd82db9cb11, dense 83b0c6d9f6b2f19b44af7537fa889c626edce622b569373c819caaf8f02d2232** — v6에서 dense도 이동, 원인 확정: 스텝별 추적에서 6 h까지 전 원장 비트 동일, 8 h(두 번째 스텝)에 수화물 원소 원장 H 한 항만 2.6e-26(1 ulp) 차이, 나머지 동일, 이후 14→20 h 스텝에서 배치 경로로 증폭. 재현: 동일 6 h 상태의 실제 행렬로 `pool[:, CSHQ] @ endmember_elements[CSHQ]`를 폭 11 vs 12로 계산하면 정확히 2.58e-26 차이 — E 폭이 BLAS dgemm 커널 선택(N=11↔12)을 바꿔 CSHQ 채널 누산 반올림만 달라진 것(합성 경로 앵커 A는 dense 불변). 같은 날 rt-dev(E=11)에서 v5 dense/full 정확 재현 → 드리프트·회귀 아님. dense 권위는 '동일 E 폭'에서만 버전 불변 — v6 dense를 새 권위로 기록 | GEMS 결합 경로 기본값 불변 감시. 주의: 앵커 실패·이중런 등가 통과 = 환경 드리프트이지 회귀 아님(§3 RT 게이트의 권위는 동일 세션 이중런) |
 
 ### 6.3 Sanity band (비블로킹 — 리포트에 pass/warn/info만 기록; info = 해당 배합에 밴드 전제가 비적용, 값만 표시 — rev.2)
 

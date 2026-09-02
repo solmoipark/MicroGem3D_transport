@@ -28,7 +28,10 @@ from .state import SimulationState, _DENSE_FIELDS, code_version
 # explicitly incompatible (no migration, PRD rule). E2's per-cluster pool
 # array (cluster_endmember_mol) rides the SAME version: no external v3
 # checkpoints existed when it landed, so no second break.
-FORMAT_VERSION = 5  # Tier 0 / RT-P0b (PRD 2.3/4.6.4): frozen aqueous
+FORMAT_VERSION = 6  # RT-Cl: the element ledger gains the Cl column (E=12,
+                    # appended last); every (.., E) array in a v5 checkpoint
+                    # is one column short - refused, no migration.
+                    # v5 was Tier 0 / RT-P0b (PRD 2.3/4.6.4): frozen aqueous
                     # speciation per domain (domain_species_mol +
                     # aq_species_ids) AND the reserved Tier-1 sorbed
                     # inventory (domain_sorbed_mol, zero rows until RT-S1a
@@ -181,7 +184,8 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
     if header["format_version"] != FORMAT_VERSION:
         raise StorageError(
             f"checkpoint format {header['format_version']} is not supported by "
-            f"this build (current {FORMAT_VERSION}); v4 checkpoints predate "
+            f"this build (current {FORMAT_VERSION}); v5 checkpoints predate the "
+            f"chloride element column (RT-Cl, E=12), v4 checkpoints predate "
             f"species transport and the reserved sorbed-inventory array "
             f"(Tier 0/RT-P0b), v3 the equilibration domains and boundary "
             f"water ledger (v4.0/RT), v2 the endmember ledger (E1) "

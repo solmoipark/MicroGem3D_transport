@@ -56,8 +56,11 @@ SOLID_PHASE_IDS: Tuple[str, ...] = KINETIC_PHASE_IDS + (INERT_PHASE_ID,)
 # SimulationState.hydrate_ids and in the checkpoint header).
 HYDRATE_PHASE_IDS: Tuple[str, ...] = ("CSH", "CH", "C3AH6", "FH3")
 # Order of the element ledger vector (fixed; covers the PC bundle's elements).
+# RT-Cl (FORMAT_VERSION 6): Cl appended LAST so every existing column index
+# is unchanged - the PC-Cl bundle carries it, the PC/CNASH bundles simply
+# leave the column zero (dense hashes untouched, full hashes re-pinned once).
 ELEMENT_IDS: Tuple[str, ...] = ("Ca", "Si", "Al", "Fe", "S", "Na", "K", "Mg",
-                                "C", "H", "O")
+                                "C", "H", "O", "Cl")
 
 
 def element_vector(formula: dict, mol: float = 1.0):

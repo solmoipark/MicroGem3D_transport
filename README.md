@@ -108,7 +108,7 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
 - `material_psd` — 재료별 PSD 맵(키: "clinker"/SCM id; 생략 시 공용 `psd`)
 - `material_shape` — 재료별 타원체 형상(반축비, 부피 정규화; 생략 시 구형)
 - `rve` — grid_size 32/64/128, voxel_size_um 0.25–1.0, seed
-- `chemistry` — backend `stoichiometric`|`gems3k`; `gems_bundle_lst`(기본 CNASH),
+- `chemistry` — backend `stoichiometric`|`gems3k`; `gems_bundle_lst`(기본 CNASH; 염화물은 `gems_bundles/PC-Cl/MySystem-dat.lst`),
   `gems_gel_porosity`(기본 CSHQ/CNASH 0.28), `gems_worker_python`
 - 지속 GEMS 워커는 기본 활성(`TINN_GEMS_PERSISTENT=0`로 비활성) + 입력해시 메모이제이션
 
@@ -146,6 +146,10 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       S1c 28d·알칼리 28d 이전 수치는 싱크 누적량으로 재해석. 완충 재실행
       실측: 28d 수착 S calibrated 11.1%→**4.0%**, 알칼리 81%→**0.93%**
       (점유율 4.8%→1.75%, 40%→0.5%) — 저장소가 AFt로 배수되는 이완형으로 전환.
+- [x] **RT-Cl-1 (2026-09-02)** — 원장 Cl 열(E=12, FORMAT_VERSION 6) + 사용자
+      GEMS 수출 `gems_bundles/PC-Cl`(Friedel/Kuzel, Cl 종, 알칼리 CSHQ) 수용.
+      백엔드 계약 "원장 ⊇ 번들 IC"(Cl 없는 번들은 0열, Cl 질량 투입 시 하드
+      에러). 앵커 dense 불변 실측·full v6 재고정.
 - [x] **RT-S2a (2026-09-02)** — ddl 표면 모형 능력(PRD 4.6.5): config 소유
       면적·하전 반응(탈양성자화/Ca 착화, 수착과 동일 원장 기계), NaCl 담체
       분해(E3 선행), 하전 종명 파서 수정. 공동 보정 실측(`fit_so4_ddl.py`):

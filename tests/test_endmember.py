@@ -162,7 +162,7 @@ def test_checkpoint_v2_explicitly_rejected(tmp_path):
     # domain-keyed rows + boundary_water_mol) - the RT-W2 sanctioned break;
     # Tier 0 broke it once more (5, RT-P0b: frozen speciation + the
     # RESERVED Tier-1 sorbed inventory riding the same break)
-    assert FORMAT_VERSION == 5
+    assert FORMAT_VERSION == 6
 
 
 def test_run_guard_rejects_endmember_universe_mismatch(tmp_path):

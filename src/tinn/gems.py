@@ -520,9 +520,12 @@ class GemsBackend:
         self._worker = worker
         self.temperature_k = temperature_k
         info = worker.info()
-        missing = sorted(set(ELEMENT_IDS) - set(info["element_names"]))
-        if missing:
-            raise GemsError(f"bundle lacks ledger elements: {missing}", kind="config")
+        # RT-Cl: the ledger may be a SUPERSET of the bundle's independent
+        # components (PC/CNASH carry no Cl, PC-Cl does). An absent element
+        # is a zero column in every matrix below; feeding it mass is a
+        # hard error in react() - never a silent drop.
+        self._absent_elements = tuple(
+            sorted(set(ELEMENT_IDS) - set(info["element_names"])))
         excluded = set(SUPPRESSED_CLINKER_PHASES) | {AQUEOUS_PHASE, GAS_PHASE}
         self.hydrate_ids = tuple(p for p in info["phase_names"] if p not in excluded)
         # suppress only the clinker phases this bundle actually declares — a
@@ -610,6 +613,13 @@ class GemsBackend:
             raise GemsError("empty element input to GEMS backend", kind="config")
         s = CANONICAL_MAX_ELEMENT_MOL / peak
 
+        for el in self._absent_elements:
+            if elements[e_ids.index(el)] > 0.0:
+                raise GemsError(
+                    f"the reactor carries {elements[e_ids.index(el)]!r} mol "
+                    f"of {el} but the bundle declares no {el} component - "
+                    f"use a bundle with {el} (e.g. gems_bundles/PC-Cl)",
+                    kind="config")
         scaled = {el: float(elements[i] * s) for i, el in enumerate(e_ids)
                   if elements[i] > 0.0}
         injected = np.zeros(len(e_ids))

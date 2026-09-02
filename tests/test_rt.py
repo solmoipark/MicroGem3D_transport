@@ -13,7 +13,7 @@ import pytest
 from tinn import ledger, transport
 from tinn.config import TinnConfig
 from tinn.engine import Engine
-from tinn.registry import HYDRATE_PHASE_IDS, default_registry
+from tinn.registry import ELEMENT_IDS, HYDRATE_PHASE_IDS, default_registry
 from tinn.storage import load_checkpoint
 
 from test_endmember import TwoEndmemberSnapshotBackend
@@ -253,16 +253,16 @@ def test_ring_exchange_invariants():
         n_domains=k, edge_a=lo, edge_b=hi,
         edge_g=(0.1 + rng.random(k)) / 2.0,
         water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
-    inv = rng.random((k, 11)) * 1e-9
+    inv = rng.random((k, len(ELEMENT_IDS))) * 1e-9
     res = transport.exchange_be(graph, inv, 5.0, 2.0)
     assert res.status == "ok"
     new = inv + res.delta
     assert np.all(new >= 0.0)
-    for e in range(11):
+    for e in range(len(ELEMENT_IDS)):
         assert float(new[:, e].sum()) == pytest.approx(
             float(inv[:, e].sum()), rel=1e-13)
     # uniform c stationary: n = W * const per element
-    uni = np.outer(graph.water, np.linspace(0.5, 1.5, 11)) * 1e-8
+    uni = np.outer(graph.water, np.linspace(0.5, 1.5, len(ELEMENT_IDS))) * 1e-8
     res_u = transport.exchange_be(graph, uni, 5.0, 2.0)
     assert float(np.abs(res_u.delta).max()) <= 1e-22
     # determinism
@@ -462,14 +462,14 @@ def test_domain_graph_exposed_wrap_edge_excluded():
     g_exp = transport.build_domain_graph(d_id, n_dom, g, liquid,
                                          (False, True, True))
     assert g_per.edge_a.size == g_exp.edge_a.size + 1   # exactly the seam
-    inv = np.linspace(1.0, 2.0, n_dom)[:, None] * np.ones((1, 11)) * 1e-10
+    inv = np.linspace(1.0, 2.0, n_dom)[:, None] * np.ones((1, len(ELEMENT_IDS))) * 1e-10
     r0 = transport.exchange_be(g_exp, inv, 1.0, 2.0)
     rz = transport.exchange_be(g_exp, inv, 1.0, 2.0,
                                bath=transport.BoundaryBath(
                                    g_bnd=np.zeros(n_dom),
-                                   c_res=np.zeros(11)))
+                                   c_res=np.zeros(len(ELEMENT_IDS))))
     assert np.array_equal(r0.delta, rz.delta)
-    assert np.array_equal(rz.boundary_net, np.zeros(11))
+    assert np.array_equal(rz.boundary_net, np.zeros(len(ELEMENT_IDS)))
 
 
 def test_boundary_coupling_halfcell_sum():
@@ -498,8 +498,8 @@ def test_single_domain_bath_analytic_decay_and_ingress():
         n_domains=1, edge_a=np.empty(0, dtype=np.int64),
         edge_b=np.empty(0, dtype=np.int64), edge_g=np.empty(0),
         water=np.array([w]), dust=np.zeros(1, dtype=bool))
-    c_res = np.full(11, 0.25)
-    inv = np.full((1, 11), 3.0)         # c = 1.5 > c_res: leaches out
+    c_res = np.full(len(ELEMENT_IDS), 0.25)
+    inv = np.full((1, len(ELEMENT_IDS)), 3.0)         # c = 1.5 > c_res: leaches out
     dt = 0.7
     res = transport.exchange_be(graph, inv, dt, d0,
                                 bath=transport.BoundaryBath(
@@ -522,7 +522,7 @@ def test_single_domain_bath_analytic_decay_and_ingress():
     assert cur[0, 0] / w - 0.25 == pytest.approx(
         (c0 - 0.25) * np.exp(-lam * dt), rel=0.01)
     # ingress: bath above the domain concentration
-    rich = np.full(11, 5.0)
+    rich = np.full(len(ELEMENT_IDS), 5.0)
     r_in = transport.exchange_be(graph, inv, dt, d0,
                                  bath=transport.BoundaryBath(
                                      g_bnd=np.array([g_ar / p]),
@@ -532,7 +532,7 @@ def test_single_domain_bath_analytic_decay_and_ingress():
     eq = transport.exchange_be(graph, inv, dt, d0,
                                bath=transport.BoundaryBath(
                                    g_bnd=np.array([g_ar / p]),
-                                   c_res=np.full(11, c0)))
+                                   c_res=np.full(len(ELEMENT_IDS), c0)))
     assert float(np.abs(eq.boundary_net).max()) <= 1e-24 + 1e-12 * 3.0
 
 
@@ -547,16 +547,16 @@ def test_bath_flux_form_conservation_and_signs():
         water=0.5 + rng.random(k), dust=np.zeros(k, dtype=bool))
     g_bnd = np.zeros(k)
     g_bnd[0] = 0.8                       # bath on one end
-    inv = rng.random((k, 11)) * 1e-9
+    inv = rng.random((k, len(ELEMENT_IDS))) * 1e-9
     res = transport.exchange_be(graph, inv, 2.0, 1.0,
                                 bath=transport.BoundaryBath(
-                                    g_bnd=g_bnd / 2.0, c_res=np.zeros(11)))
+                                    g_bnd=g_bnd / 2.0, c_res=np.zeros(len(ELEMENT_IDS))))
     assert res.status == "ok"
     new = inv + res.delta
     assert np.all(new >= 0.0)
     # domain loss equals the boundary accumulator (per element, to the
     # exchange-gate tolerance - summation order dust only)
-    for e in range(11):
+    for e in range(len(ELEMENT_IDS)):
         loss = float(res.delta[:, e].sum())
         assert loss == pytest.approx(float(res.boundary_net[e]),
                                      abs=1e-24 + 1e-12 * float(
@@ -564,7 +564,7 @@ def test_bath_flux_form_conservation_and_signs():
     assert np.all(res.boundary_net <= 0.0)   # pure-water bath only leaches
     res2 = transport.exchange_be(graph, inv, 2.0, 1.0,
                                  bath=transport.BoundaryBath(
-                                     g_bnd=g_bnd / 2.0, c_res=np.zeros(11)))
+                                     g_bnd=g_bnd / 2.0, c_res=np.zeros(len(ELEMENT_IDS))))
     assert np.array_equal(res.delta, res2.delta)
 
 
@@ -678,13 +678,13 @@ def test_boundary_mirror_symmetry():
                                          (False, True, True))
     g_ar = transport.boundary_coupling(d_id, n_dom, g, 0, True, True)
     # z-symmetric inventory profile: n proportional to water, uniform c
-    inv = np.outer(graph.water, np.ones(11)) * 2.5e-10
+    inv = np.outer(graph.water, np.ones(len(ELEMENT_IDS))) * 2.5e-10
     res = transport.exchange_be(graph, inv, 1.0, 2.0,
                                 bath=transport.BoundaryBath(
-                                    g_bnd=g_ar / 2.0, c_res=np.zeros(11)))
+                                    g_bnd=g_ar / 2.0, c_res=np.zeros(len(ELEMENT_IDS))))
     assert res.status == "ok"
     # per-z-layer delta via domain -> layer map (tile 2 => 4 z-bands)
-    layer_delta = np.zeros((n // 2, 11))
+    layer_delta = np.zeros((n // 2, len(ELEMENT_IDS)))
     for d in range(n_dom):
         zs = np.flatnonzero((d_id == d).any(axis=(1, 2)))
         band = int(zs[0]) // 2
@@ -711,7 +711,7 @@ def test_switch_permutation_is_remapped_exactly():
     assert ndp == nde                        # the count-proxy trap
     assert not np.array_equal(dp, de)        # ...while ids permute
     rows = (np.arange(ndp, dtype=float)[:, None]
-            * np.ones((1, 11)) + 1.0)
+            * np.ones((1, len(ELEMENT_IDS))) + 1.0)
     res = transport.remap_inventories(dp, liquid, de, liquid, rows, nde)
     assert not res.dryout
     # every voxel's row content followed its voxel set exactly
@@ -759,7 +759,7 @@ def test_dryout_surrender_witnesses():
     cl_labels = np.array([[[0, 0, 1]]])
     prev_liquid = np.array([[[3.0, 4.0, 1e-4]]])
     dom_to_cl = np.array([0, 0, 1])
-    rows = np.zeros((3, 11))
+    rows = np.zeros((3, len(ELEMENT_IDS)))
     rows[0, 0] = 1.0
     rows[1, 1] = 0.5
     rows[2, :3] = 1e-9                       # dust row, trace water

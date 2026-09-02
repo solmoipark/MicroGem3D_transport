@@ -314,7 +314,7 @@ def test_np_engine_restart_bit_identity(tmp_path):
     manifest = json.loads(man.read_text(encoding="utf-8"))
     manifest["header.json"] = _hl.sha256(hdr.read_bytes()).hexdigest()
     man.write_text(json.dumps(manifest), encoding="utf-8")
-    assert FORMAT_VERSION == 5
+    assert FORMAT_VERSION == 6
     with pytest.raises(StorageError, match="species transport"):
         load_checkpoint(str(tmp_path / "v4ish"), reg)
 
@@ -409,3 +409,42 @@ def test_exchange_be_signed_frame_columns():
     assert ex.delta[:, h].sum() == pytest.approx(0.0, abs=1e-24)   # conserved
     assert (inv + ex.delta)[0, h] > inv[0, h]                        # relaxes
     assert ex.delta[:, ca].sum() == pytest.approx(0.0, abs=1e-24)
+
+
+# ------------------------------------------------------- RT-Cl: E=12 ledger
+
+@needs_gems
+def test_ledger_superset_bundle_contract():
+    """RT-Cl (FORMAT_VERSION 6): the element ledger carries Cl (last
+    column). A bundle without Cl still loads - the column stays zero -
+    but feeding it chloride mass is a hard config error, while the PC-Cl
+    bundle accepts it and speciates Cl- (Friedel's salt declared)."""
+    import numpy as np
+    from tinn.gems import GemsBackend, GemsError, GemsWorker
+    from tinn.registry import ELEMENT_IDS
+    assert ELEMENT_IDS[-1] == "Cl" and len(ELEMENT_IDS) == 12
+    e = np.zeros(len(ELEMENT_IDS))
+    for el, v in (("Ca", 2e-3), ("Na", 1e-3), ("Cl", 1e-3), ("O", 3e-3),
+                  ("H", 2e-3)):
+        e[ELEMENT_IDS.index(el)] = v
+    w = GemsWorker(str(PC_BUNDLE), python_executable=str(GEMS_PYTHON))
+    try:
+        be = GemsBackend(w, 298.15)
+        assert be._absent_elements == ("Cl",)
+        with pytest.raises(GemsError, match="no Cl component"):
+            be.react({}, 5.0, e)
+    finally:
+        w.close()
+    cl_bundle = REPO / "gems_bundles" / "PC-Cl" / "MySystem-dat.lst"
+    w = GemsWorker(str(cl_bundle), python_executable=str(GEMS_PYTHON))
+    try:
+        be = GemsBackend(w, 298.15)
+        assert be._absent_elements == ()
+        assert "Friedels" in be.hydrate_ids
+        r = be.react({}, 5.0, e)
+        assert r.status == "ok"
+        cl = ELEMENT_IDS.index("Cl")
+        assert r.aqueous_elements[cl] == pytest.approx(1e-3, rel=1e-6)
+        assert r.aqueous_species_mol.get("Cl-", 0.0) > 0.0
+    finally:
+        w.close()
