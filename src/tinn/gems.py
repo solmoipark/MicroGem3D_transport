@@ -346,7 +346,7 @@ class GemsWorker:
             present = set(self._cached_info()["phase_names"])
             suppressed_phases = tuple(
                 p for p in SUPPRESSED_CLINKER_PHASES if p in present)
-        return self._call({
+        result = self._call({
             "mode": "elements",
             "dat_lst": self.bundle_lst,
             "element_mol": {str(k): float(v) for k, v in element_mol.items()},
@@ -354,6 +354,26 @@ class GemsWorker:
             "pressure_pa": float(pressure_pa),
             "suppressed_phases": list(suppressed_phases),
         })
+        # suppression witness, mirroring the engine path (gems.py react):
+        # bound=0 leaves numerical dust, anything material means the
+        # suppression LEAKED. Measured 2026-09-02: the CO3_SO4_AFt solid
+        # solution ignored suppress_multiple_phases on this 0D path and
+        # precipitated up to 45% of the input sulfur while its sibling
+        # SO4_CO3_AFt and every single-DC phase suppressed fine - a
+        # silent leak would contaminate every crosscheck built on this
+        # API (no silent fallback, PRD 0.3).
+        total_in = sum(v for k, v in element_mol.items()
+                       if k != CHARGE_ELEMENT_ID)
+        for phase in suppressed_phases:
+            amt = (result.phase_amounts_mol or {}).get(phase, 0.0)
+            if amt > 1e-9 * total_in:
+                raise GemsError(
+                    f"suppressed phase {phase} precipitated {amt!r} mol "
+                    f"(input total {total_in!r}) - suppression leaked "
+                    f"(known xgems issue for some solid solutions, e.g. "
+                    f"CO3_SO4_AFt); drop it from the request or treat the "
+                    f"result as unsuppressed", kind="internal")
+        return result
 
     # --------------------------------------------------------------- private
     def _call(self, request: Dict) -> GemsResult:
