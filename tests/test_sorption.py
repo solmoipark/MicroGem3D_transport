@@ -569,3 +569,35 @@ def test_sorption_second_pool_operator_independent():
     assert r1.sorbed_mol[s_i] == pytest.approx(r0.sorbed_mol[s_i], rel=5e-2)
     with pytest.raises(ValueError, match="Surf_c pool"):
         one.sorb(e, 2.0, 3.0e-4, sites_c_mol=1.0e-4)
+
+
+def test_sorbed_store_folds_onto_wet_neighbours_on_cluster_death():
+    """RT-Cl-3: a dead cluster's sorbed row folds onto the wet neighbours
+    of its voxels (largest-liquid-contact label, voxel-count weighted,
+    exact floats); with no wet neighbour anywhere the fold reports None
+    (the caller keeps the hard reject)."""
+    from tinn.engine import _fold_dead_sorbed_rows
+    n = 4
+    cl_labels = np.full((n, n, n), -1, dtype=np.int64)
+    cl_labels[0] = 1                      # the dying cluster: whole z=0 plane
+    cl_labels[2:] = 2
+    new_labels = np.full((n, n, n), -1, dtype=np.int64)
+    new_labels[1] = 0                     # wet neighbour plane (new domain 0)
+    new_labels[2:] = 1                    # another wet domain, not adjacent
+    liquid = np.zeros((n, n, n))
+    liquid[1] = 0.5
+    liquid[2:] = 1.0
+    rows = np.zeros((1, len(ELEMENT_IDS)))
+    rows[0, ELEMENT_IDS.index("Cl")] = 3.0e-3
+    result = np.zeros((2, len(ELEMENT_IDS)))
+    events = _fold_dead_sorbed_rows(rows, result, [0], np.array([1]),
+                                    cl_labels, new_labels, liquid,
+                                    (False, True, True))
+    assert events == [(0, 0, float(n * n))]
+    assert result[0, ELEMENT_IDS.index("Cl")] == 3.0e-3      # exact float
+    assert result[1].sum() == 0.0
+    dry = np.full((n, n, n), -1, dtype=np.int64)
+    assert _fold_dead_sorbed_rows(rows, np.zeros_like(result), [0],
+                                  np.array([1]), cl_labels, dry,
+                                  np.zeros_like(liquid),
+                                  (False, True, True)) is None

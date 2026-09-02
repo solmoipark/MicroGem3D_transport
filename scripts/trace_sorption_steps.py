@@ -27,6 +27,11 @@ def main() -> None:
         Path(sys.argv[1]).read_text(encoding="utf-8")))
 
     def hook(rec: dict) -> None:
+        if rec.get("event") == "trial_rejected":
+            print("REJECT " + json.dumps(
+                {k: v for k, v in rec.items()
+                 if k not in ("metrics",)}, default=str)[:1500], flush=True)
+            return
         if rec.get("event") != "step_accepted":
             return
         m = rec.get("metrics") or {}
@@ -42,7 +47,15 @@ def main() -> None:
         t = rec.get("time_h", rec.get("time_end_h"))
         print(f"t={t} {json.dumps(found)}", flush=True)
 
-    Engine(cfg).run(out_dir=sys.argv[2], audit_hook=hook)
+    state = None
+    if any(a == "resume=1" for a in sys.argv[3:]):
+        from tinn.registry import registry_for
+        from tinn.storage import load_checkpoint
+        ckpts = sorted(Path(sys.argv[2]).glob("ckpt_*"))
+        state = load_checkpoint(str(ckpts[-1]), registry_for(cfg))
+        print(f"resuming from {ckpts[-1].name} at t={state.time_h} h",
+              flush=True)
+    Engine(cfg).run(state=state, out_dir=sys.argv[2], audit_hook=hook)
 
 
 if __name__ == "__main__":

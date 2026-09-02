@@ -47,6 +47,24 @@ class EngineError(RuntimeError):
 @dataclass
 class StepReject:
     reason: str
+    detail: str = ""     # diagnosis text for the audit record / EngineError
+
+
+def _dryout_detail(tag: str, rows: np.ndarray, hard: List[int],
+                   dom_to_cl, cl_labels, prev_liquid: np.ndarray) -> str:
+    """The surrender witnesses of every hard-dry domain, for the reject
+    record: a cluster_dryout reject that names nothing is undiagnosable
+    (measured: RT-Cl-3 0.1 M ladder, nine anonymous rejects)."""
+    pool = float(np.abs(rows).sum()) or 1.0
+    tot_liq = float(prev_liquid[prev_liquid > 0.0].sum()) or 1.0
+    parts = []
+    for pd in hard[:6]:
+        row_sum = float(np.abs(rows[pd]).sum())
+        cl_liq = (float(prev_liquid[cl_labels == int(dom_to_cl[pd])].sum())
+                  if dom_to_cl is not None else float("nan"))
+        parts.append(f"domain {int(pd)}: row/pool {row_sum / pool:.2e}, "
+                     f"cluster water/total {cl_liq / tot_liq:.2e}")
+    return f"{tag} hard dryout of {len(hard)} domain(s): " + "; ".join(parts)
 
 
 def _dryout_surrender(rows: np.ndarray, hard: List[int],
@@ -109,6 +127,38 @@ def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray,
 
 _SORB_SOLUTE_COLS = [i for i, el in enumerate(ELEMENT_IDS)
                      if el not in ("O", "H")]
+
+
+def _fold_dead_sorbed_rows(rows: np.ndarray, result_rows: np.ndarray,
+                           hard: List[int], dom_to_cl, cl_labels: np.ndarray,
+                           new_labels: np.ndarray, new_liquid: np.ndarray,
+                           periodic_axes) -> Optional[List[tuple]]:
+    """RT-Cl-3 (measured 2026-09-03): the sorbed store rides the SOLID
+    surface, not the water. When a whole cluster dies (an orphan pocket
+    self-desiccating at bath onset), its solution row is dust and
+    surrenders, but its sorbed row is material (the store remaps by
+    sorbent weight, so a C-S-H-rich dry pocket holds a real share) and
+    the old hard reject was dt-independent - nine anonymous rejects. The
+    surface load stays where the solid is: the row folds onto the wet
+    neighbours of the dead cluster's voxels, weighted by how many of
+    those voxels see each neighbour label as their best liquid contact
+    (deterministic, exact floats; the next re-offer hands it to that
+    reactor). None if some dead cluster has no wet neighbour at all."""
+    nb = _neighbor_best_label(new_labels, new_liquid, periodic_axes)
+    events: List[tuple] = []
+    for pd in hard:
+        m = cl_labels == int(dom_to_cl[pd])
+        cand = nb[m]
+        cand = cand[cand >= 0]
+        if cand.size == 0:
+            return None
+        dist = np.bincount(cand, minlength=result_rows.shape[0]).astype(
+            np.float64)
+        frac = dist / float(dist.sum())
+        result_rows += rows[pd][None, :] * frac[:, None]
+        for nd in np.flatnonzero(dist > 0.0):
+            events.append((int(pd), int(nd), float(dist[nd])))
+    return events
 
 
 def sorption_reactor_dry(water_mol: float, offer: np.ndarray,
@@ -1773,7 +1823,10 @@ class Engine:
         fold_events: List[tuple] = []
         if remap.dryout:
             if dom_to_cl is None:
-                return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                return None, StepReject(
+                    REJECT_CLUSTER_DRYOUT,
+                    f"inventory dryout of clusters {remap.dryout[:6]} "
+                    f"(no domain graph)"), {}
             hard, fold_events = _fold_dry_rows(residual, remap.inventory,
                                                remap.dryout)
             if hard:
@@ -1781,7 +1834,11 @@ class Engine:
                                                  cl_labels, prev_liquid)
                                if bath_active else None)
                 if surrendered is None:
-                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                    return None, StepReject(
+                        REJECT_CLUSTER_DRYOUT,
+                        _dryout_detail("inventory", residual, hard, dom_to_cl,
+                                       cl_labels, prev_liquid)
+                        + ("" if bath_active else " (bath inactive)")), {}
                 for pd in surrendered:
                     trial.boundary_exchanged_elements = (
                         trial.boundary_exchanged_elements - residual[pd])
@@ -1867,12 +1924,47 @@ class Engine:
             sorb_folds = []
             if sorb_remap.dryout:
                 if dom_to_cl is None:
-                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                    return None, StepReject(
+                        REJECT_CLUSTER_DRYOUT,
+                        f"sorbed-store dryout of clusters "
+                        f"{sorb_remap.dryout[:6]} (no domain graph)"), {}
                 hard_s, sorb_folds = _fold_dry_rows(sorb_new,
                                                     sorb_remap.inventory,
                                                     sorb_remap.dryout)
                 if hard_s:
-                    return None, StepReject(REJECT_CLUSTER_DRYOUT), {}
+                    folded = _fold_dead_sorbed_rows(
+                        sorb_new, sorb_remap.inventory, hard_s, dom_to_cl,
+                        cl_labels, new_labels, trial.capillary_liquid,
+                        axes_now)
+                    if folded is None:
+                        # an ISOLATED dead pocket (no wet neighbour at all):
+                        # the PRD 4.6.3 surrender doctrine applies to the
+                        # store exactly as to the solution row - both
+                        # witnesses (row vs store pool, cluster water vs
+                        # total) below DRYOUT_SURRENDER_REL surrender the
+                        # row to the boundary ledger (exact floats, closure
+                        # identity untouched); a material row keeps the
+                        # hard reject. Measured: RT-Cl-3 0.1 M onset, one
+                        # pocket at row/pool 2.6e-4, water/total 1e-12.
+                        surrendered_s = (_dryout_surrender(
+                            sorb_new, hard_s, dom_to_cl, cl_labels,
+                            prev_liquid) if bath_active else None)
+                        if surrendered_s is None:
+                            return None, StepReject(
+                                REJECT_CLUSTER_DRYOUT,
+                                _dryout_detail("sorbed store", sorb_new,
+                                               hard_s, dom_to_cl, cl_labels,
+                                               prev_liquid)
+                                + " (no wet neighbour, not dust)"), {}
+                        for pd in surrendered_s:
+                            trial.boundary_exchanged_elements = (
+                                trial.boundary_exchanged_elements
+                                - sorb_new[pd])
+                        exchange_metrics["sorption_surrendered_rows"] = (
+                            exchange_metrics.get("sorption_surrendered_rows", 0)
+                            + len(surrendered_s))
+                    else:
+                        sorb_folds.extend(folded)
             fold_events.extend(sorb_folds)
             trial.domain_sorbed_mol = sorb_remap.inventory
         # RT-W2b: economy snapshots survive relabeling only through pure
@@ -2063,6 +2155,7 @@ class Engine:
                             "dt_attempt_h": float(dt_try),
                             "retry": int(retries),
                             "reason": reject.reason,
+                            "detail": reject.detail,
                             "metrics": dict(metrics),
                             "committed_dense_hash_before": dense_before,
                             "committed_dense_hash_after": state.dense_hash(),
@@ -2072,7 +2165,9 @@ class Engine:
                     if retries > sched.max_retries:
                         raise EngineError(
                             f"step at t={state.time_h} h rejected {retries} times "
-                            f"(last reason {reject.reason!r})", reject.reason)
+                            f"(last reason {reject.reason!r}"
+                            f"{': ' + reject.detail if reject.detail else ''})",
+                            reject.reason)
                     # halve, but never below dt_min (a boundary-alignment sliver
                     # already below dt_min just retries at its own size)
                     dt_try = max(dt_try / 2.0, min(sched.dt_min_h, dt_try))
