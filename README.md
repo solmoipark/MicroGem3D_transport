@@ -1,10 +1,14 @@
-# TINN 시멘트 수화 4D 플랫폼 v2 — reactive-transport 분기 (rt-dev)
+# MicroGEM3D — reactive-transport 선 (`rt`, v4.0/RT)
 
 배합(C3S, OPC 4상, SCM 블렌드), PSD, w/c, 온도, 시간 스케줄을 입력받아 질량 보존되는
 시간 의존 3D 미세구조(상 분포·물 분배·공극·수송 지표)를 결정론적·재시작 가능하게
 출력하는 시뮬레이션 플랫폼. 설계와 범위는 [PRD.md](PRD.md)가 유일한 기준 문서다.
 
-이 저장소는 플랫폼 v2(f7be88b)에서 분기한 **v4.0/RT 개발 트리**다 (PRD §1.4 v4.0/RT,
+**버전 계보**: MicroGEM3D `main` = v3(transport 도입 전, 논문판, 태그 `v3.0-paper`),
+이 브랜치 `rt` = v4(reactive transport, 태그 `v4.0-rt-tier1` …). 개발 중 이름은
+TINN이었고 패키지 이름공간(`src/tinn/`, `TINN_GEMS_PYTHON`)은 재현성 계약상 유지한다.
+
+이 브랜치는 플랫폼 v2(f7be88b)에서 분기한 **v4.0/RT 개발 트리**다 (PRD §1.4 v4.0/RT,
 §4.6): config `transport` 섹션으로 ① 속도제한 재평형(모드 B, `exchange_tau_h`) ②
 서브클러스터 평형 도메인 + 도메인 그래프 확산(모드 C, `domains`) ③ 경계 저수조
 (RT-W3, `boundary`)를 선택한다. `transport` 부재 시 현행 엔진과 비트 동일하게 동작한다.
