@@ -1028,7 +1028,11 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   설계 방향(둘 중 하나 또는 병행): ① 사이트를 "소유 CSHQ"가 아닌 **물이
   접촉하는 CSHQ**로 한정(포켓 펌프 제거), ② O/H를 부호 있는 프레임 원소로
   원장·BE·overdraw 가드에서 일관 취급(탈착의 OH⁻ 소비 = 산성화, 물 프레임
-  상대값). 봉인 런(calibrated, 포켓 저장소 0.6%)은 영향 미미.
+  상대값). **범위 확정(같은 날 실측)**: 같은 168 h에서 봉인 런(모드 C
+  없음)은 주 클러스터 저장소 점유 99.6%(calibrated)·99.9%(알칼리) — 포켓
+  펌프는 **모드 C(`transport.domains`) 하의 소유권→사이트 경로에만** 발생.
+  수정 1순위는 모드 C 사이트 산정(도메인 단위 소유권이 포켓에 CSHQ를
+  넘기는 지점)이며 봉인 결과는 영향 없음.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
