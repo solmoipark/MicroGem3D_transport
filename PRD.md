@@ -977,15 +977,23 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   357) 배치 실험(3.4 g C-S-H/250 mL NaOH, 25 °C)을 **SorptionOperator
   자체로 재현**(cemdata18 활동도, no_edl, 사이트 고정)해 0.1 M NaOH
   등온선(Fig. 3 디지타이즈 11점, OPC 공극수 최근접 pH)에 최소자승 →
-  **log_K = +0.50** (0.25 그리드 + 0.05 정밀화, SSE 0.286 (mmol/g)²,
-  RMS ~0.16 mmol/g). 파생 Rd(10 mmol/L, 0.1 M NaOH) ≈ **29 L/kg** —
+  **log_K = +0.50 (−0.10/+0.05)** (0.25 그리드 + 0.05 정밀화, SSE 0.286
+  (mmol/g)², RMS ~0.16 mmol/g; 괄호는 SSE 평탄역 — 0.40–0.52에서
+  SSE +1% 미만). **불확도 사슬 주의**: 사이트 밀도는 BET 방법 의존
+  (Divet 자체 320–350 m²/g)과 silanol/Si의 Ca/Si 의존(Haas & Nonat의
+  γ-C-S-H는 0.5/Si — 고 Ca/Si 조성이 낮은 쪽) 탓에 **×1.5–2 밴드**를
+  가진 점추정이다. 파생 Rd(10 mmol/L, 0.1 M NaOH) ≈ **29 L/kg** —
   Ochs et al. 2016의 약한 음이온(Se(VI) 유사체) C-S-H 밴드와 정합.
   피팅 스크립트+디지타이즈 점 = `scripts/fit_so4_logk.py`(재실행 가능,
   스케일 불변 실측: 기하평균 앵커 전환 후 12자리 일치).
 - **모형 한계 (메커니즘 표 항목)**: 0.5 M 검증 — 논문 자체 회귀(Fig. 2:
   1/Cb = 54.42/C − 0.053, R² 0.9868) 대비 모형 ~6× 과소. 단일 리간드
   교환(OH⁻ 방출)의 pH 경향이 실측(pH·이온강도와 함께 **증가**)과 반대 —
-  상수는 보정 pH(~12.9–13.4) 전용, pH 외삽 금지.
+  상수는 보정 pH(~12.9–13.4) 전용, pH 외삽 금지. **바인더 결합 주의**:
+  28d 런의 보정창 일치는 현 qualification 바인더가 알칼리-빈약(아카나이트
+  0.5%뿐)해 공극수가 pH ~13.0에 앉는 덕이다 — 실제 알칼리 함량 바인더
+  (Na₂O-eq ~1%)에선 운영점이 pH 13.3+로 이동해 이 한계가 실제 오차로
+  전환된다.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
@@ -995,18 +1003,22 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   (하전 종명 `Surf_sOCa+` 보존). 분해기에 NaCl 담체 추가(Cl은 원장
   원소가 아직 아님 — E3 선행분, Na 부족 시 거부). 신규 optional은 해시
   불가시(pre-S2a 수착 config 해시 불변, 테스트 고정).
-  **공동 보정 실측** (`scripts/fit_so4_ddl.py`: NaOH 4곡선 31점 피팅 +
-  NaCl 2곡선 out-of-sample 예측): 최적 (A형 OH방출, pK_H 9.8/K_Ca −7,
-  Na쌍 +0.5, SO4 log_K +5.3)에서도 joint RMS 0.62 mmol/g — pH 사다리를
-  정량 재현 못함(0.05 M ~2× 과대, 0.5 M ~6× 과소; Gouy-Chapman의
-  고이온강도 스크리닝 과장). NaCl 경향은 **부호 재현**(no_edl은 불가)
-  하나 크기 ~2× 과대. **판정: SO4 프로덕션 상수는 no_edl 국소 보정
+  **공동 보정 실측** (`scripts/fit_so4_ddl.py`: NaOH 4곡선 33점 피팅 +
+  NaCl 2곡선 out-of-sample 예측; 리뷰 정정 2026-09-02 — 0.5 M 곡선을
+  Fig 2 회귀의 고농도 외삽에서 **Fig 3 실측 디지타이즈로 교체**, 외삽은
+  C≥80 mmol/L에서 Cb를 ~30% 부풀렸었음): 최적 (A형 OH방출, pK_H
+  9.8/K_Ca −7, Na쌍 0.0, SO4 log_K +5.1)에서도 joint RMS 0.65 mmol/g —
+  pH 사다리를 정량 재현 못함(0.05 M ~2–4× 과대, 0.5 M ~5× 과소;
+  Gouy-Chapman의 고이온강도 스크리닝 과장). NaCl 경향은 **부호 재현**
+  (no_edl은 불가)하나 크기 ~1.5–2× 과대. **판정: SO4 프로덕션 상수는 no_edl 국소 보정
   (S1c) 유지; ddl은 능력으로 탑재하되 정전 지배 이온(Cl 배제, 알칼리
   Donnan)용으로 보류** — 메커니즘 표 항목.
 - **28d 실측 런** (`scripts/run_sorption_so4.py calibrated`, Deschner
   OPC 32³ 봉인 dt 0.6 h, 296.15 K, 벽시계 766 s,
   `runs/sorption_so4_results_calibrated.json`): 수착 S 24 h 1.68e-12 →
-  168 h 1.75e-12 → **672 h 1.85e-12 mol = 총 S(1.665e-11)의 11.1%**;
+  168 h 1.75e-12 → **672 h 1.85e-12 mol = 총 S(1.665e-11)의 11.1%**
+  (위 불확도 사슬을 통과시키면 ~5–20% 밴드의 점추정 — 밀도 ±2× 민감도
+  런은 미실행);
   사이트 1.91→3.85e-11 mol(CSHQ 성장 동승), 점유율 4.8%, 커버리지
   0.999→0.938. 최종 공극수(주 클러스터): **[SO4] 0.37 mmol/L —
   Barbarulo & al. 2007 (CCR 37, 1176)의 20 °C 에트린자이트 평형

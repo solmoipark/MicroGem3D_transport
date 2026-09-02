@@ -34,7 +34,7 @@ def base_path(name: str) -> Path:
 
 def run_case(d0: float, out_dir: Path, dt_s: float = None,
              base: Path = None, until_h: float = None,
-             np_mode: bool = False) -> dict:
+             np_mode: bool = False, resume: bool = False) -> dict:
     raw = json.loads((base or base_path("opc32")).read_text(encoding="utf-8"))
     if np_mode:
         # RT-W4(2) remeasure (PRD 4.6.4): species NP conductances replace the
@@ -91,14 +91,34 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
                 else:
                     np_counts[k] += m.get(k, 0.0)
 
-    if out_dir.exists():
+    start_state = None
+    if resume and out_dir.exists():
+        # continue an interrupted run from its last checkpoint (the engine
+        # is resume-complete: outputs filter on state.time_h and ckpt
+        # indices are schedule-global). config_hash must match - a resume
+        # across code/config drift is refused, never absorbed. NOTE: the
+        # summary-derived counters (np clamps, frozen) then cover only the
+        # resumed portion; checkpoint-based rows are unaffected.
+        done = sorted(out_dir.glob("ckpt_*"))
+        if done:
+            from tinn.storage import load_checkpoint
+            start_state = load_checkpoint(str(done[-1]), registry_for(cfg))
+            if start_state.config_hash != cfg.config_hash():
+                raise SystemExit(
+                    f"resume refused: checkpoint config_hash "
+                    f"{start_state.config_hash[:12]} != current config "
+                    f"{cfg.config_hash()[:12]}")
+            print(f"  [resume] from {done[-1].name} t={start_state.time_h} h",
+                  flush=True)
+    if out_dir.exists() and start_state is None:
         # storage refuses checkpoint overwrites; a rerun after an aborted
         # or completed ladder must start clean (review finding)
         import shutil
         assert out_dir.name.startswith("leach_w4_")
         shutil.rmtree(out_dir)
     t0 = time.perf_counter()
-    state, summary = Engine(cfg).run(out_dir=str(out_dir), audit_hook=hook)
+    state, summary = Engine(cfg).run(state=start_state,
+                                     out_dir=str(out_dir), audit_hook=hook)
     wall = time.perf_counter() - t0
 
     reg = registry_for(cfg)
@@ -152,10 +172,13 @@ def main() -> None:
     until_h = None
     cfg_name = "opc32"
     np_mode = False
+    resume = False
     while args and "=" in args[0]:
         key, _, val = args[0].partition("=")
         if key == "dt":
             dt_s = float(val)
+        elif key == "resume":
+            resume = val not in ("0", "false", "")
         elif key == "cfg":
             cfg_name = val
         elif key == "until":
@@ -183,7 +206,7 @@ def main() -> None:
         out = REPO / "runs" / f"leach_w4_{tag}"
         print(f"== {tag} ==", flush=True)
         results[tag] = run_case(d0, out, dt_s, base, until_h,
-                                np_mode=np_mode)
+                                np_mode=np_mode, resume=resume)
         r = results[tag]
         print(f"  wall {r['wall_s']} s, a = {r['a_um_per_sqrt_day']} "
               f"um/sqrt(day) ({r['n_fit_points']} pts), supply "

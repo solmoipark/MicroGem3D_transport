@@ -106,6 +106,23 @@ def _neighbor_best_label(labels: np.ndarray, liquid: np.ndarray,
     return np.where(best_liq >= 0.0, best_lab, np.int64(-1))
 
 
+
+_SORB_SOLUTE_COLS = [i for i, el in enumerate(ELEMENT_IDS)
+                     if el not in ("O", "H")]
+
+
+def sorption_reactor_dry(water_mol: float, offer: np.ndarray,
+                         dust_floor: float) -> bool:
+    """S-stage wetness/dust contract (RT-S1c, PRD 4.6.5): a reactor is an
+    aqueous phase only when water dominates the solutes (mol ratio >= 10)
+    AND the solute total sits above the ledger noise floor. Pure function
+    so the contract stays unit-testable against the measured failure
+    inputs (the femto-water dust cluster, the solute-noise micro-pocket)."""
+    solute = float(np.clip(offer[_SORB_SOLUTE_COLS], 0.0, None).sum())
+    return (water_mol <= 0.0 or water_mol < 10.0 * solute
+            or solute <= dust_floor)
+
+
 class Engine:
     def __init__(self, config: TinnConfig, registry: Optional[Registry] = None,
                  reaction_backend: Optional[backend_mod.ReactionBackend] = None,
@@ -1010,9 +1027,6 @@ class Engine:
             # swallowed (measured: a 5.6e-17 mol water / 7.3e-17 mol S
             # dust cluster scaled to a ~7e4 mol/kg "solution" and broke
             # IPhreeqc's A(H2O) convergence).
-            oh_cols = [ELEMENT_IDS.index("O"), ELEMENT_IDS.index("H")]
-            solute_cols = [i for i in range(len(ELEMENT_IDS))
-                           if i not in oh_cols]
             n_sorb_dry = 0
             # dust clause: an offer whose solute total sits at the ledger's
             # float-noise floor (same style as the overdraw guard below)
@@ -1023,10 +1037,8 @@ class Engine:
             dust_floor = 1e-24 + 1e-12 * inv_scale
             for c in range(n_clusters):
                 offer = inv_eff[c] + sorb_in[c]
-                solute = float(np.clip(offer[solute_cols], 0.0, None).sum())
-                if (water_mol_c[c] <= 0.0
-                        or water_mol_c[c] < 10.0 * solute
-                        or solute <= dust_floor):
+                if sorption_reactor_dry(float(water_mol_c[c]), offer,
+                                        dust_floor):
                     sorb_new[c] = sorb_in[c]     # dry reactor: frozen store
                     n_sorb_dry += int(water_mol_c[c] > 0.0)
                     continue

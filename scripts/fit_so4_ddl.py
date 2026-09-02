@@ -55,8 +55,7 @@ CHARGING = {
 }
 
 # (NaOH mol/L, NaCl mol/L, [(C_eq mmol/L, Cb mmol/g), ...]) - digitized
-# from Divet Figs. 3-4 (600 dpi rendering), 0.5 M from the Fig. 2
-# regression 1/Cb = 54.42/C - 0.053 (R2 0.9868).
+# from Divet Figs. 3-4 (600 dpi rendering).
 DATASETS_FIT = {
     "0.05M NaOH":  (0.05, 0.0, [(20, 0.25), (30, 0.47), (47, 0.62),
                                 (65, 0.93), (95, 1.03), (157, 1.50)]),
@@ -67,8 +66,13 @@ DATASETS_FIT = {
     "0.2M NaOH":   (0.20, 0.0, [(22, 0.41), (28, 0.52), (38, 0.60),
                                 (44, 0.72), (64, 1.00), (75, 1.06),
                                 (79, 1.18), (94, 1.27), (121, 1.65)]),
-    "0.5M NaOH":   (0.50, 0.0, [(c, 1.0 / (54.42 / c - 0.053))
-                                for c in (10.0, 20.0, 40.0, 80.0, 120.0)]),
+    # digitized Fig. 3 filled diamonds - NOT the Fig. 2 regression:
+    # extrapolating that linearization to C >= 80 mmol/L inflates Cb by
+    # ~30% vs the paper's own measured curve (review correction
+    # 2026-09-02); the regression stays quoted for the Henry-slope only.
+    "0.5M NaOH":   (0.50, 0.0, [(20, 0.55), (35, 0.75), (45, 0.95),
+                                (60, 1.25), (75, 1.50), (85, 1.63),
+                                (120, 1.90)]),
 }
 DATASETS_VAL = {
     "0.2M+0.5M NaCl": (0.20, 0.5, [(44, 0.90), (62, 1.27), (78, 1.47),

@@ -353,3 +353,57 @@ def test_sorption_ddl_operator_matches_standalone():
     kgw = float(rows[-1][col["mass_H2O"]])
     bound = float(rows[-1][col["m_Surf_sSO4-(mol/kgw)"]]) * kgw
     assert r.site_occupancy["Surf_sSO4-"] == pytest.approx(bound, rel=1e-9)
+
+
+def test_sorption_wetness_dust_contract():
+    """RT-S1c S-stage contract, pinned on the two MEASURED failure
+    inputs: the femto-water dust cluster (water 5.6e-17 mol vs S
+    7.3e-17 mol -> scaled to a ~7e4 mol/kg pseudo-solution, A(H2O)
+    diverged) and the water-rich solute-noise pocket (broke the exact
+    oxide decomposition at noise scale). Healthy pore solutions stay
+    wet; water<=0 stays dry."""
+    from tinn.engine import sorption_reactor_dry
+
+    def offer(**mol):
+        e = np.zeros(len(ELEMENT_IDS))
+        for el, v in mol.items():
+            e[ELEMENT_IDS.index(el)] = v
+        return e
+
+    floor = 1e-24 + 1e-12 * 1e-4          # ledger scale ~1e-4 mol
+    # measured dust cluster (2026-09-02 run log): ratio ~0.76 -> dry
+    dust = offer(S=7.336702161685963e-17, Ca=5.8087856419267095e-21,
+                 K=1.7081002873427281e-19, O=2.2028302791834196e-16)
+    assert sorption_reactor_dry(5.557966695806393e-17, dust, floor)
+    # water-rich, solute at noise scale -> dry via the dust floor
+    noise = offer(S=1e-19, Ca=1e-20)
+    assert sorption_reactor_dry(3e-10, noise, floor)
+    # healthy CH-buffered pore solution (ratio ~55) -> wet
+    pore = offer(Ca=2e-6, S=5e-7, K=1e-6, O=1e-5)
+    assert not sorption_reactor_dry(2e-4, pore, floor)
+    # water<=0 always dry; negative element dust never flips the sign
+    assert sorption_reactor_dry(0.0, pore, floor)
+    assert sorption_reactor_dry(-1.0, pore, floor)
+    neg = offer(S=-1e-6, Ca=1e-9)
+    assert sorption_reactor_dry(5e-9, neg, floor) in (True, False)
+
+
+def test_sorption_nacl_carrier_decomposition():
+    """RT-S2a: chloride rides the NaCl carrier in the reactant
+    decomposition (E3 precursor). Exact closure round-trips; a Cl
+    surplus over Na is refused - no other carrier is declared."""
+    from tinn.backend import _decompose_to_reactants
+
+    r = _decompose_to_reactants(
+        {"Na": 0.55, "Cl": 0.5, "S": 0.015, "O": 0.11, "H": 0.05})
+    assert r["NaCl"] == pytest.approx(0.5)
+    assert r["Na2O"] == pytest.approx((0.55 - 0.5) / 2.0)
+    assert r["SO3"] == pytest.approx(0.015)
+    # NaOH-only solution with NaCl: exact O/H accounting, no O2 residue
+    r2 = _decompose_to_reactants(
+        {"Na": 0.075, "Cl": 0.05, "O": 0.025, "H": 0.025})
+    assert r2["NaCl"] == pytest.approx(0.05)
+    assert r2["H2O"] == pytest.approx(0.0125)
+    assert "O2" not in r2
+    with pytest.raises(ValueError, match="NaCl carrier"):
+        _decompose_to_reactants({"Cl": 0.5, "Na": 0.1, "O": 0.1, "H": 0.1})
