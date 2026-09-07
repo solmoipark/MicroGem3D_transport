@@ -544,11 +544,21 @@ class SpeciesDiffusionConfig(BaseModel):
     # RT-P0a: keep the scalar d0 physics and only REPORT the NP effective
     # diffusivities per step. False (active transport) lands with RT-P0b.
     diagnostics_only: bool = False
+    # RT-01 (review 2026-09-07): the BE step advances element columns
+    # independently, so the flux it APPLIES can carry net charge even when
+    # the frozen projection was zero-current and no clamp fired. The
+    # residual is always reported (np_applied_charge_rel_max); a threshold
+    # here rejects the trial (dt halves) when it is exceeded. None = report
+    # only (every earlier hash unchanged).
+    applied_charge_rtol: Optional[float] = Field(default=None, gt=0.0)
 
     @model_validator(mode="after")
     def _check(self) -> "SpeciesDiffusionConfig":
         if not math.isfinite(self.geometry_factor):
             raise ValueError("geometry_factor must be finite")
+        if (self.applied_charge_rtol is not None
+                and not math.isfinite(self.applied_charge_rtol)):
+            raise ValueError("applied_charge_rtol must be finite")
         if (self.default_dw_m2_s is not None
                 and not math.isfinite(self.default_dw_m2_s)):
             raise ValueError("default_dw_m2_s must be finite")
@@ -1268,6 +1278,12 @@ class TinnConfig(BaseModel):
                 if isinstance(d, dict):
                     for key in [k for k, v in d.items() if v is None]:
                         d.pop(key)
+                    # the species block nests one level deeper (RT-01:
+                    # applied_charge_rtol None keeps every P0 hash)
+                    sp = d.get("species")
+                    if isinstance(sp, dict):
+                        for key in [k for k, v in sp.items() if v is None]:
+                            sp.pop(key)
         if not payload.get("transport"):
             payload.pop("transport", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every

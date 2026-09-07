@@ -142,11 +142,11 @@ def test_np_clamp_ladder():
     # species collapse — exactly the bath call's degree of freedom
     dc_s = np.array([[1.0, 0.0, 0.0]])
     cbar = np.array([[0.5, 0.5, 0.0]])
-    d4, c4, _ = transport._np_deff(
+    d4, c4, _, _, _ = transport._np_deff(
         dc_s, cbar, np.array([[-1.0, 1.0, 1.0]]), np.ones((1, 3)),
         dw, z, np.eye(3))
     assert c4["np_fick_clamped"] >= 1          # s1/dc_el < 0 -> D-bar
-    d5, c5, _ = transport._np_deff(
+    d5, c5, _, _, _ = transport._np_deff(
         dc_s, cbar, np.array([[1e-3, 1.0, 1.0]]), np.ones((1, 3)),
         dw, z, np.eye(3))
     assert c5["np_cap_clamped"] >= 1           # quotient blows past D_max
@@ -542,3 +542,56 @@ def test_gems_reduced_sulfur_suppression():
             w.equilibrate_elements(el, 296.15, suppressed_species=("NoSuchSpecies",))
     finally:
         w.close()
+
+
+# ------------------------------------------------- RT-01: applied-flux charge
+
+def test_np_applied_flux_charge_residual_reproduces_review_case():
+    """RT-01 (review 2026-09-07): two domains, three ions z=[+1,-1,+1],
+    identity species->element map, D=[9.31,2.03,1.96], dt 0.1 - the
+    frozen projection is zero-current (~1e-16) but the flux the BE step
+    applies carries ~4.6 % net charge; the new witness reports it, and it
+    vanishes as dt -> 0. A threshold in the config pops from the hash when
+    unset."""
+    graph = _two_domain_graph(g=1.0, w=(1.0, 1.0))
+    z = np.array([1.0, -1.0, 1.0])
+    dw = np.array([9.31, 2.03, 1.96])
+    nu = np.eye(3)
+    inv = np.array([[3.0, 4.0, 1.0], [1.0, 1.5, 0.5]])
+    npc = transport.np_effective_conductance(graph, inv, graph.water, dw, z, nu)
+    assert npc.charge_flux_rel_max <= 1e-12
+    assert sum(npc.counts[k] for k in ("np_phi_clamped", "np_fick_clamped",
+                                       "np_cap_clamped")) == 0
+    ex = transport.exchange_be(graph, inv.copy(), 0.1, None, np_cond=npc)
+    assert ex.status == "ok"
+    assert 0.03 < ex.np_applied_charge_rel_max < 0.06
+    new = inv + ex.delta
+    assert abs(float(new[0] @ z)) > 0.03            # the charge really moved
+    ex_small = transport.exchange_be(graph, inv.copy(), 1e-3, None, np_cond=npc)
+    assert ex_small.np_applied_charge_rel_max < 0.1 * ex.np_applied_charge_rel_max
+    # scalar path: no NP data -> residual 0 by definition
+    ex_s = transport.exchange_be(graph, inv.copy(), 0.1, 2.0)
+    assert ex_s.np_applied_charge_rel_max == 0.0
+    # primary-element attribution over the real ledger: SO4-2 -> S (not
+    # its four O), OH- -> a frame element
+    from tinn.registry import ELEMENT_IDS
+    nu2 = np.zeros((2, len(ELEMENT_IDS)))
+    nu2[0, ELEMENT_IDS.index("S")] = 1.0
+    nu2[0, ELEMENT_IDS.index("O")] = 4.0
+    nu2[1, ELEMENT_IDS.index("O")] = 1.0
+    nu2[1, ELEMENT_IDS.index("H")] = 1.0
+    prim = transport._primary_element(nu2)
+    assert prim[0] == ELEMENT_IDS.index("S")
+    assert prim[1] in (ELEMENT_IDS.index("O"), ELEMENT_IDS.index("H"))
+    from tinn.config import TinnConfig
+    raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"] = {"backend": "gems3k"}
+    raw["transport"] = {"domains": {"tile_vox": 8, "species": {
+        "dw_table": str(DW_JSON), "default_dw_m2_s": 1.0e-9,
+        "geometry_factor": 1.0}}}
+    h0 = TinnConfig.model_validate(raw).config_hash()
+    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = None
+    assert TinnConfig.model_validate(raw).config_hash() == h0
+    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = 0.05
+    assert TinnConfig.model_validate(raw).config_hash() != h0
