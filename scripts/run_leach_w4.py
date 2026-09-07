@@ -104,7 +104,8 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
         # resumed portion; checkpoint-based rows are unaffected.
         done = sorted(out_dir.glob("ckpt_*"))
         if done:
-            from tinn.storage import load_checkpoint
+            # (module-level import; a local re-import here made the name local
+            # to run_case and broke the non-resume path - measured 2026-09-07)
             start_state = load_checkpoint(str(done[-1]), registry_for(cfg))
             if start_state.config_hash != cfg.config_hash():
                 raise SystemExit(
