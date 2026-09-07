@@ -595,3 +595,19 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
     assert TinnConfig.model_validate(raw).config_hash() == h0
     raw["transport"]["domains"]["species"]["applied_charge_rtol"] = 0.05
     assert TinnConfig.model_validate(raw).config_hash() != h0
+
+
+def test_rt_connectivity_check_flags_gel_only_paths():
+    """RT-02 (review 2026-09-07): a finite reported network diffusivity on
+    an axis whose capillary liquid does not span is flagged as a gel-only
+    path (the RT graph carries no flux there); spanning axes and
+    floor-level diffusivities are not."""
+    from tinn.analysis import NETWORK_FLOOR, rt_connectivity_check
+    net = {"relative_diffusivity": {"z": 0.00499, "y": 0.2, "x": NETWORK_FLOOR},
+           "background_floor": NETWORK_FLOOR}
+    perc = {"z": False, "y": True, "x": False, "any": True}
+    chk = rt_connectivity_check(perc, net)
+    assert chk["z"]["gel_only_path"] is True          # the review's 4x4x4 case
+    assert chk["y"]["gel_only_path"] is False         # liquid spans
+    assert chk["x"]["gel_only_path"] is False         # floor only
+    assert chk["any_gel_only_axis"] is True

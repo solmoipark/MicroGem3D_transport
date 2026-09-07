@@ -161,6 +161,11 @@ def state_row(state: SimulationState, registry: Registry,
                                             if reacted_mass_g > 0 else 0.0),
         "accept_count": state.accept_count,
         "reject_counts": dict(state.reject_counts),
+        # RT-02 (review 2026-09-07): the RT graph transports through
+        # capillary liquid only; record per output whether that liquid
+        # spans each axis so a reader can put it against the reported
+        # (gel-inclusive) diffusivity network
+        "liquid_percolation": liquid_percolation(state.capillary_liquid),
     }
 
 
@@ -658,6 +663,30 @@ NETWORK_FLOOR = 1e-8
 FACE_MIXING_BETA = 0.0
 
 
+def rt_connectivity_check(percolation: Dict[str, bool],
+                          network: Dict, floor_factor: float = 10.0) -> Dict:
+    """RT-02 (review 2026-09-07): the reported diffusivity network conducts
+    through gel-bearing voxels (gel_rel_diffusivity), the RT domain graph
+    only through capillary liquid above LIQ_EPS. The two agree on
+    connectivity only while capillary liquid percolates; a finite reported
+    D_eff/D0 over a non-spanning liquid means the RT path is gel-only and
+    the transport model carries NO flux there. Per axis: the two facts
+    and the verdict; 'any_gel_only_axis' summarises."""
+    rel = network.get("relative_diffusivity", {})
+    floor = float(network.get("background_floor", NETWORK_FLOOR))
+    out: Dict = {}
+    any_gel = False
+    for ax in ("z", "y", "x"):
+        d = float(rel.get(ax, 0.0))
+        spans = bool(percolation.get(ax, False))
+        gel_only = (d > floor_factor * floor) and not spans
+        any_gel = any_gel or gel_only
+        out[ax] = {"rt_liquid_spans": spans, "network_rel_diffusivity": d,
+                   "gel_only_path": gel_only}
+    out["any_gel_only_axis"] = any_gel
+    return out
+
+
 def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
                                  gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY,
                                  face_mixing_beta: Optional[float] = None,
@@ -986,6 +1015,13 @@ def report(run_dir: str, out_dir: Optional[str] = None,
         row["diffusivity_network"] = relative_diffusivity_network(
             state, gel_eps, gel_rel_diffusivity,
             face_mixing_beta=face_mixing_beta)
+        row["rt_connectivity_check"] = rt_connectivity_check(
+            row["percolation"], row["diffusivity_network"])
+        if row["rt_connectivity_check"]["any_gel_only_axis"]:
+            print(f"[RT-02] {ck.name}: reported diffusivity is finite on an "
+                  f"axis whose capillary liquid does not span - the RT graph "
+                  f"carries no flux there (gel-only path): "
+                  f"{row['rt_connectivity_check']}", flush=True)
         png_name = f"slice_{ck.name}.png"
         write_png(str(out / png_name), central_slice_rgb(state))
         row["slice_png"] = png_name
