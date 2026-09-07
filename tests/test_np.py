@@ -142,15 +142,55 @@ def test_np_clamp_ladder():
     # species collapse — exactly the bath call's degree of freedom
     dc_s = np.array([[1.0, 0.0, 0.0]])
     cbar = np.array([[0.5, 0.5, 0.0]])
-    d4, c4, _ = transport._np_deff(
+    d4, c4, _, _ = transport._np_deff(
         dc_s, cbar, np.array([[-1.0, 1.0, 1.0]]), np.ones((1, 3)),
         dw, z, np.eye(3))
     assert c4["np_fick_clamped"] >= 1          # s1/dc_el < 0 -> D-bar
-    d5, c5, _ = transport._np_deff(
+    d5, c5, _, _ = transport._np_deff(
         dc_s, cbar, np.array([[1e-3, 1.0, 1.0]]), np.ones((1, 3)),
         dw, z, np.eye(3))
     assert c5["np_cap_clamped"] >= 1           # quotient blows past D_max
     assert d5[0, 0] <= dw.max() * (1 + 1e-12)
+
+
+def test_np_applied_flux_charge_residual_rt01():
+    """RT-01: the reported zero-current witness only checks the initial
+    projected species flux; the flux backward Euler actually applies can
+    break charge balance even with no diffusivity clamp. The review's
+    synthetic 2-domain, 3-ion case is reproduced exactly - reported witness
+    ~5e-17, applied residual ~4.64% at dt=0.1, final domain charges +/-0.0443 -
+    and the applied residual falls monotonically toward 0 as dt -> 0."""
+    graph = transport.DomainGraph(
+        n_domains=2, edge_a=np.array([0]), edge_b=np.array([1]),
+        edge_g=np.array([1.0]), water=np.array([1.0, 1.0]),
+        dust=np.zeros(2, dtype=bool))
+    z = np.array([1.0, -1.0, 1.0])
+    dw = np.array([9.31, 2.03, 1.96])
+    nu = np.eye(3)
+    inv = np.array([[3.0, 4.0, 1.0], [1.0, 1.5, 0.5]])
+    npc = transport.np_effective_conductance(graph, inv, graph.water, dw, z, nu)
+    # no diffusivity clamp is activated
+    assert (npc.counts["np_phi_clamped"] == 0
+            and npc.counts["np_fick_clamped"] == 0
+            and npc.counts["np_cap_clamped"] == 0)
+    assert npc.charge_flux_rel_max < 1e-12          # initial projection ~0
+    assert npc.zeta_edge[0] == pytest.approx([1.0, -1.0, 1.0])  # identity nu
+
+    res = transport.exchange_be(graph, inv, 0.1, np_cond=npc)
+    assert res.np_applied_charge_rel_max == pytest.approx(0.04638, abs=1e-4)
+    new = inv + res.delta
+    assert (new @ z)[0] == pytest.approx(0.04434, abs=1e-4)   # net charge moved
+
+    prev = res.np_applied_charge_rel_max
+    for dt in (0.05, 0.025, 0.0125, 0.00625, 0.001):
+        r = transport.exchange_be(graph, inv, dt, np_cond=npc)
+        assert r.np_applied_charge_rel_max < prev    # monotone in dt
+        prev = r.np_applied_charge_rel_max
+    assert prev < 1e-3                               # -> 0 as dt -> 0
+
+    # the scalar-D0 path has no speciation, so no applied-charge concept
+    r0 = transport.exchange_be(graph, inv, 0.1, d0_vox2_h=1.0)
+    assert r0.np_applied_charge_rel_max == 0.0
 
 
 # ------------------------------------------------- P0a: worker protocol v2
@@ -271,6 +311,12 @@ def test_np_scalar_path_bitwise_and_hash():
                     "geometry_factor": 1.0}}
     h_np = TinnConfig.model_validate(raw).config_hash()
     assert h_np != h_scalar
+    # RT-01: applied_charge_rtol is None-popped from the hash (a species config
+    # that does not use it keeps the earlier hash), and a value changes it
+    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = None
+    assert TinnConfig.model_validate(raw).config_hash() == h_np
+    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = 0.02
+    assert TinnConfig.model_validate(raw).config_hash() != h_np
 
 
 @needs_gems

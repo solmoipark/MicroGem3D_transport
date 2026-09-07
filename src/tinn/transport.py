@@ -337,6 +337,8 @@ class NPConductance:
     deff_edge: np.ndarray                 # (n_edges, n_elem) vox^2/h
     counts: Dict[str, int] = field(default_factory=dict)
     charge_flux_rel_max: float = 0.0      # zero-current witness (unclamped)
+    zeta_edge: Optional[np.ndarray] = None   # (n_edges, n_elem) charge/element
+    zeta_bnd: Optional[np.ndarray] = None    # (n_domains, n_elem) or None
 
 
 def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
@@ -345,15 +347,19 @@ def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
     face-mean; dc_el is the BE driving force per element (the caller's
     convention: species collapse for interior edges, x - c_res for bath
     faces); cmax_el scales the small-difference guard. Returns
-    (deff, counts, charge_rel_max). PRD 4.6.4 ladder: (1) |dc_el| dust ->
+    (deff, counts, charge_rel_max, zeta). PRD 4.6.4 ladder: (1) |dc_el| dust ->
     weighted-Fick D-bar; (2) F_NP / dc_el; (3) negative -> drop the Phi term
     (pure Fick); (4) still negative -> D-bar; (5) cap at D_max over the
-    species present on the face. 0 <= deff <= D_max keeps the M-matrix."""
+    species present on the face. 0 <= deff <= D_max keeps the M-matrix.
+    zeta (rows, n_elem) is the frozen-speciation charge carried per mole of
+    each element on the face - (sum_s z_s nu_s,el D_s cbar_s) /
+    (sum_s nu_s,el D_s cbar_s), the same D_s cbar_s weighting the ladder uses;
+    RT-01 puts it on the flux the BE actually applied."""
     rows, n_elem = dc_el.shape
     counts = {"np_smalldc": 0, "np_phi_clamped": 0, "np_fick_clamped": 0,
               "np_cap_clamped": 0, "np_empty_el": 0}
     if rows == 0:
-        return np.zeros((0, n_elem)), counts, 0.0
+        return np.zeros((0, n_elem)), counts, 0.0, np.zeros((0, n_elem))
     zd = z * dw
     den = cbar_s @ (z * zd)                        # (rows,) sum z^2 D cbar
     num = dc_s @ zd                                # (rows,) sum z D dc
@@ -394,7 +400,12 @@ def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
     q_abs = np.abs(f_s * z[None, :]).sum(axis=1)
     wit = ok_den & (q_abs > 0.0)
     charge_rel_max = float((q_net[wit] / q_abs[wit]).max()) if wit.any() else 0.0
-    return deff, counts, charge_rel_max
+    # RT-01: per-element charge weight zeta_el = (sum_s z_s nu_s,el D_s cbar_s)
+    # / (sum_s nu_s,el D_s cbar_s) = s2 / dbar_num. exchange_be applies it to
+    # the flux the implicit solve actually accepted, per element column.
+    zeta = np.where(dbar_num > 0.0, s2 / np.where(dbar_num > 0.0, dbar_num, 1.0),
+                    0.0)
+    return deff, counts, charge_rel_max, zeta
 
 
 def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
@@ -432,11 +443,12 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
                       0.0)
     dc_el = dc_s @ nu
     cmax_el = np.maximum(ca @ nu, cb @ nu)
-    deff, counts, qrel = _np_deff(dc_s, cbar_s, dc_el, cmax_el,
-                                  dw_vox2_h, z, nu)
+    deff, counts, qrel, zeta_edge = _np_deff(dc_s, cbar_s, dc_el, cmax_el,
+                                             dw_vox2_h, z, nu)
     t_edge = graph.edge_g[:, None] * deff
 
     t_bnd = None
+    zeta_bnd = None
     if g_bnd is not None:
         res = (np.zeros(n_elem) if c_res is None
                else np.asarray(c_res, dtype=np.float64))
@@ -451,14 +463,15 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
             cbar_b = np.where(both,
                               2.0 * c * s_res / np.where(both, c + s_res, 1.0),
                               c)
-        deff_b, counts_b, qrel_b = _np_deff(dc_b, cbar_b, dc_el_b, cmax_b,
-                                            dw_vox2_h, z, nu)
+        deff_b, counts_b, qrel_b, zeta_bnd = _np_deff(dc_b, cbar_b, dc_el_b,
+                                                      cmax_b, dw_vox2_h, z, nu)
         t_bnd = np.asarray(g_bnd, dtype=np.float64)[:, None] * deff_b
         for k, v in counts_b.items():
             counts[k] += v
         qrel = max(qrel, qrel_b)
     return NPConductance(t_edge=t_edge, t_bnd=t_bnd, deff_edge=deff,
-                         counts=counts, charge_flux_rel_max=qrel)
+                         counts=counts, charge_flux_rel_max=qrel,
+                         zeta_edge=zeta_edge, zeta_bnd=zeta_bnd)
 
 
 @dataclass
@@ -469,6 +482,11 @@ class ExchangeResult:
     max_edge_flux_mol: float
     repair_rel: float            # largest relative negative-dust repair
     boundary_net: np.ndarray     # (E,) net element flux INTO the system
+    # RT-01: charge residual of the flux the BE solve ACTUALLY applied, using
+    # the frozen speciation's per-element charge weights. |sum_el zeta_el F_el|
+    # / sum_el |zeta_el F_el|, max over participating edges/bath faces. 0.0 on
+    # the scalar-D0 path (no speciation) and when no flux was applied.
+    np_applied_charge_rel_max: float = 0.0
 
 
 def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
@@ -583,6 +601,29 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         if f_out.size:
             max_flux = max(max_flux, float(np.abs(f_out).max()))
 
+    # RT-01: charge residual of the flux the implicit solve ACTUALLY applied.
+    # The reported charge_flux_rel_max only witnesses the initial projected
+    # species flux; independent per-element BE updates can break the
+    # zero-current relation even with no diffusivity clamp. Apply the frozen
+    # speciation's per-element charge weights zeta to the accepted element
+    # fluxes and measure |sum_el zeta_el F_el| / sum_el |zeta_el F_el| per
+    # participating edge / bath face.
+    applied_charge_rel = 0.0
+    if np_cond is not None and np_cond.zeta_edge is not None:
+        terms = []
+        if flux.size:
+            terms.append(np_cond.zeta_edge * flux)
+        if (t_bnd2 is not None and np_cond.zeta_bnd is not None
+                and f_out.size):
+            terms.append(np_cond.zeta_bnd[rows] * f_out)
+        if terms:
+            qz = np.concatenate(terms, axis=0)
+            qnet = np.abs(qz.sum(axis=1))
+            qabs = np.abs(qz).sum(axis=1)
+            m = qabs > 0.0
+            if np.any(m):
+                applied_charge_rel = float((qnet[m] / qabs[m]).max())
+
     # deterministic negative-dust repair: clip, charge the largest entry.
     # O and H are FRAME elements (solute-frame values relative to H2O):
     # a negative entry there is water-frame acid (an OH- deficit), a
@@ -622,4 +663,5 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
             f"logic error, not absorbable; (element, shortfall mol, column "
             f"scale mol): {repairs}")
     return ExchangeResult(delta, "ok", iters, max_flux, repair_rel,
-                          boundary_net)
+                          boundary_net,
+                          np_applied_charge_rel_max=applied_charge_rel)

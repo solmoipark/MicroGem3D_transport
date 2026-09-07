@@ -544,6 +544,13 @@ class SpeciesDiffusionConfig(BaseModel):
     # RT-P0a: keep the scalar d0 physics and only REPORT the NP effective
     # diffusivities per step. False (active transport) lands with RT-P0b.
     diagnostics_only: bool = False
+    # RT-01: relative tolerance on the charge residual of the flux backward
+    # Euler ACTUALLY applies (|sum_el zeta_el F_el| / sum_el |zeta_el F_el|,
+    # per edge/bath face). None = diagnostic only (recorded, never rejects);
+    # a value rejects the step (StepReject "np_charge") when exceeded so the
+    # engine halves dt. Optional and None-popped from the config hash, so
+    # every earlier config keeps its hash.
+    applied_charge_rtol: Optional[float] = Field(default=None, gt=0.0)
 
     @model_validator(mode="after")
     def _check(self) -> "SpeciesDiffusionConfig":
@@ -1262,6 +1269,14 @@ class TinnConfig(BaseModel):
                 if isinstance(d, dict):
                     for key in [k for k, v in d.items() if v is None]:
                         d.pop(key)
+            # domains.species is itself a nested dict: its later Optional
+            # additions (applied_charge_rtol) None-pop too, so a species
+            # config that does not use them keeps its earlier hash
+            dom = tr.get("domains")
+            if isinstance(dom, dict) and isinstance(dom.get("species"), dict):
+                sp = dom["species"]
+                for key in [k for k, v in sp.items() if v is None]:
+                    sp.pop(key)
         if not payload.get("transport"):
             payload.pop("transport", None)
         # PSD measured-input fields (rev.2): default-valued keys pop so every

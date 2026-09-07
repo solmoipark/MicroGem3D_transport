@@ -816,6 +816,18 @@ class Engine:
                                            self._d0_vox2_h, bath=bath)
             if ex.status != "ok":
                 return None, StepReject(REJECT_TRANSPORT_FAILURE), {}
+            if np_active:
+                exchange_metrics["np_applied_charge_rel_max"] = (
+                    ex.np_applied_charge_rel_max)
+                rtol = self._np_cfg.applied_charge_rtol
+                if (rtol is not None
+                        and ex.np_applied_charge_rel_max > rtol):
+                    return None, StepReject(
+                        "np_charge",
+                        detail=(f"applied-flux charge residual "
+                                f"{ex.np_applied_charge_rel_max:.3e} exceeds "
+                                f"applied_charge_rtol {rtol:.3e} at dt "
+                                f"{dt_h:.4g} h - halve dt (RT-01)")), {}
             inv_eff = inv_eff + ex.delta
             if bath is not None:
                 trial.boundary_exchanged_elements = (
