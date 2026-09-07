@@ -8,6 +8,7 @@ salt) along the exposed axis (layer 0 = the bath face).
     py -3 scripts/analyze_chloride_ingress.py [runs/chloride_ingress_opc32]
 """
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -64,6 +65,30 @@ def main() -> None:
         cl_aq = float(st.cluster_inventory[:, cl_idx].sum())
         liq_m3 = float(st.capillary_liquid.sum()) * vox_m3
         bound = cl_in - cl_aq                      # solids + sorbed, by balance
+        # RT-06 (review): S partition, CH volume, and an approximate pH so the
+        # S-R dt-convergence ladder can be judged on the same state.
+        s_idx = ELEMENT_IDS.index("S")
+        s_aq = float(st.cluster_inventory[:, s_idx].sum())
+        s_sorbed = (float(st.domain_sorbed_mol[:, s_idx].sum())
+                    if st.domain_sorbed_mol.size else 0.0)
+        ch_vox = (float(st.hydrate_fraction[hyd.index("Portlandite")].sum())
+                  if "Portlandite" in hyd else 0.0)
+        # charge-balance pH (approximation, no speciation): the strong-ion
+        # difference [Na]+[K]+2[Ca]-[Cl]-2[S(VI)] in the pore solution is
+        # balanced by OH- (alkaline cement pore solution); activity, ion
+        # pairing and CaOH+ are ignored, so this is indicative, not a GEMS 0D
+        # pH. Reported alongside so the dt ladder tracks the same quantity.
+        ph = None
+        if liq_m3 > 0.0:
+            def _molL(el):
+                return float(st.cluster_inventory[:, ELEMENT_IDS.index(el)
+                                                   ].sum()) / liq_m3 / 1e3
+            sid = (_molL("Na") + _molL("K") + 2.0 * _molL("Ca")
+                   - _molL("Cl") - 2.0 * _molL("S"))
+            if sid > 0.0:
+                ph = 14.0 + math.log10(sid)        # [OH-] = sid, pOH=-log10
+            elif sid < 0.0:
+                ph = -math.log10(-sid)             # [H+] = -sid
         rows.append({
             "ckpt": ck.name,
             "time_h": float(st.time_h),
@@ -74,6 +99,11 @@ def main() -> None:
             "free_Cl_mol_L": cl_aq / liq_m3 / 1e3 if liq_m3 > 0 else None,
             "bound_Cl_mg_per_g_cement": bound * 35.453 * 1e3 / cement_g,
             "sorbed_Cl_mg_per_g_cement": sorbed * 35.453 * 1e3 / cement_g,
+            "S_aqueous_mol": s_aq,
+            "S_sorbed_mol": s_sorbed,
+            "free_S_mol_L": s_aq / liq_m3 / 1e3 if liq_m3 > 0 else None,
+            "CH_volume_vox": ch_vox,
+            "pH_charge_balance": ph,
             "cl_phases": list(cl_phases),
             "layer_profiles_vox": prof,
             "layer_liquid_vox": st.capillary_liquid.sum(axis=other).tolist(),
