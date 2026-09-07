@@ -1421,6 +1421,38 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   스위트: 300 passed / 1 skipped, 사전존재 실패 1(`test_geometry_legacy_bitwise_unchanged`,
   위 크로스-플랫폼 해시 드리프트, 무관).
 
+- **RT-R01 — 적용 플럭스 전하 잔차(코드+실측)**: 상세는 §RT-W4② 기록의 RT-R01 참조
+  (32³ NP leach 적용 잔차 p50 0.475 / p95 0.9997, 동결 witness ~1e-16). 합성 재현:
+  리뷰 2도메인·3이온 예에서 적용 잔차 4.638%(dt 0.1), dt→0 단조 감소. config
+  `transport.domains.species.applied_charge_rtol`(Optional, None=진단만; None-pop 해시
+  불변) 초과 시 `StepReject("np_charge")`→dt 반감.
+
+- **D1 — 체크포인트 화학 입력 identity (2026-09-08, 실측)**: 무엇 — 체크포인트 헤더에
+  GEMS 번들 파일들·PHREEQC dat의 sha256(내용 해시, `gems.audit_bundle` 재사용)과
+  xgems/phreeqpython 버전을 기록, 재시작 시 내용 해시 불일치는 하드 에러
+  (`TINN_ALLOW_CHEMISTRY_MISMATCH` 없이는 진행 금지); 구 체크포인트(키 없음)는 경고.
+  헤더 키 추가만(FORMAT_VERSION 무단절). 어떤 런 — `test_m1` 단위: PC 번들+cemdat18
+  identity가 64-hex 해시맵을 담고, 정상 재시작 비트 동일 유지, 주입한 내용-해시 드리프트가
+  `StorageError` 유발·env 오버라이드로 통과. 해석 — 같은 이름의 평형상수 변경을 경로·종명
+  검사로는 못 잡던 갭(리뷰) 차단. 미결 — split 드라이버 환경에서 xgems 버전은 워커 것이라
+  드라이버측 기록은 None일 수 있음(내용 해시는 완전).
+
+- **D2 — 폴백 크기 보고 (2026-09-08, 실측)**: 무엇 — 배스 sweep·dryout surrender의
+  원소별 mol과 동결 도메인-스텝 수를 run summary `fallback_report`에 누적하고, 폴백 총
+  크기의 총 용질 인벤토리·경계 플럭스 대비 **스칼라 비율**을 기록(원소별 비율은 trace 분모의
+  tiny/tiny 폭발로 무의미해 회피), surrender z-층 히스토그램 포함. 어떤 런 — 32³ leach
+  스모크(168.0–168.02 h): nonconv 동결 27 도메인-스텝, 배스 flush 7, bath_swept 총
+  2.1e-17 mol = 용질 인벤토리의 2.8e-5 / 경계 플럭스의 2.7e-7 → **무시할 수치적 정리로
+  올바르게 판정**. 해석 — 건수만으로는 못 하던 "물질적 vs 정리" 구분 가능(리뷰). 미결 —
+  원소별 동결 mol과 도메인별 동결 지속 히스토그램은 후속(동결은 물질을 제자리 보존 =
+  크기가 아니라 지연 평형의 문제; 물질을 옮기는 sweep/surrender만 원소 질량 기록).
+
+- **RT-R02 — 겔 연결성 즉시 경고 (2026-09-08)**: 무엇 — 보고 확산 네트워크가 겔 전도로
+  축을 관통하나 모세관-액체 RT 라벨링은 그러지 못하면 run summary에 경고(CG 없는 위상
+  비교, transport 활성 런만). 어떤 런 — 단위 테스트로 리뷰의 4×4×4 재현(겔 층 사이 반대면
+  액체 → 경고; 중간 액체 충전 → 무경고). 설계안은 §4.6.2에 제안(구현은 승인 후). 미결 —
+  전도 전용 노드 구현은 승인 대기.
+
 ---
 
 ## 5. 비기능 요구
