@@ -1229,9 +1229,26 @@ class Engine:
                 if self._sorb_buffer_h is not None:
                     buf_mol = max(float(owned_mol[c, self._sorb_buffer_h]),
                                   0.0)
-                res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
-                                         float(sites[c]), buffer_mol=buf_mol,
-                                         sites_c_mol=float(sites_c[c]))
+                try:
+                    res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
+                                             float(sites[c]), buffer_mol=buf_mol,
+                                             sites_c_mol=float(sites_c[c]))
+                except backend_mod.BackendTransientError as exc:
+                    # RT-05: a PHREEQC convergence failure in the S stage is
+                    # retryable, like the R-stage GEMS failures - convert it to
+                    # a StepReject so the engine halves dt and retries instead
+                    # of terminating the run. Config / stoichiometry errors
+                    # (ValueError, RuntimeError, e.g. the closure witness) are
+                    # NOT caught and still propagate as hard errors.
+                    solutes = {ELEMENT_IDS[k]: float(offer[k])
+                               for k in _SORB_SOLUTE_COLS if offer[k] != 0.0}
+                    detail = (
+                        f"cluster {c}: water {float(water_mol_c[c]):.3e} mol, "
+                        f"sites_s {float(sites[c]):.3e}, "
+                        f"sites_c {float(sites_c[c]):.3e}, buffer {buf_mol:.3e}, "
+                        f"solutes {solutes} | {exc}")
+                    return None, StepReject("sorption_failure",
+                                            detail=detail), {}
                 sorb_new[c] = res.sorbed_mol
                 if buf_mol > 0.0 and res.buffer_delta_mol is not None:
                     # RT-S1d booking: what the buffer released into the

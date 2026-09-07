@@ -117,6 +117,65 @@ def test_sorption_structural_alkali_endmember_refused(tmp_path):
         Engine(cfg)
 
 
+@needs_gems
+def test_sorption_stage_transient_failure_rejects_and_retries(tmp_path):
+    """RT-05: a PHREEQC transient failure in the S stage is converted to a
+    StepReject('sorption_failure') so the engine halves dt and retries,
+    instead of terminating the run. Config/stoichiometry errors still
+    propagate (not covered here). A fake operator raises
+    BackendTransientError on its first call, then delegates to the real one."""
+    from tinn import backend as backend_mod
+    cemdat = REPO / "gems_bundles" / "PHREEQC-cemdata18" / "cemdata18.dat"
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = str(GEMS_PYTHON)
+    raw["schedule"] = {"output_times_h": [4.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    raw["sorption"] = {"operator": "phreeqc_surface", "phreeqc_dat": str(cemdat),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.02},
+                       "surface_species": [
+                           {"reaction": "Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                            "log_k": 0.5,
+                            "sorbed_elements": {"S": 1.0, "O": 3.0, "H": -1.0}}],
+                       "elements": ["S"]}
+    cfg = TinnConfig.model_validate(raw)
+    eng = Engine(cfg)
+
+    # take one real step so the reactors are wet and the S stage actually
+    # calls sorb; then inject a transient failure and prove the except path
+    # converts it to a StepReject with a diagnostic detail.
+    st1, rej0, _ = eng.try_step(eng.initial_state(), 2.0)
+    assert rej0 is None and st1 is not None
+    real_sorb = eng._sorb_op.sorb
+
+    def always_fail(*a, **k):
+        raise backend_mod.BackendTransientError("injected PHREEQC failure")
+
+    eng._sorb_op.sorb = always_fail
+    _, rej, _ = eng.try_step(st1, 2.0)
+    assert rej is not None and rej.reason == "sorption_failure"
+    assert "cluster" in rej.detail and "water" in rej.detail
+    eng._sorb_op.sorb = real_sorb                  # restore (unused hereafter)
+
+    # end-to-end: the run survives the injected failure by halving dt
+    eng2 = Engine(cfg)
+    real2 = eng2._sorb_op.sorb
+    c2 = {"n": 0}
+
+    def flaky2(*a, **k):
+        c2["n"] += 1
+        if c2["n"] == 1:
+            raise backend_mod.BackendTransientError("injected PHREEQC failure")
+        return real2(*a, **k)
+
+    eng2._sorb_op.sorb = flaky2
+    state, summary = eng2.run(out_dir=str(tmp_path / "run"))
+    assert state.reject_counts.get("sorption_failure", 0) >= 1
+    assert state.accept_count >= 1                  # dt halved, then advanced
+
+
 def _release():
     return {"C3S": 2e-12, "C2S": 3e-13, "C3A": 2e-13, "C4AF": 1.5e-13}
 
