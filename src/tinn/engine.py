@@ -1256,6 +1256,26 @@ class Engine:
                     # of terminating the run. Config / stoichiometry errors
                     # (ValueError, RuntimeError, e.g. the closure witness) are
                     # NOT caught and still propagate as hard errors.
+                    #
+                    # Trace-water guard: a drained sub-voxel micro-pocket (water
+                    # far below the largest reactor) cannot converge PHREEQC's
+                    # A(H2O) balance at ANY dt - the sorption scale factor
+                    # s_fac ~ 1/water blows up (measured 1.5e12 at water
+                    # 1.9e-16 mol), so dt-halving is futile and would kill an
+                    # otherwise healthy run. Skip it exactly like a dry reactor
+                    # (freeze the store, conserve material, count it), the same
+                    # disposition sorption_reactor_dry gives its neighbours.
+                    # These pockets sit on an FP knife edge that converges on
+                    # some GEMS/libm builds and not others (cross-platform),
+                    # so the skip is the portable, non-terminating behaviour.
+                    wmax = float(water_mol_c.max()) if water_mol_c.size else 0.0
+                    if float(water_mol_c[c]) < 1e-3 * wmax:
+                        sorb_new[c] = sorb_in[c]      # frozen store, like dry
+                        n_sorb_dry += 1
+                        exchange_metrics["sorption_trace_water_skips"] = (
+                            exchange_metrics.get(
+                                "sorption_trace_water_skips", 0.0) + 1.0)
+                        continue
                     solutes = {ELEMENT_IDS[k]: float(offer[k])
                                for k in _SORB_SOLUTE_COLS if offer[k] != 0.0}
                     detail = (
