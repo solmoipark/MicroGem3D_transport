@@ -3,7 +3,7 @@ morphology -> ledger checks -> atomic commit or full rollback with dt halving.
 
 The engine is the only mutator of SimulationState. Rejection reasons are stable
 identifiers: placement_capacity, insufficient_water, cluster_dryout,
-backend_failure, balance_* (from ledger checks).
+backend_failure, sorption_failure, balance_* (from ledger checks).
 """
 
 from __future__ import annotations
@@ -371,6 +371,24 @@ class Engine:
                     "double-count alkali uptake (the solid solution binds "
                     "them thermodynamically) - refused, mechanism table")
             cshq_dcs = self._hydrate_endmembers["CSHQ"]
+            # RT-04A (review 2026-09-07): the phase NAME does not establish
+            # that the sorbent is free of structural alkali uptake - the
+            # PC/PC-Cl CSHQ carries KSiOH/NaSiOH endmembers. Check the
+            # endmember element rows themselves.
+            if any(el in ("Na", "K") for el in config.sorption.elements):
+                rows = getattr(self.backend, "endmember_elements", {}) or {}
+                na_k = [ELEMENT_IDS.index("Na"), ELEMENT_IDS.index("K")]
+                structural = [dc for dc in cshq_dcs
+                              if dc in rows and any(
+                                  float(np.asarray(rows[dc])[i]) > 0.0
+                                  for i in na_k)]
+                if structural:
+                    raise RuntimeError(
+                        f"alkali sorption on a C-S-H whose endmembers already "
+                        f"bind alkalis structurally ({structural}) would "
+                        f"double-count the uptake - refused (mechanism table; "
+                        f"use a CSHQ without alkali endmembers or drop Na/K "
+                        f"from sorption.elements)")
             unknown = sorted(set(config.sorption.site_density_mol_per_mol)
                              - set(cshq_dcs))
             if unknown:
@@ -1211,9 +1229,21 @@ class Engine:
                 if self._sorb_buffer_h is not None:
                     buf_mol = max(float(owned_mol[c, self._sorb_buffer_h]),
                                   0.0)
-                res = self._sorb_op.sorb(offer, float(water_mol_c[c]),
-                                         float(sites[c]), buffer_mol=buf_mol,
-                                         sites_c_mol=float(sites_c[c]))
+                try:
+                    res = self._sorb_op.sorb(
+                        offer, float(water_mol_c[c]), float(sites[c]),
+                        buffer_mol=buf_mol, sites_c_mol=float(sites_c[c]))
+                except backend_mod.BackendTransientError as exc:
+                    # RT-05 (review 2026-09-07): a PHREEQC convergence
+                    # failure is a retryable trial outcome like a GEMS one -
+                    # the committed state stays, the step halves dt. Config /
+                    # stoichiometry errors (ValueError, RuntimeError) still
+                    # propagate: they are not fixed by a smaller step.
+                    return None, StepReject(
+                        "sorption_failure",
+                        f"cluster {c}: water {float(water_mol_c[c])!r} mol, "
+                        f"sites {float(sites[c])!r} + c {float(sites_c[c])!r}, "
+                        f"buffer {buf_mol!r}: {str(exc)[:600]}"), {}
                 sorb_new[c] = res.sorbed_mol
                 if buf_mol > 0.0 and res.buffer_delta_mol is not None:
                     # RT-S1d booking: what the buffer released into the

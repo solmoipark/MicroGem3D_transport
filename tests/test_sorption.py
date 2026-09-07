@@ -627,3 +627,90 @@ def test_surface_reaction_row_derived_from_equation():
         surface_reaction_removal("Surf_sOH + Sr+2 = Surf_sOSr+ + H+")
     with pytest.raises(ValueError, match="cannot parse"):
         surface_reaction_removal("Surf_sOH + so4-2 = Surf_sSO4- + OH-")
+
+
+def test_buffer_phase_refuses_per_phase_rate_limit():
+    """RT-04B (review 2026-09-07): a per-phase exchange_tau on the buffer
+    phase is refused at config level; a global tau stays engine-refused."""
+    base = json.loads((REPO / "examples" / "qualification"
+                       / "deschner_opc_q32_dt06_28d.json"
+                       ).read_text(encoding="utf-8"))
+    base["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.05},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"], "buffer_phase": "Portlandite"}
+    base["transport"] = {"exchange_tau_h_per_phase": {"Portlandite": 100.0}}
+    with pytest.raises(ValueError, match="exchange_tau_h_per_phase"):
+        TinnConfig.model_validate(base)
+    base["transport"] = {"exchange_tau_h_per_phase": {"ettringite": 100.0}}
+    TinnConfig.model_validate(base)                     # other phases: fine
+
+
+@needs_gems
+@needs_iphreeqc
+def test_structural_alkali_endmembers_refuse_alkali_sorption():
+    """RT-04A (review 2026-09-07): the PC bundle's CSHQ carries KSiOH /
+    NaSiOH; Na surface sorption on top is refused by the endmember
+    element rows, not by a phase-name check."""
+    import os
+    from tinn.engine import Engine
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(PC_BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = os.environ.get(
+        "TINN_GEMS_PYTHON", str(GEMS_PYTHON))
+    raw["schedule"] = {"output_times_h": [2.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    raw["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {"CSHQ-TobH": 0.02},
+                       "surface_species": [
+                           {"reaction": "Surf_sOH + Na+ = Surf_sONa + H+",
+                            "log_k": -10.0,
+                            "sorbed_elements": {"Na": 1.0, "H": -1.0}}],
+                       "elements": ["Na"], "alkali_exchange": True}
+    with pytest.raises(RuntimeError, match="structurally"):
+        Engine(TinnConfig.model_validate(raw))
+
+
+@needs_gems
+@needs_iphreeqc
+def test_sorption_transient_failure_is_a_retried_reject(tmp_path):
+    """RT-05 (review 2026-09-07): a PHREEQC transient failure in the S
+    stage becomes a 'sorption_failure' trial reject (committed state kept,
+    dt halved) instead of killing the run; the run then completes."""
+    import os
+    from tinn.backend import BackendTransientError
+    from tinn.engine import Engine
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(PC_BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = os.environ.get(
+        "TINN_GEMS_PYTHON", str(GEMS_PYTHON))
+    raw["schedule"] = {"output_times_h": [2.0, 4.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    raw["sorption"] = {"operator": "phreeqc_surface",
+                       "phreeqc_dat": str(CEMDAT),
+                       "site_density_mol_per_mol": {
+                           "CSHQ-TobH": 0.02, "CSHQ-TobD": 0.02,
+                           "CSHQ-JenH": 0.02, "CSHQ-JenD": 0.02},
+                       "surface_species": [dict(SO4_RX)],
+                       "elements": ["S"]}
+    eng = Engine(TinnConfig.model_validate(raw))
+    real = eng._sorb_op.sorb
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BackendTransientError("injected PHREEQC failure")
+        return real(*a, **k)
+
+    eng._sorb_op.sorb = flaky
+    state, _ = eng.run(out_dir=str(tmp_path / "run"))
+    assert state.reject_counts.get("sorption_failure") == 1
+    assert state.time_h == pytest.approx(4.0)
+    assert calls["n"] > 1

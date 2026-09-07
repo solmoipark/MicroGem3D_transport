@@ -1164,6 +1164,20 @@ class TinnConfig(BaseModel):
                 f"output time so no step straddles the sealed->exposed "
                 f"switch")
         if self.sorption is not None:
+            # RT-04B (review 2026-09-07): the S stage hands the reactor's
+            # OWNED buffer amount to PHREEQC, but a per-phase rate limit on
+            # that phase restricts what the R stage offers - the buffer
+            # would reach mass the reaction transaction withholds. The
+            # global exchange_tau_h case is refused by the engine already.
+            per = (self.transport.exchange_tau_h_per_phase or {}
+                   if self.transport is not None else {})
+            if (self.sorption.buffer_phase is not None
+                    and self.sorption.buffer_phase in per):
+                raise ValueError(
+                    f"sorption.buffer_phase {self.sorption.buffer_phase!r} "
+                    f"cannot carry a transport.exchange_tau_h_per_phase entry "
+                    f"- the S-stage buffer would use mass the rate-limited R "
+                    f"offer withholds (refused, no silent inconsistency)")
             if self.chemistry.backend != "gems3k":
                 raise ValueError(
                     "sorption needs the gems3k backend - sorbent sites come "
