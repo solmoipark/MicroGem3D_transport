@@ -50,6 +50,18 @@ class StepReject:
     detail: str = ""     # diagnosis text for the audit record / EngineError
 
 
+def _acc_by_element(metrics: dict, key: str, vec: np.ndarray) -> None:
+    """RT-D2 (review 2026-09-07): fallback actions (freezing, bath flush,
+    dryout surrender) preserve the accounting but can still shape the
+    front; a count says nothing about their weight. Accumulate the
+    element-resolved magnitude (mol, over ELEMENT_IDS) per step so a
+    reader can put it against the aqueous inventory or the boundary flux
+    of the same step (aqueous_inventory_abs_mol_by_element)."""
+    v = np.abs(np.asarray(vec, dtype=np.float64)).tolist()
+    prev = metrics.get(key)
+    metrics[key] = v if prev is None else [a + b for a, b in zip(prev, v)]
+
+
 def _dryout_detail(tag: str, rows: np.ndarray, hard: List[int],
                    dom_to_cl, cl_labels, prev_liquid: np.ndarray) -> str:
     """The surrender witnesses of every hard-dry domain, for the reject
@@ -1367,6 +1379,10 @@ class Engine:
             exchange_metrics["sorption_dry_reactors"] = n_sorb_dry
             exchange_metrics["sorption_buffer_dissolved_mol"] = n_buffer_mol
 
+        # RT-D2 reference scale for the fallback magnitudes of this step
+        exchange_metrics["aqueous_inventory_abs_mol_by_element"] = (
+            np.abs(inv_eff).sum(axis=0).tolist() if inv_eff.size
+            else [0.0] * len(ELEMENT_IDS))
         total_water_mol = float(water_mol_c.sum())
         for c in range(n_clusters):
             rel = {p: float(released[c, k]) for k, p in enumerate(KINETIC_PHASE_IDS)
@@ -1439,6 +1455,9 @@ class Engine:
                         # the scale-down path.
                         trial.boundary_exchanged_elements = (
                             trial.boundary_exchanged_elements - inv_eff[c])
+                        _acc_by_element(exchange_metrics,
+                                        "bath_flushed_mol_by_element",
+                                        inv_eff[c])
                         inv_eff[c] = 0.0
                         inv_flushed = True
                         exchange_metrics["bath_flushed_domains"] = (
@@ -1500,6 +1519,11 @@ class Engine:
                     exchange_metrics["water_frozen_domains"] = (
                         exchange_metrics.get("water_frozen_domains", 0.0)
                         + 1.0)
+                    _acc_by_element(exchange_metrics,
+                                    "water_frozen_inventory_mol_by_element",
+                                    inv_eff[c])
+                    exchange_metrics.setdefault(
+                        "frozen_domain_ids", []).append(int(c))
                     scale_c[c] = 0.0
                     # RT-S1d: an unsolved reactor takes the buffer transfer back
                     residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
@@ -1522,6 +1546,11 @@ class Engine:
                     exchange_metrics["nonconv_frozen_domains"] = (
                         exchange_metrics.get("nonconv_frozen_domains", 0.0)
                         + 1.0)
+                    _acc_by_element(exchange_metrics,
+                                    "nonconv_frozen_inventory_mol_by_element",
+                                    inv_eff[c])
+                    exchange_metrics.setdefault(
+                        "frozen_domain_ids", []).append(int(c))
                     scale_c[c] = 0.0
                     # RT-S1d: an unsolved reactor takes the buffer transfer back
                     residual[c] = (inv_eff[c] - sorb_buffer_bd[c]
@@ -1943,6 +1972,10 @@ class Engine:
                     exchange_metrics.get("dryout_surrendered_mol", 0.0)
                     + float(sum(np.abs(residual[pd]).sum()
                                 for pd in surrendered)))
+                for pd in surrendered:
+                    _acc_by_element(exchange_metrics,
+                                    "dryout_surrendered_mol_by_element",
+                                    residual[pd])
         trial.cluster_inventory = remap.inventory
         # E2: pools follow the assemblage — a solved cluster's pool IS its own
         # parcels (absolute replacement, non-compounding); frozen clusters
@@ -2057,6 +2090,11 @@ class Engine:
                         exchange_metrics["sorption_surrendered_rows"] = (
                             exchange_metrics.get("sorption_surrendered_rows", 0)
                             + len(surrendered_s))
+                        for pd in surrendered_s:
+                            _acc_by_element(
+                                exchange_metrics,
+                                "sorption_surrendered_mol_by_element",
+                                sorb_new[pd])
                     else:
                         sorb_folds.extend(folded)
             fold_events.extend(sorb_folds)

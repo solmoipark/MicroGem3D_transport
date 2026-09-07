@@ -246,6 +246,8 @@ def test_sorption_engine_run_closes_and_restarts(tmp_path):
     assert m["sorbed_total_mol"] > 0.0
     assert m["sorption_sites_mol"] > 0.0
     assert m["sorption_balance_max_mol"] == 0.0     # same-float transfer
+    # RT-D2: the fallback-magnitude reference scale rides every step
+    assert len(m["aqueous_inventory_abs_mol_by_element"]) == len(ELEMENT_IDS)
     reg = default_registry()
     mid = load_checkpoint(str(tmp_path / "run" / "ckpt_000"), reg)
     assert mid.domain_sorbed_mol.shape[0] > 0        # store round-trips
