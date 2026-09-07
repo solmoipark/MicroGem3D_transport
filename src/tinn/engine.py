@@ -518,6 +518,60 @@ class Engine:
         return vec
 
     # ------------------------------------------------------------------ setup
+    def chemistry_env(self) -> dict:
+        """RT-D1 (review 2026-09-07): what the external chemistry IS, not
+        where it lives - content sha256 over every file of the GEMS bundle
+        and of the PHREEQC database directory (the same audit digests the
+        run-time read-only checks use) plus the chemistry-engine versions.
+        Matching paths, species names or endmember rows do not detect a
+        changed equilibrium constant under the same name; these do."""
+        import hashlib
+        import importlib.metadata
+
+        def combined(digests: dict) -> str:
+            h = hashlib.sha256()
+            for name in sorted(digests):
+                h.update(f"{name}:{digests[name]}\n".encode())
+            return h.hexdigest()
+
+        def version(pkg: str) -> str:
+            try:
+                return importlib.metadata.version(pkg)
+            except Exception:
+                return "not_available"
+
+        env = {"backend": str(self.backend.backend_id)}
+        worker = getattr(self.backend, "_worker", None)
+        if worker is not None:
+            from .gems import audit_bundle
+            env["gems_bundle_lst"] = str(self.config.chemistry.gems_bundle_lst)
+            env["gems_bundle_sha256"] = combined(audit_bundle(worker.bundle_lst))
+            env["xgems_version"] = str(worker.info().get("xgems_version",
+                                                         "not_available"))
+        if self._sorb_op is not None:
+            env["phreeqc_dat"] = str(self.config.sorption.phreeqc_dat)
+            env["phreeqc_dat_sha256"] = combined(self._sorb_op.baseline_audit)
+            env["phreeqpython_version"] = version("phreeqpython")
+        return env
+
+    def _check_chemistry_env(self, state: SimulationState) -> None:
+        current = self.chemistry_env()
+        stored = dict(state.chemistry_env or {})
+        if not stored:
+            print("[chemistry_env] checkpoint carries no chemistry identity "
+                  "(pre-RT-D1); adopting the current environment", flush=True)
+            state.chemistry_env = current
+            return
+        diff = {k: (stored.get(k), current.get(k))
+                for k in sorted(set(stored) | set(current))
+                if stored.get(k) != current.get(k)}
+        if diff:
+            raise EngineError(
+                "checkpoint chemistry environment does not match this run "
+                "(bundle/database content or engine version changed under "
+                f"the same names; no silent continuation): {diff}",
+                "chemistry_env_mismatch")
+
     def initial_state(self) -> SimulationState:
         rve = initialize_rve(self.config, self.registry)
         st = SimulationState.from_geometry(
@@ -2110,7 +2164,11 @@ class Engine:
         deliberately outside :class:`SimulationState`: enabling a paper audit
         must not change the numerical trajectory or checkpoint format.
         """
-        state = state or self.initial_state()
+        if state is None:
+            state = self.initial_state()
+            state.chemistry_env = self.chemistry_env()
+        else:
+            self._check_chemistry_env(state)
         if tuple(state.hydrate_ids) != self.hydrate_ids:
             raise RuntimeError(
                 "checkpoint hydrate channels do not match the backend's channel "

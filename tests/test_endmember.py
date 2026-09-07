@@ -879,3 +879,29 @@ def test_gems_pools_track_clusters_and_casi(tmp_path):
                        rtol=1e-6, atol=1e-18)
     casi = analysis.cluster_ca_si(state)
     assert casi and all(0.6 <= v <= 2.5 for v in casi.values())
+
+
+def test_checkpoint_carries_chemistry_environment_identity(tmp_path):
+    """RT-D1 (review 2026-09-07): a run records what its external chemistry
+    IS (content hashes + engine versions) in the checkpoint header; the
+    identity round-trips, a restart under a different identity is refused,
+    and a pre-D1 checkpoint (no identity) restarts with a warning."""
+    from tinn.engine import EngineError
+    from tinn.registry import default_registry
+    from tinn.storage import load_checkpoint, save_checkpoint
+    cfg = _short_cfg()
+    state, _ = Engine(cfg).run(out_dir=str(tmp_path / "run"))
+    assert state.chemistry_env.get("backend") == state.backend_id
+    save_checkpoint(state, str(tmp_path), "env")
+    loaded = load_checkpoint(str(tmp_path / "env"), default_registry())
+    assert loaded.chemistry_env == state.chemistry_env
+    assert loaded.full_hash() == state.full_hash()     # metadata, not physics
+    Engine(cfg).run(state=loaded)                        # same identity: fine
+    tampered = load_checkpoint(str(tmp_path / "env"), default_registry())
+    tampered.chemistry_env["backend"] = "some-other-engine"
+    with pytest.raises(EngineError, match="chemistry environment"):
+        Engine(cfg).run(state=tampered)
+    legacy = load_checkpoint(str(tmp_path / "env"), default_registry())
+    legacy.chemistry_env = {}
+    Engine(cfg).run(state=legacy)                        # warns, adopts
+    assert legacy.chemistry_env.get("backend") == state.backend_id

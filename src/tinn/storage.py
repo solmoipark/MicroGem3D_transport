@@ -132,6 +132,9 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             # RT-P0b: run-scoped aqueous species order, positional over
             # domain_species_mol columns (empty when species transport off)
             "aq_species_ids": list(state.aq_species_ids),
+            # RT-D1: chemistry environment identity (optional key; older
+            # checkpoints lack it and the engine warns on restart)
+            "chemistry_env": dict(state.chemistry_env),
         }
         for k in _LEDGER_SCALARS:
             header[k] = getattr(state, k)
@@ -286,4 +289,5 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
         rng_state=header["rng_state"],
         config_hash=header["config_hash"],
         backend_id=header["backend_id"],
+        chemistry_env=dict(header.get("chemistry_env", {})),
     )

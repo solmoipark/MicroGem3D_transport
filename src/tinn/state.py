@@ -140,6 +140,12 @@ class SimulationState:
     # does not cost a second anchor re-pin.
     domain_sorbed_mol: np.ndarray = field(
         default_factory=lambda: np.zeros((0, len(ELEMENT_IDS))))
+    # RT-D1 (review 2026-09-07): identity of the external chemistry the
+    # run was computed with - content sha256 of the GEMS bundle and the
+    # PHREEQC database plus engine versions. Header metadata only (not a
+    # hash input: it identifies the environment, it is not physics);
+    # a restart under a different environment is refused by the engine.
+    chemistry_env: dict = field(default_factory=dict)
 
     # --- derived helpers ---
     @property

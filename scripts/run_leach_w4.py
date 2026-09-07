@@ -69,6 +69,7 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
                                           dt_h / 4.0)
     cfg = TinnConfig.model_validate(raw)
     supply = []
+    applied = []          # RT-01: per-step applied-flux charge residual
 
     frozen = {"nonconv": 0.0, "water": 0.0, "surrendered": 0.0,
               "surrendered_mol": 0.0}
@@ -81,6 +82,8 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
             m = ev.get("metrics", {})
             if "boundary_supply_ratio" in m:
                 supply.append(m["boundary_supply_ratio"])
+            if "np_applied_charge_rel_max" in m:
+                applied.append(float(m["np_applied_charge_rel_max"]))
             frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
             frozen["water"] += m.get("water_frozen_domains", 0.0)
             frozen["surrendered"] += m.get("dryout_surrendered_domains", 0.0)
@@ -162,6 +165,11 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
         "n_fit_points": len(pts),
         "np_mode": np_mode,
         "np_counters": (np_counts if np_mode else None),
+        "np_applied_charge": ({
+            "n": len(applied), "max": max(applied),
+            "p50": sorted(applied)[len(applied) // 2],
+            "p95": sorted(applied)[int(0.95 * (len(applied) - 1))]}
+            if applied else None),
     }
 
 
