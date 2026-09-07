@@ -298,6 +298,38 @@ def test_sorption_ddl_config_gates():
     assert h_bare == h_explicit
 
 
+def test_sorption_reaction_oh_stoichiometry():
+    """RT-03: the solution-removal vector is derived from the reaction and
+    the declared sorbed_elements must match it for EVERY element, O and H
+    included - the run-time closure witness only checks the solute
+    whitelist, so a wrong O/H declaration would otherwise pass."""
+    from tinn.config import SurfaceReaction, _solution_removal_vector
+
+    # the review's example and its correct vector
+    assert _solution_removal_vector(
+        "Surf_sOH + SO4-2 = Surf_sSO4- + OH-") == {"S": 1.0, "O": 3.0, "H": -1.0}
+    # every reaction shipped in the examples/tests derives what it declares
+    for rx, se in (
+            ("Surf_sOH + SO4-2 = Surf_sSO4- + OH-", {"S": 1.0, "O": 3.0, "H": -1.0}),
+            ("Surf_cOH + Cl- = Surf_cOHCl-", {"Cl": 1.0}),
+            ("Surf_sOH + Ca+2 = Surf_sOCa+ + H+", {"Ca": 1.0, "H": -1.0}),
+            ("Surf_sOH = Surf_sO- + H+", {"H": -1.0})):
+        SurfaceReaction(reaction=rx, log_k=0.5, sorbed_elements=se)
+
+    # the review's mis-declaration (S:1, O:0, H:0) is now refused
+    with pytest.raises(Exception, match="reaction stoichiometry"):
+        SurfaceReaction(reaction="Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                        log_k=0.5, sorbed_elements={"S": 1.0, "O": 0.0, "H": 0.0})
+    # a wrong solute coefficient is refused too
+    with pytest.raises(Exception, match="reaction stoichiometry"):
+        SurfaceReaction(reaction="Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                        log_k=0.5, sorbed_elements={"S": 2.0, "O": 3.0, "H": -1.0})
+    # an unparseable species is a hard error, not a silent skip
+    with pytest.raises(Exception):
+        SurfaceReaction(reaction="Surf_sOH + Xx-2 = Surf_sSO4- + OH-",
+                        log_k=0.5, sorbed_elements={"S": 1.0})
+
+
 @needs_iphreeqc
 def test_sorption_ddl_operator_matches_standalone():
     """RT-S2a operator: under ddl the charging reactions ride the same

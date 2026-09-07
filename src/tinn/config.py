@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
@@ -691,6 +692,72 @@ class TransportConfig(BaseModel):
                 or self.exchange_tau_h_per_phase is not None)
 
 
+_SPECIES_TOKEN = re.compile(r"([A-Z][a-z]?)(\d*)")
+
+
+def _parse_species_composition(name: str) -> Dict[str, int]:
+    """Element composition of one cemdata18/PHREEQC species name, charge
+    stripped (RT-03). 'SO4-2' -> {S:1, O:4}, 'OH-' -> {O:1, H:1},
+    'Ca+2' -> {Ca:1}, 'H2O' -> {H:2, O:1}. Raises if the name has any
+    leftover the element grammar cannot consume - unparseable species is a
+    hard error, never a silent skip."""
+    core = re.sub(r"[+-]+\d*$", "", name)   # trailing charge: -2, +2, -, ++
+    consumed = "".join(sym + num for sym, num in _SPECIES_TOKEN.findall(core))
+    if consumed != core or not core:
+        raise ValueError(
+            f"cannot parse species {name!r} (charge-stripped {core!r}) as a "
+            f"cemdata18 element formula")
+    comp: Dict[str, int] = {}
+    for sym, num in _SPECIES_TOKEN.findall(core):
+        comp[sym] = comp.get(sym, 0) + (int(num) if num else 1)
+    unknown = sorted(set(comp) - set(ELEMENT_IDS))
+    if unknown:
+        raise ValueError(
+            f"species {name!r} uses elements {unknown} outside the model set "
+            f"{list(ELEMENT_IDS)}")
+    return comp
+
+
+def _solution_removal_vector(reaction: str) -> Dict[str, float]:
+    """Elements REMOVED from solution per mol of bound species, derived from
+    the reaction stoichiometry (RT-03). Surface species (Surf_*) hold their
+    own atoms and are excluded from the solution balance; the removal of a
+    real element X is (sum over aqueous reactants) - (sum over aqueous
+    products) of its stoichiometric coefficient. For
+    'Surf_sOH + SO4-2 = Surf_sSO4- + OH-' this returns {S:1, O:3, H:-1},
+    independent of the same-float ledger check the operator runs at run
+    time (review recommendation)."""
+    if reaction.count("=") != 1:
+        raise ValueError(f"reaction {reaction!r} must have exactly one '='")
+    removal: Dict[str, float] = {}
+    for sign, side in ((1.0, reaction.split("=", 1)[0]),
+                       (-1.0, reaction.split("=", 1)[1])):
+        for term in side.split(" + "):
+            term = term.strip()
+            if not term:
+                continue
+            parts = term.split()
+            if len(parts) == 1:
+                coeff, sp = 1.0, parts[0]
+            elif len(parts) == 2:
+                try:
+                    coeff = float(parts[0])
+                except ValueError:
+                    raise ValueError(
+                        f"reaction term {term!r} in {reaction!r} is not "
+                        f"'<coeff> <species>' or '<species>'")
+                sp = parts[1]
+            else:
+                raise ValueError(
+                    f"reaction term {term!r} in {reaction!r} is not "
+                    f"'<coeff> <species>' or '<species>'")
+            if sp.startswith("Surf_"):
+                continue                     # surface, not in solution
+            for el, n in _parse_species_composition(sp).items():
+                removal[el] = removal.get(el, 0.0) + sign * coeff * n
+    return removal
+
+
 class SurfaceReaction(BaseModel):
     """One PHREEQC SURFACE_SPECIES reaction (RT-S1, spec 3). cemdata18.dat
     defines NO surface chemistry (measured: zero SURFACE blocks), so the
@@ -729,6 +796,21 @@ class SurfaceReaction(BaseModel):
         for el, v in self.sorbed_elements.items():
             if not math.isfinite(v):
                 raise ValueError(f"sorbed_elements[{el!r}] must be finite")
+        # RT-03: derive the solution-removal vector from the reaction and
+        # require the declared sorbed_elements to match it for EVERY element,
+        # O and H included. The run-time closure witness only checks the
+        # solute whitelist, so a wrong O/H declaration would otherwise pass.
+        derived = _solution_removal_vector(self.reaction)
+        for el in sorted(set(derived) | set(self.sorbed_elements)):
+            got = float(self.sorbed_elements.get(el, 0.0))
+            want = float(derived.get(el, 0.0))
+            if abs(got - want) > 1e-9:
+                raise ValueError(
+                    f"sorbed_elements[{el!r}] = {got} disagrees with the "
+                    f"reaction stoichiometry (removes {want} mol of {el} from "
+                    f"solution per mol of {self.bound_species}); the reaction "
+                    f"{self.reaction!r} implies "
+                    f"{ {k: v for k, v in sorted(derived.items()) if v != 0.0} }")
         return self
 
     @property
