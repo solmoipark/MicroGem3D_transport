@@ -601,3 +601,29 @@ def test_sorbed_store_folds_onto_wet_neighbours_on_cluster_death():
                                   np.array([1]), cl_labels, dry,
                                   np.zeros_like(liquid),
                                   (False, True, True)) is None
+
+
+def test_surface_reaction_row_derived_from_equation():
+    """RT-03 (review 2026-09-07): the sorbed_elements row is derived from
+    the PHREEQC equation and must match O/H included; unbalanced or
+    unparsable equations and rows outside the ledger are refused."""
+    from tinn.config import SurfaceReaction, surface_reaction_removal
+    assert surface_reaction_removal("Surf_sOH + SO4-2 = Surf_sSO4- + OH-") == {
+        "S": 1.0, "O": 3.0, "H": -1.0}
+    assert surface_reaction_removal("Surf_cOH + Cl- = Surf_cOHCl-") == {"Cl": 1.0}
+    assert surface_reaction_removal("Surf_sOH = Surf_sO- + H+") == {"H": -1.0}
+    assert surface_reaction_removal("Surf_sOH + Ca+2 = Surf_sOCa+ + H+") == {
+        "Ca": 1.0, "H": -1.0}
+    assert surface_reaction_removal("Surf_sOH + Al(OH)4- = Surf_sOAl(OH)3- + H2O") == {
+        "Al": 1.0, "O": 3.0, "H": 2.0}
+    with pytest.raises(ValueError, match="disagree with the equation"):
+        SurfaceReaction(reaction="Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                        log_k=1.0, sorbed_elements={"S": 1.0})
+    with pytest.raises(ValueError, match="not element-balanced"):
+        surface_reaction_removal("Surf_sOH + SO4-2 = Surf_sSO4-")
+    with pytest.raises(ValueError, match="not charge-balanced"):
+        surface_reaction_removal("Surf_sOH + SO4-2 = Surf_sSO4- + OH")
+    with pytest.raises(ValueError, match="outside the ledger"):
+        surface_reaction_removal("Surf_sOH + Sr+2 = Surf_sOSr+ + H+")
+    with pytest.raises(ValueError, match="cannot parse"):
+        surface_reaction_removal("Surf_sOH + so4-2 = Surf_sSO4- + OH-")

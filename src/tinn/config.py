@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
@@ -691,6 +692,90 @@ class TransportConfig(BaseModel):
                 or self.exchange_tau_h_per_phase is not None)
 
 
+_SPECIES_CHARGE_RE = re.compile(r"^(.*?)([+-]\d*)$")
+_FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?|\(|\))(\d*\.?\d*)")
+
+
+def _parse_species_elements(name: str) -> Tuple[Dict[str, float], float]:
+    """PHREEQC species name -> (element counts, charge). Surface species
+    keep their site as a pseudo-element 'Surf_x' so the site balances like
+    any other element (RT-03). Charge is the trailing +/-N; a bare +/- is
+    +/-1. Parentheses nest (Al(OH)4-). Anything unparsable is an error -
+    a reaction the platform cannot audit is refused, never guessed."""
+    m = _SPECIES_CHARGE_RE.match(name.strip())
+    base, q = (m.group(1), m.group(2)) if m and m.group(2) else (name.strip(), "")
+    charge = 0.0 if not q else (float(q) if len(q) > 1 else float(q + "1"))
+    counts: Dict[str, float] = {}
+    if base.startswith("Surf_"):
+        site, base = base[:6], base[6:]          # 'Surf_s' / 'Surf_c'
+        counts[site] = 1.0
+    pos = 0
+    stack: List[Dict[str, float]] = [counts]
+    while pos < len(base):
+        tok = _FORMULA_TOKEN_RE.match(base, pos)
+        if tok is None or tok.end() == pos:
+            raise ValueError(f"cannot parse species {name!r} at {base[pos:]!r}")
+        sym, num = tok.group(1), tok.group(2)
+        pos = tok.end()
+        if sym == "(":
+            stack.append({})
+            continue
+        if sym == ")":
+            grp = stack.pop()
+            mult = float(num) if num else 1.0
+            for el, v in grp.items():
+                stack[-1][el] = stack[-1].get(el, 0.0) + v * mult
+            continue
+        stack[-1][sym] = stack[-1].get(sym, 0.0) + (float(num) if num else 1.0)
+    if len(stack) != 1:
+        raise ValueError(f"unbalanced parentheses in species {name!r}")
+    return counts, charge
+
+
+def surface_reaction_removal(reaction: str) -> Dict[str, float]:
+    """Element mols REMOVED from solution per mol of reaction, derived from
+    the equation itself: aqueous reactants minus aqueous products. Refuses
+    an element- or charge-unbalanced equation and elements outside the
+    ledger (RT-03: the declared row must reproduce this, O/H included)."""
+    lhs, rhs = (side.strip() for side in reaction.split("=", 1))
+    totals = {"lhs": ({}, 0.0), "rhs": ({}, 0.0)}
+    removal: Dict[str, float] = {}
+    for side, text in (("lhs", lhs), ("rhs", rhs)):
+        el_sum: Dict[str, float] = {}
+        q_sum = 0.0
+        for term in text.split(" + "):
+            term = term.strip()
+            coef, sp = 1.0, term
+            parts = term.split(" ", 1)
+            if len(parts) == 2 and re.fullmatch(r"\d*\.?\d+", parts[0]):
+                coef, sp = float(parts[0]), parts[1].strip()
+            counts, charge = _parse_species_elements(sp)
+            q_sum += coef * charge
+            for el, v in counts.items():
+                el_sum[el] = el_sum.get(el, 0.0) + coef * v
+            if not sp.startswith("Surf_"):
+                sign = 1.0 if side == "lhs" else -1.0
+                for el, v in counts.items():
+                    removal[el] = removal.get(el, 0.0) + sign * coef * v
+        totals[side] = (el_sum, q_sum)
+    (l_el, l_q), (r_el, r_q) = totals["lhs"], totals["rhs"]
+    for el in set(l_el) | set(r_el):
+        if abs(l_el.get(el, 0.0) - r_el.get(el, 0.0)) > 1e-9:
+            raise ValueError(
+                f"surface reaction {reaction!r} is not element-balanced "
+                f"({el}: {l_el.get(el, 0.0)} vs {r_el.get(el, 0.0)})")
+    if abs(l_q - r_q) > 1e-9:
+        raise ValueError(
+            f"surface reaction {reaction!r} is not charge-balanced "
+            f"({l_q} vs {r_q})")
+    bad = sorted(el for el in removal if el not in ELEMENT_IDS)
+    if bad:
+        raise ValueError(
+            f"surface reaction {reaction!r} moves elements outside the "
+            f"ledger: {bad}")
+    return {el: v for el, v in removal.items() if abs(v) > 1e-12}
+
+
 class SurfaceReaction(BaseModel):
     """One PHREEQC SURFACE_SPECIES reaction (RT-S1, spec 3). cemdata18.dat
     defines NO surface chemistry (measured: zero SURFACE blocks), so the
@@ -729,6 +814,19 @@ class SurfaceReaction(BaseModel):
         for el, v in self.sorbed_elements.items():
             if not math.isfinite(v):
                 raise ValueError(f"sorbed_elements[{el!r}] must be finite")
+        # RT-03 (external review 2026-09-07): the declared row must equal
+        # the removal vector the equation itself implies, O/H INCLUDED -
+        # the operator's closure witness audits solutes only and the ledger
+        # closes with any row applied consistently, so a wrong O/H row was
+        # invisible to both (reproduced: S:1,O:0,H:0 was accepted).
+        derived = surface_reaction_removal(self.reaction)
+        for el in set(derived) | set(self.sorbed_elements):
+            d, s = derived.get(el, 0.0), self.sorbed_elements.get(el, 0.0)
+            if abs(d - s) > 1e-9:
+                raise ValueError(
+                    f"sorbed_elements for {self.reaction!r} disagree with the "
+                    f"equation: declared {dict(self.sorbed_elements)}, derived "
+                    f"{derived} (element {el}: {s} vs {d})")
         return self
 
     @property
