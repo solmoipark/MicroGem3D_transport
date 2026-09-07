@@ -70,6 +70,7 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
     cfg = TinnConfig.model_validate(raw)
     supply = []
     applied = []          # RT-01: per-step applied-flux charge residual
+    projected = []        # RT-01: same measure on the projected flux (baseline)
 
     frozen = {"nonconv": 0.0, "water": 0.0, "surrendered": 0.0,
               "surrendered_mol": 0.0}
@@ -82,8 +83,10 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
             m = ev.get("metrics", {})
             if "boundary_supply_ratio" in m:
                 supply.append(m["boundary_supply_ratio"])
-            if "np_applied_charge_rel_max" in m:
-                applied.append(float(m["np_applied_charge_rel_max"]))
+            if "np_frozen_gradient_dev_max" in m:
+                applied.append(float(m["np_frozen_gradient_dev_max"]))
+            if "np_resolved_pairs" in m:
+                projected.append(float(m["np_resolved_pairs"]))
             frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
             frozen["water"] += m.get("water_frozen_domains", 0.0)
             frozen["surrendered"] += m.get("dryout_surrendered_domains", 0.0)
@@ -166,11 +169,16 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
         "n_fit_points": len(pts),
         "np_mode": np_mode,
         "np_counters": (np_counts if np_mode else None),
-        "np_applied_charge": ({
+        "np_frozen_gradient_dev": ({
             "n": len(applied), "max": max(applied),
             "p50": sorted(applied)[len(applied) // 2],
             "p95": sorted(applied)[int(0.95 * (len(applied) - 1))]}
             if applied else None),
+        "np_resolved_pairs": ({
+            "n": len(projected), "max": max(projected),
+            "p50": sorted(projected)[len(projected) // 2],
+            "p95": sorted(projected)[int(0.95 * (len(projected) - 1))]}
+            if projected else None),
     }
 
 

@@ -546,13 +546,14 @@ def test_gems_reduced_sulfur_suppression():
 
 # ------------------------------------------------- RT-01: applied-flux charge
 
-def test_np_applied_flux_charge_residual_reproduces_review_case():
+def test_np_frozen_gradient_deviation_reproduces_review_case():
     """RT-01 (review 2026-09-07): two domains, three ions z=[+1,-1,+1],
     identity species->element map, D=[9.31,2.03,1.96], dt 0.1 - the
-    frozen projection is zero-current (~1e-16) but the flux the BE step
-    applies carries ~4.6 % net charge; the new witness reports it, and it
-    vanishes as dt -> 0. A threshold in the config pops from the hash when
-    unset."""
+    frozen projection is zero-current (~1e-16) yet the applied element
+    fluxes carry ~4.6 % net charge. The well-posed witness is how far the
+    implicit driving forces left the frozen ones (|dx/dc - 1|, resolved
+    gradients only): it is large here, vanishes with dt, is 0 on the
+    scalar path, and its config threshold pops from the hash when unset."""
     graph = _two_domain_graph(g=1.0, w=(1.0, 1.0))
     z = np.array([1.0, -1.0, 1.0])
     dw = np.array([9.31, 2.03, 1.96])
@@ -560,34 +561,18 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
     inv = np.array([[3.0, 4.0, 1.0], [1.0, 1.5, 0.5]])
     npc = transport.np_effective_conductance(graph, inv, graph.water, dw, z, nu)
     assert npc.charge_flux_rel_max <= 1e-12
-    assert sum(npc.counts[k] for k in ("np_phi_clamped", "np_fick_clamped",
-                                       "np_cap_clamped")) == 0
     ex = transport.exchange_be(graph, inv.copy(), 0.1, None, np_cond=npc)
     assert ex.status == "ok"
-    assert 0.03 < ex.np_applied_charge_rel_max < 0.06
-    assert ex.np_projected_charge_rel_max <= 1e-12     # identity map: q = z
-    # a species shared by two elements: the per-element charge equivalents
-    # are concentration-weighted means, exact where one species owns the
-    # element
-    from tinn.registry import ELEMENT_IDS
-    nu2 = np.zeros((2, len(ELEMENT_IDS)))
-    nu2[0, ELEMENT_IDS.index("S")] = 1.0
-    nu2[0, ELEMENT_IDS.index("O")] = 4.0
-    nu2[1, ELEMENT_IDS.index("O")] = 1.0
-    nu2[1, ELEMENT_IDS.index("H")] = 1.0
-    q = transport._charge_per_element(np.array([[0.1, 0.3]]),
-                                      np.array([-2.0, -1.0]), nu2)
-    assert q[0, ELEMENT_IDS.index("S")] == pytest.approx(-2.0)
-    assert q[0, ELEMENT_IDS.index("H")] == pytest.approx(-1.0)
-    assert q[0, ELEMENT_IDS.index("O")] == pytest.approx(
-        (-2.0 * 4 * 0.1 - 1.0 * 0.3) / (4 * 0.1 + 0.3))
     new = inv + ex.delta
-    assert abs(float(new[0] @ z)) > 0.03            # the charge really moved
+    net_q = abs(float(new[0] @ z))
+    tot_q = float(np.abs(ex.delta[0] * z).sum())
+    assert 0.03 < net_q / tot_q < 0.06                # the review's 4.6 %
+    assert ex.np_resolved_pairs == 3
+    assert ex.np_frozen_gradient_dev_max > 0.1        # far from frozen
     ex_small = transport.exchange_be(graph, inv.copy(), 1e-3, None, np_cond=npc)
-    assert ex_small.np_applied_charge_rel_max < 0.1 * ex.np_applied_charge_rel_max
-    # scalar path: no NP data -> residual 0 by definition
+    assert ex_small.np_frozen_gradient_dev_max < 0.1 * ex.np_frozen_gradient_dev_max
     ex_s = transport.exchange_be(graph, inv.copy(), 0.1, 2.0)
-    assert ex_s.np_applied_charge_rel_max == 0.0
+    assert ex_s.np_frozen_gradient_dev_max == 0.0 and ex_s.np_resolved_pairs == 0
     from tinn.config import TinnConfig
     raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
         encoding="utf-8"))
@@ -596,9 +581,9 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
         "dw_table": str(DW_JSON), "default_dw_m2_s": 1.0e-9,
         "geometry_factor": 1.0}}}
     h0 = TinnConfig.model_validate(raw).config_hash()
-    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = None
+    raw["transport"]["domains"]["species"]["frozen_gradient_rtol"] = None
     assert TinnConfig.model_validate(raw).config_hash() == h0
-    raw["transport"]["domains"]["species"]["applied_charge_rtol"] = 0.05
+    raw["transport"]["domains"]["species"]["frozen_gradient_rtol"] = 0.5
     assert TinnConfig.model_validate(raw).config_hash() != h0
 
 

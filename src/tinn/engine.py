@@ -877,18 +877,19 @@ class Engine:
                         npc.charge_flux_rel_max)
                 ex = transport.exchange_be(graph, inv_eff, dt_h, None,
                                            bath=bath, np_cond=npc)
-                # RT-01: charge carried by the APPLIED flux (frozen partition)
-                exchange_metrics["np_applied_charge_rel_max"] = float(
-                    ex.np_applied_charge_rel_max)
-                exchange_metrics["np_projected_charge_rel_max"] = float(
-                    ex.np_projected_charge_rel_max)
-                rtol = self._np_cfg.applied_charge_rtol
-                if rtol is not None and ex.np_applied_charge_rel_max > rtol:
+                # RT-01: how far the applied implicit driving forces left
+                # the frozen ones the zero-current projection assumed
+                exchange_metrics["np_frozen_gradient_dev_max"] = float(
+                    ex.np_frozen_gradient_dev_max)
+                exchange_metrics["np_resolved_pairs"] = float(
+                    ex.np_resolved_pairs)
+                rtol = self._np_cfg.frozen_gradient_rtol
+                if rtol is not None and ex.np_frozen_gradient_dev_max > rtol:
                     return None, StepReject(
                         "np_charge",
-                        f"applied-flux charge residual "
-                        f"{ex.np_applied_charge_rel_max:.3e} exceeds "
-                        f"applied_charge_rtol {rtol:.3e} at dt {dt_h!r} h"), {}
+                        f"frozen-gradient deviation "
+                        f"{ex.np_frozen_gradient_dev_max:.3e} exceeds "
+                        f"frozen_gradient_rtol {rtol:.3e} at dt {dt_h!r} h"), {}
             else:
                 ex = transport.exchange_be(graph, inv_eff, dt_h,
                                            self._d0_vox2_h, bath=bath)
