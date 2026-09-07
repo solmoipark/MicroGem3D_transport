@@ -569,10 +569,11 @@ def test_np_frozen_gradient_deviation_reproduces_review_case():
     assert 0.03 < net_q / tot_q < 0.06                # the review's 4.6 %
     assert ex.np_resolved_pairs == 3
     assert ex.np_frozen_gradient_dev_max > 0.1        # far from frozen
+    assert 0.0 < ex.np_frozen_gradient_dev <= ex.np_frozen_gradient_dev_max
     ex_small = transport.exchange_be(graph, inv.copy(), 1e-3, None, np_cond=npc)
-    assert ex_small.np_frozen_gradient_dev_max < 0.1 * ex.np_frozen_gradient_dev_max
+    assert ex_small.np_frozen_gradient_dev < 0.1 * ex.np_frozen_gradient_dev
     ex_s = transport.exchange_be(graph, inv.copy(), 0.1, 2.0)
-    assert ex_s.np_frozen_gradient_dev_max == 0.0 and ex_s.np_resolved_pairs == 0
+    assert ex_s.np_frozen_gradient_dev == 0.0 and ex_s.np_resolved_pairs == 0
     from tinn.config import TinnConfig
     raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
         encoding="utf-8"))

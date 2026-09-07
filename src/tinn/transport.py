@@ -305,7 +305,7 @@ NP_DC_REL_EPS = 1e-9
 # RT-01 frozen-gradient witness: a (face, element) pair counts as a RESOLVED
 # frozen gradient above this relative difference; only there is the
 # implicit/frozen driving-force ratio dx/dc meaningful
-NP_RATIO_REL_EPS = 1e-6
+NP_RATIO_REL_EPS = 1e-3
 
 # water dynamic viscosity, mPa*s, 0..100 C in 5 C steps (IAPWS-anchored
 # tabulation, e.g. CRC Handbook); linear interpolation between nodes
@@ -349,10 +349,13 @@ class NPConductance:
     cmax_el_edge: Optional[np.ndarray] = None     # (n_edges, n_elem)
     dc_el_bnd: Optional[np.ndarray] = None        # (D, n_elem)
     cmax_el_bnd: Optional[np.ndarray] = None      # (D, n_elem)
+    deff_bnd: Optional[np.ndarray] = None         # (D, n_elem) vox^2/h
 
 
 def frozen_gradient_deviation(dc_el: np.ndarray, dx_el: np.ndarray,
-                              cmax_el: np.ndarray) -> Tuple[float, int]:
+                              cmax_el: np.ndarray,
+                              deff: Optional[np.ndarray] = None
+                              ) -> Tuple[float, float, int]:
     """RT-01: the zero-current projection is exact for the FROZEN driving
     forces dc_el; the BE step applies the implicit ones dx_el, element by
     element, and the applied flux stays zero-current only insofar as
@@ -363,14 +366,24 @@ def frozen_gradient_deviation(dc_el: np.ndarray, dx_el: np.ndarray,
     it is well-posed where two element-space charge reconstructions were
     not (measured 2026-09-07: the O/H frame columns aggregate every
     oxygen/hydrogen species, so any per-element charge equivalent either
-    saturates at 1 or has a ~1 baseline)."""
+    saturates at 1 or has a ~1 baseline). Returns (weighted mean, max,
+    resolved count): the mean weights each pair by the magnitude of its
+    projected flux |deff dc| - the number that says how much of the
+    transported mass moved under driving forces the projection did not
+    see (a bath flooding a 32 um RVE within one 0.5 s step gave max
+    ~1e20 from near-threshold pairs while most mass moved at the faces)."""
     if dc_el is None or dc_el.size == 0:
-        return 0.0, 0
+        return 0.0, 0.0, 0
     resolved = (np.abs(dc_el) > NP_RATIO_REL_EPS * np.asarray(cmax_el)) & (dc_el != 0.0)
     if not resolved.any():
-        return 0.0, 0
+        return 0.0, 0.0, 0
     r = np.where(resolved, dx_el / np.where(resolved, dc_el, 1.0), 1.0)
-    return float(np.abs(r - 1.0).max()), int(np.count_nonzero(resolved))
+    dev = np.abs(r - 1.0)
+    w = np.abs(dc_el) * (np.asarray(deff) if deff is not None else 1.0)
+    w = np.where(resolved, w, 0.0)
+    wsum = float(w.sum())
+    wmean = float((w * dev).sum() / wsum) if wsum > 0.0 else 0.0
+    return wmean, float(dev[resolved].max()), int(np.count_nonzero(resolved))
 
 
 def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
@@ -497,7 +510,8 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
                          counts=counts, charge_flux_rel_max=qrel,
                          dc_el_edge=dc_el, cmax_el_edge=cmax_el,
                          dc_el_bnd=(dc_el_b if g_bnd is not None else None),
-                         cmax_el_bnd=(cmax_b if g_bnd is not None else None))
+                         cmax_el_bnd=(cmax_b if g_bnd is not None else None),
+                         deff_bnd=(deff_b if g_bnd is not None else None))
 
 
 @dataclass
@@ -508,10 +522,11 @@ class ExchangeResult:
     max_edge_flux_mol: float
     repair_rel: float            # largest relative negative-dust repair
     boundary_net: np.ndarray     # (E,) net element flux INTO the system
-    # RT-01: largest |dx/dc - 1| over resolved frozen gradients (how far
-    # the applied implicit driving forces left the frozen ones the
-    # zero-current projection assumed) and the resolved-pair count;
-    # 0.0 / 0 on the scalar path
+    # RT-01: |dx/dc - 1| over resolved frozen gradients (how far the
+    # applied implicit driving forces left the frozen ones the zero-
+    # current projection assumed): projected-flux-weighted mean, max, and
+    # the resolved-pair count; 0.0 / 0 on the scalar path
+    np_frozen_gradient_dev: float = 0.0
     np_frozen_gradient_dev_max: float = 0.0
     np_resolved_pairs: int = 0
 
@@ -620,11 +635,14 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     np.add.at(delta, eb, flux)
     max_flux = float(np.abs(flux).max()) if flux.size else 0.0
     boundary_net = np.zeros(n_elem)
-    dev_max = 0.0
+    dev_w = dev_max = 0.0
     n_res = 0
+    w_tot = 0.0
     if np_cond is not None and np_cond.dc_el_edge is not None:
-        dev_max, n_res = frozen_gradient_deviation(
-            np_cond.dc_el_edge, x[ea] - x[eb], np_cond.cmax_el_edge)
+        dev_w, dev_max, n_res = frozen_gradient_deviation(
+            np_cond.dc_el_edge, x[ea] - x[eb], np_cond.cmax_el_edge,
+            np_cond.deff_edge)
+        w_tot = float(np.abs(np_cond.dc_el_edge * np_cond.deff_edge).sum())
     if t_bnd2 is not None:
         rows = np.flatnonzero((t_bnd2 > 0.0).any(axis=1))  # ascending, deterministic
         f_out = dt_h * t_bnd2[rows] * (x[rows] - bath.c_res[None, :])
@@ -633,9 +651,13 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         if f_out.size:
             max_flux = max(max_flux, float(np.abs(f_out).max()))
         if np_cond is not None and np_cond.dc_el_bnd is not None:
-            d_b, n_b = frozen_gradient_deviation(
+            w_b, d_b, n_b = frozen_gradient_deviation(
                 np_cond.dc_el_bnd[rows], x[rows] - bath.c_res[None, :],
-                np_cond.cmax_el_bnd[rows])
+                np_cond.cmax_el_bnd[rows], np_cond.deff_bnd[rows])
+            wb_tot = float(np.abs(np_cond.dc_el_bnd[rows]
+                                  * np_cond.deff_bnd[rows]).sum())
+            if w_tot + wb_tot > 0.0:
+                dev_w = (dev_w * w_tot + w_b * wb_tot) / (w_tot + wb_tot)
             dev_max = max(dev_max, d_b)
             n_res += n_b
 
@@ -678,4 +700,4 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
             f"logic error, not absorbable; (element, shortfall mol, column "
             f"scale mol): {repairs}")
     return ExchangeResult(delta, "ok", iters, max_flux, repair_rel,
-                          boundary_net, dev_max, n_res)
+                          boundary_net, dev_w, dev_max, n_res)

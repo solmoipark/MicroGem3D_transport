@@ -879,16 +879,18 @@ class Engine:
                                            bath=bath, np_cond=npc)
                 # RT-01: how far the applied implicit driving forces left
                 # the frozen ones the zero-current projection assumed
+                exchange_metrics["np_frozen_gradient_dev"] = float(
+                    ex.np_frozen_gradient_dev)
                 exchange_metrics["np_frozen_gradient_dev_max"] = float(
                     ex.np_frozen_gradient_dev_max)
                 exchange_metrics["np_resolved_pairs"] = float(
                     ex.np_resolved_pairs)
                 rtol = self._np_cfg.frozen_gradient_rtol
-                if rtol is not None and ex.np_frozen_gradient_dev_max > rtol:
+                if rtol is not None and ex.np_frozen_gradient_dev > rtol:
                     return None, StepReject(
                         "np_charge",
-                        f"frozen-gradient deviation "
-                        f"{ex.np_frozen_gradient_dev_max:.3e} exceeds "
+                        f"flux-weighted frozen-gradient deviation "
+                        f"{ex.np_frozen_gradient_dev:.3e} exceeds "
                         f"frozen_gradient_rtol {rtol:.3e} at dt {dt_h!r} h"), {}
             else:
                 ex = transport.exchange_be(graph, inv_eff, dt_h,

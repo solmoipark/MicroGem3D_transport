@@ -83,8 +83,8 @@ def run_case(d0: float, out_dir: Path, dt_s: float = None,
             m = ev.get("metrics", {})
             if "boundary_supply_ratio" in m:
                 supply.append(m["boundary_supply_ratio"])
-            if "np_frozen_gradient_dev_max" in m:
-                applied.append(float(m["np_frozen_gradient_dev_max"]))
+            if "np_frozen_gradient_dev" in m:
+                applied.append(float(m["np_frozen_gradient_dev"]))
             if "np_resolved_pairs" in m:
                 projected.append(float(m["np_resolved_pairs"]))
             frozen["nonconv"] += m.get("nonconv_frozen_domains", 0.0)
