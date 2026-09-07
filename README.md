@@ -189,6 +189,10 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       전도도(FORMAT_VERSION 5, Tier 1 수착 배열 예약 동승). 실측: OPC 공극수
       D_eff/D₀ 0.008–8.1×(p50 1.57×). 전제 G0(PHREEQC-Cemdata18 0D
       교차검증)은 `scripts/README_phreeqc_crosscheck.md`에 기록.
+- [x] **RT-R03/R04A/R04B/R05 (2026-09-08, review-2026-09)** — 외부 리뷰
+      2026-09-07 안전장치 4건(PRD 4.6.5): 표면반응 O/H 화학량론 자동 유도·대조,
+      구조 알칼리 엔드멤버 검사, 완충상+상별 τ 거부, S단계 실패의 트랜잭션 처리.
+      스위트 300 passed(사전존재 크로스-플랫폼 지오메트리 해시 실패 1 무관).
 
 ## 예제 config
 

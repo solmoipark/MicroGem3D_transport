@@ -1333,6 +1333,51 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   정량 앵커는 없음(C1012는 팽창 지표) — 미결로 남김: 석고 형성 시작 농도
   (문헌 ~1.5–3 g/L SO4 문턱) 대조를 배스 농도 사다리로 수행할 것.
 
+#### 외부 리뷰(2026-09-07) 대응 — 안전장치 실측 기록 (review-2026-09 브랜치)
+
+환경: 드라이버 `clinkerlab`(py3.11, numpy 2.4.6) + GEMS 워커 `tinn-remote`(xgems
+2.0.2); 저장소는 ASCII 경로(`C:\tinn\…`)에 둔다 — 한글 경로에서는 xGEMS/PHREEQC
+네이티브 라이브러리가 파일을 못 연다(GemsError). 크로스-플랫폼 부동소수점(libm/BLAS)
+차이로 지오메트리 dense_hash/앵커가 PRD authority와 갈리므로(같은 numpy 2.4.6인데도)
+"해시 불변"은 *이 머신 변경 전후 불변*으로 해석(config_hash는 플랫폼 독립). 상세는
+인계 폴더 `results_back/NOTES.md`.
+
+- **RT-R03 — 표면반응 O/H 화학량론 자동 유도·대조 (2026-09-08, 실측)**: 무엇 —
+  `config.SurfaceReaction`이 반응식(예 `Surf_sOH + SO4-2 = Surf_sSO4- + OH-`)을
+  파싱해 종별 원소조성(전하 제거, cemdata18 종명 규칙)에서 **용액 제거 벡터**를
+  유도(Surf_* 종은 표면 보유분이라 용액수지 제외), 선언 `sorbed_elements`와 O/H까지
+  전 원소 대조 후 불일치 시 하드 에러. 파싱 불가 종도 에러. 어떤 런 — config 로드
+  단위 검증(`tests/test_sorption.py::test_sorption_reaction_oh_stoichiometry`). 수치 —
+  S반응 파생 벡터 {S:1, O:3, H:-1}로 리뷰와 일치; 예제/테스트의 4개 반응 모두 선언과
+  일치, 예제 24/24 로드. 해석 — 런타임 closure witness는 용질 화이트리스트만 보므로
+  O/H 오선언이 통과했던 갭(리뷰 RT-03)을 config 단계에서 독립 차단. 미결 — 없음.
+- **RT-R04A — 구조 알칼리 흡수 엔드멤버 검사 (2026-09-08, 실측)**: 무엇 — engine이
+  흡착제 CSHQ 엔드멤버의 실제 원소행(`backend.endmember_elements`)을 보고 Na/K를
+  구조적으로 결합하는 엔드멤버가 있으면 Na/K 수착을 `alkali_exchange`라도 거부(해당
+  엔드멤버명 표기), CNASH 상 이름 검사와 독립. 어떤 런 — PC 번들 GEMS 테스트
+  (`test_m4.py::test_sorption_structural_alkali_endmember_refused`). 수치 — PC·PC-Cl
+  둘 다 CSHQ가 KSiOH(K=0.5)·NaSiOH(Na=0.5)를 보유, 둘 다 CNASH 상은 없음 → Na 수착
+  config(alkali_exchange:true)가 이전엔 통과했으나 이제 `RuntimeError`로 거부. 해석 —
+  이중계산(구조+표면) 차단(리뷰 RT-04A). 미결 — 없음.
+- **RT-R04B — 완충상 + 상별 τ 거부 (2026-09-08, 실측)**: 무엇 — `TinnConfig` 검증에서
+  `sorption.buffer_phase` 소유 시 `exchange_tau_h_per_phase`에 활성(τ>0) 항목이 하나라도
+  있으면 거부(전역 `exchange_tau_h`는 이미 engine이 거부). 어떤 런 — config 단위
+  (`test_sorption.py::test_sorption_buffer_with_per_phase_tau_refused`). 수치 — 리뷰
+  조합(buffer Portlandite + per-phase {Portlandite:100})과 무관 상 τ 모두 `ValueError`;
+  버퍼만 있고 τ 없는 기존 chloride_binding config는 통과. 해석 — S단계가 완충에 쓰는 CH
+  양을 R단계가 상별 τ로 제한받아 트랜잭션에서 배제되는 불일치 차단(리뷰 RT-04B). 미결 — 없음.
+- **RT-R05 — S 단계 실패의 트랜잭션 처리 (2026-09-08, 실측)**: 무엇 — engine S단계
+  `sorb()` 호출을 `BackendTransientError`에서 잡아 `StepReject("sorption_failure",
+  detail=클러스터/물/사이트s·c/버퍼/오퍼 용질)`로 변환(→ dt 반감 재시도), config·화학량론
+  오류(ValueError/RuntimeError)는 그대로 전파. 어떤 런 — PC 번들 GEMS 테스트
+  (`test_m4.py::test_sorption_stage_transient_failure_rejects_and_retries`). 수치 — 주입한
+  가짜 실패가 `sorption_failure` 거부(detail에 cluster/water 포함)를 내고, 첫 sorb 호출
+  실패를 주입한 런은 dt 반감으로 살아남아 진행(reject_counts≥1, accept_count≥1). 해석 —
+  PHREEQC 일시 실패가 런을 종료시키던 경로(리뷰 RT-05)를 GEMS react와 동일 계약으로 흡수.
+  미결 — 없음.
+  스위트: 300 passed / 1 skipped, 사전존재 실패 1(`test_geometry_legacy_bitwise_unchanged`,
+  위 크로스-플랫폼 해시 드리프트, 무관).
+
 ---
 
 ## 5. 비기능 요구
