@@ -302,14 +302,6 @@ def boundary_coupling(domain_id: np.ndarray, n_domains: int, g: np.ndarray,
 # small-|dc_el| guard: below this relative element-concentration difference
 # the F/dc quotient is ill-conditioned and the weighted-Fick fallback is used
 NP_DC_REL_EPS = 1e-9
-# RT-01 applied-flux witness: an element pair counts as a RESOLVED frozen
-# gradient (its implicit/frozen driving-force ratio is meaningful) above
-# this relative difference; the ratio is clamped to +-NP_RATIO_MAX and the
-# number of clamps is reported - a clamp means the step moved that element
-# far beyond its frozen gradient (bath flooding), i.e. the frozen
-# partition no longer describes the applied flux there.
-NP_RATIO_REL_EPS = 1e-6
-NP_RATIO_MAX = 10.0
 
 # water dynamic viscosity, mPa*s, 0..100 C in 5 C steps (IAPWS-anchored
 # tabulation, e.g. CRC Handbook); linear interpolation between nodes
@@ -345,75 +337,48 @@ class NPConductance:
     deff_edge: np.ndarray                 # (n_edges, n_elem) vox^2/h
     counts: Dict[str, int] = field(default_factory=dict)
     charge_flux_rel_max: float = 0.0      # zero-current witness (unclamped)
-    # RT-01 (review 2026-09-07): the frozen projected SPECIES fluxes per
-    # unit transmissibility and the driving forces they were built from,
-    # so exchange_be can re-partition the flux it actually applied and
-    # witness the charge it carried (see applied_charge_residual)
-    f_species_edge: Optional[np.ndarray] = None   # (n_edges, S)
-    small_edge: Optional[np.ndarray] = None       # (n_edges, n_elem) bool
-    dc_el_edge: Optional[np.ndarray] = None       # (n_edges, n_elem)
-    cmax_el_edge: Optional[np.ndarray] = None     # (n_edges, n_elem)
-    f_species_bnd: Optional[np.ndarray] = None    # (D, S)
-    small_bnd: Optional[np.ndarray] = None        # (D, n_elem) bool
-    dc_el_bnd: Optional[np.ndarray] = None        # (D, n_elem)
-    cmax_el_bnd: Optional[np.ndarray] = None      # (D, n_elem)
-    z: Optional[np.ndarray] = None                # (S,)
-    prim: Optional[np.ndarray] = None             # (S,) primary element idx
+    # RT-01 (review 2026-09-07): the frozen mean charge per element atom at
+    # each face (q_el) and the projected zero-current ELEMENT flux per unit
+    # transmissibility, so exchange_be can weigh the flux it actually
+    # applied and the flux the projection intended with the same charge
+    # equivalents (see charge_residual)
+    q_el_edge: Optional[np.ndarray] = None        # (n_edges, n_elem)
+    f_np_edge: Optional[np.ndarray] = None        # (n_edges, n_elem)
+    q_el_bnd: Optional[np.ndarray] = None         # (D, n_elem)
+    f_np_bnd: Optional[np.ndarray] = None         # (D, n_elem)
+    deff_bnd: Optional[np.ndarray] = None         # (D, n_elem) vox^2/h
 
 
-def _primary_element(nu: np.ndarray) -> np.ndarray:
-    """Each species' identity element: the non-frame element it carries
-    (SO4-2 -> S, Al(OH)4- -> Al, Cl- -> Cl), else the frame element it is
-    made of (OH- -> O, H+ -> H). The applied element flux of that column
-    is what re-scales the species' projected flux (RT-01)."""
-    n_elem = nu.shape[1]
-    frame = [i for i in _FRAME_COLS if i < n_elem]
-    w = np.asarray(nu, dtype=np.float64).copy()
-    w_nf = w.copy()
-    if frame:
-        w_nf[:, frame] = 0.0
-    prim = np.argmax(w_nf, axis=1)
-    none_nf = w_nf.max(axis=1) <= 0.0
-    prim = np.where(none_nf, np.argmax(w, axis=1), prim)
-    return prim.astype(np.int64)
+def _charge_per_element(cbar_s: np.ndarray, z: np.ndarray,
+                        nu: np.ndarray) -> np.ndarray:
+    """Concentration-weighted mean charge carried per atom of each element
+    at a face: q_el = sum_s z_s nu_s,el cbar_s / sum_s nu_s,el cbar_s. With
+    an identity species->element map q_el = z exactly."""
+    num = (cbar_s * z[None, :]) @ nu
+    den = cbar_s @ nu
+    return np.where(den > 0.0, num / np.where(den > 0.0, den, 1.0), 0.0)
 
 
-def applied_charge_residual(f_species: np.ndarray, small: np.ndarray,
-                            dc_el: np.ndarray, dx_el: np.ndarray,
-                            z: np.ndarray, prim: np.ndarray,
-                            cmax_el: Optional[np.ndarray] = None
-                            ) -> Tuple[float, int]:
-    """RT-01: the BE solver advances element columns independently, so the
-    flux it applies is the projected zero-current flux re-scaled per
-    element by r_el = (implicit driving force) / (frozen driving force).
-    Re-partitioning each species' projected flux by the r of its primary
-    element reconstructs the applied species flux; its charge residual
-    |sum z f| / sum |z f| is the witness the frozen-state diagnostic
-    (np_charge_flux_rel_max) cannot give. Exact for an identity
-    species->element map (the review's reproduction), a frozen-partition
-    estimate otherwise. Only RESOLVED frozen gradients (|dc| above
-    NP_RATIO_REL_EPS x the face's element concentration) carry a ratio;
-    the rest keep r = 1, and |r| is clamped to NP_RATIO_MAX - the clamp
-    count returned with the residual says how many (face, element) pairs
-    the step carried beyond what the frozen partition can describe
-    (measured 2026-09-07: a NaCl bath floods a 32 um RVE within one 0.5 s
-    step, so interior Cl/Na pairs with no frozen gradient took r ~ 1e17
-    and the unclamped estimate saturated at 1.0)."""
-    if f_species is None or f_species.size == 0:
-        return 0.0, 0
-    ref = (np.abs(dc_el).max(axis=1, keepdims=True) if cmax_el is None
-           else np.asarray(cmax_el))
-    resolved = (~small) & (np.abs(dc_el) > NP_RATIO_REL_EPS * ref) & (dc_el != 0.0)
-    safe = np.where(resolved, dc_el, 1.0)
-    r = np.where(resolved, dx_el / safe, 1.0)                   # (rows, n_elem)
-    clamped = int(np.count_nonzero(resolved & (np.abs(r) > NP_RATIO_MAX)))
-    r = np.clip(r, -NP_RATIO_MAX, NP_RATIO_MAX)
-    f_app = f_species * r[:, prim]                              # (rows, S)
-    q_net = np.abs(f_app @ z)
-    q_abs = np.abs(f_app * z[None, :]).sum(axis=1)
-    wit = q_abs > 0.0
-    return (float((q_net[wit] / q_abs[wit]).max()) if wit.any() else 0.0,
-            clamped)
+def charge_residual(q_el: np.ndarray, f_el: np.ndarray) -> float:
+    """RT-01: |sum_el q_el F_el| / sum_el |q_el F_el| over faces - the net
+    charge an ELEMENT flux carries when every atom of an element carries
+    that face's frozen mean charge. Applied to the flux the BE step
+    actually applied it is the witness the frozen projection cannot give;
+    applied to the projected flux it is the baseline of the same measure
+    (zero for an identity map, small but non-zero when several species
+    of different charge share an element - so read the applied value
+    AGAINST the projected one, not against zero). A first attempt that
+    re-partitioned species fluxes by implicit/frozen driving-force ratios
+    saturated at 1.0 on both smokes (2026-09-07): the O/H frame columns
+    aggregate every oxygen/hydrogen-bearing species, so OH- got the ratio
+    of a column that has nothing to do with its own transport."""
+    if q_el is None or f_el is None or f_el.size == 0:
+        return 0.0
+    qf = q_el * f_el
+    net = np.abs(qf.sum(axis=1))
+    tot = np.abs(qf).sum(axis=1)
+    wit = tot > 0.0
+    return float((net[wit] / tot[wit]).max()) if wit.any() else 0.0
 
 
 def _np_deff(dc_s, cbar_s, dc_el, cmax_el, dw, z, nu):
@@ -536,15 +501,15 @@ def np_effective_conductance(graph: DomainGraph, species_mol: np.ndarray,
         for k, v in counts_b.items():
             counts[k] += v
         qrel = max(qrel, qrel_b)
+    zz = np.asarray(z, dtype=np.float64)
     return NPConductance(t_edge=t_edge, t_bnd=t_bnd, deff_edge=deff,
                          counts=counts, charge_flux_rel_max=qrel,
-                         f_species_edge=f_s, small_edge=small, dc_el_edge=dc_el,
-                         cmax_el_edge=cmax_el,
-                         f_species_bnd=f_s_b, small_bnd=small_b,
-                         dc_el_bnd=dc_el_b,
-                         cmax_el_bnd=(cmax_b if g_bnd is not None else None),
-                         z=np.asarray(z, dtype=np.float64),
-                         prim=_primary_element(nu))
+                         q_el_edge=_charge_per_element(cbar_s, zz, nu),
+                         f_np_edge=f_s @ nu,
+                         q_el_bnd=(_charge_per_element(cbar_b, zz, nu)
+                                   if g_bnd is not None else None),
+                         f_np_bnd=(f_s_b @ nu if g_bnd is not None else None),
+                         deff_bnd=(deff_b if g_bnd is not None else None))
 
 
 @dataclass
@@ -555,11 +520,11 @@ class ExchangeResult:
     max_edge_flux_mol: float
     repair_rel: float            # largest relative negative-dust repair
     boundary_net: np.ndarray     # (E,) net element flux INTO the system
-    # RT-01: charge residual of the APPLIED flux under the frozen species
-    # partition (0.0 on the scalar path / without NP data) and the number
-    # of (face, element) ratio clamps behind it
+    # RT-01: charge residual of the APPLIED element flux under the frozen
+    # per-element charge equivalents, and the same measure on the
+    # PROJECTED flux (its baseline); 0.0 on the scalar path
     np_applied_charge_rel_max: float = 0.0
-    np_applied_ratio_clamped: int = 0
+    np_projected_charge_rel_max: float = 0.0
 
 
 def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
@@ -667,11 +632,11 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
     max_flux = float(np.abs(flux).max()) if flux.size else 0.0
     boundary_net = np.zeros(n_elem)
     applied_q = 0.0
-    applied_clamps = 0
-    if np_cond is not None and np_cond.f_species_edge is not None:
-        applied_q, applied_clamps = applied_charge_residual(
-            np_cond.f_species_edge, np_cond.small_edge, np_cond.dc_el_edge,
-            x[ea] - x[eb], np_cond.z, np_cond.prim, np_cond.cmax_el_edge)
+    projected_q = 0.0
+    if np_cond is not None and np_cond.q_el_edge is not None:
+        applied_q = charge_residual(np_cond.q_el_edge,
+                                    np_cond.deff_edge * (x[ea] - x[eb]))
+        projected_q = charge_residual(np_cond.q_el_edge, np_cond.f_np_edge)
     if t_bnd2 is not None:
         rows = np.flatnonzero((t_bnd2 > 0.0).any(axis=1))  # ascending, deterministic
         f_out = dt_h * t_bnd2[rows] * (x[rows] - bath.c_res[None, :])
@@ -679,15 +644,12 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
         boundary_net = -f_out.sum(axis=0)             # rows AND the ledger
         if f_out.size:
             max_flux = max(max_flux, float(np.abs(f_out).max()))
-        if np_cond is not None and np_cond.f_species_bnd is not None:
-            q_b, c_b = applied_charge_residual(
-                np_cond.f_species_bnd[rows], np_cond.small_bnd[rows],
-                np_cond.dc_el_bnd[rows], x[rows] - bath.c_res[None, :],
-                np_cond.z, np_cond.prim,
-                (np_cond.cmax_el_bnd[rows] if np_cond.cmax_el_bnd is not None
-                 else None))
-            applied_q = max(applied_q, q_b)
-            applied_clamps += c_b
+        if np_cond is not None and np_cond.q_el_bnd is not None:
+            applied_q = max(applied_q, charge_residual(
+                np_cond.q_el_bnd[rows],
+                np_cond.deff_bnd[rows] * (x[rows] - bath.c_res[None, :])))
+            projected_q = max(projected_q, charge_residual(
+                np_cond.q_el_bnd[rows], np_cond.f_np_bnd[rows]))
 
     # deterministic negative-dust repair: clip, charge the largest entry.
     # O and H are FRAME elements (solute-frame values relative to H2O):
@@ -728,4 +690,4 @@ def exchange_be(graph: DomainGraph, inventory: np.ndarray, dt_h: float,
             f"logic error, not absorbable; (element, shortfall mol, column "
             f"scale mol): {repairs}")
     return ExchangeResult(delta, "ok", iters, max_flux, repair_rel,
-                          boundary_net, applied_q, applied_clamps)
+                          boundary_net, applied_q, projected_q)

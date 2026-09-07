@@ -21,6 +21,7 @@ KEYS = ("sorbed_total_mol", "sorbed_delta_mol", "sorption_sites_mol",
         "n_frozen_domains", "domains_selected", "domains_deferred",
         # RT-01: frozen-projection witness vs applied-flux residual
         "np_charge_flux_rel_max", "np_applied_charge_rel_max",
+        "np_projected_charge_rel_max",
         "np_phi_clamped", "np_fick_clamped", "np_cap_clamped",
         "boundary_supply_ratio")
 

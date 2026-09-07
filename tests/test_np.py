@@ -565,14 +565,22 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
     ex = transport.exchange_be(graph, inv.copy(), 0.1, None, np_cond=npc)
     assert ex.status == "ok"
     assert 0.03 < ex.np_applied_charge_rel_max < 0.06
-    assert ex.np_applied_ratio_clamped == 0           # ratios stay O(1) here
-    # a dust frozen gradient with a large implicit change must not
-    # dominate the witness: the ratio is clamped and counted
-    inv2 = inv.copy()
-    inv2[1, 2] = inv2[0, 2] * (1.0 - 1e-8)            # ion 3: no real gradient
-    npc2 = transport.np_effective_conductance(graph, inv2, graph.water, dw, z, nu)
-    ex2 = transport.exchange_be(graph, inv2.copy(), 0.1, None, np_cond=npc2)
-    assert ex2.np_applied_charge_rel_max <= 1.0
+    assert ex.np_projected_charge_rel_max <= 1e-12     # identity map: q = z
+    # a species shared by two elements: the per-element charge equivalents
+    # are concentration-weighted means, exact where one species owns the
+    # element
+    from tinn.registry import ELEMENT_IDS
+    nu2 = np.zeros((2, len(ELEMENT_IDS)))
+    nu2[0, ELEMENT_IDS.index("S")] = 1.0
+    nu2[0, ELEMENT_IDS.index("O")] = 4.0
+    nu2[1, ELEMENT_IDS.index("O")] = 1.0
+    nu2[1, ELEMENT_IDS.index("H")] = 1.0
+    q = transport._charge_per_element(np.array([[0.1, 0.3]]),
+                                      np.array([-2.0, -1.0]), nu2)
+    assert q[0, ELEMENT_IDS.index("S")] == pytest.approx(-2.0)
+    assert q[0, ELEMENT_IDS.index("H")] == pytest.approx(-1.0)
+    assert q[0, ELEMENT_IDS.index("O")] == pytest.approx(
+        (-2.0 * 4 * 0.1 - 1.0 * 0.3) / (4 * 0.1 + 0.3))
     new = inv + ex.delta
     assert abs(float(new[0] @ z)) > 0.03            # the charge really moved
     ex_small = transport.exchange_be(graph, inv.copy(), 1e-3, None, np_cond=npc)
@@ -580,17 +588,6 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
     # scalar path: no NP data -> residual 0 by definition
     ex_s = transport.exchange_be(graph, inv.copy(), 0.1, 2.0)
     assert ex_s.np_applied_charge_rel_max == 0.0
-    # primary-element attribution over the real ledger: SO4-2 -> S (not
-    # its four O), OH- -> a frame element
-    from tinn.registry import ELEMENT_IDS
-    nu2 = np.zeros((2, len(ELEMENT_IDS)))
-    nu2[0, ELEMENT_IDS.index("S")] = 1.0
-    nu2[0, ELEMENT_IDS.index("O")] = 4.0
-    nu2[1, ELEMENT_IDS.index("O")] = 1.0
-    nu2[1, ELEMENT_IDS.index("H")] = 1.0
-    prim = transport._primary_element(nu2)
-    assert prim[0] == ELEMENT_IDS.index("S")
-    assert prim[1] in (ELEMENT_IDS.index("O"), ELEMENT_IDS.index("H"))
     from tinn.config import TinnConfig
     raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
         encoding="utf-8"))
