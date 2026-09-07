@@ -860,6 +860,10 @@ class Engine:
                     trial.boundary_exchanged_elements = (
                         trial.boundary_exchanged_elements - swept)
                     exchange_metrics["bath_swept_mol"] = float(swept.sum())
+                    # D2 (review): the per-element size of the flush, not just
+                    # its scalar sum - so a materially large sweep is
+                    # distinguishable from numerical cleanup in the run report
+                    exchange_metrics["bath_swept_elements"] = swept.tolist()
             exchange_bal = ledger.ExchangeBalance(
                 applied_delta_elements=ex.delta.sum(axis=0),
                 boundary_net_elements=ex.boundary_net,
@@ -1896,6 +1900,20 @@ class Engine:
                     exchange_metrics.get("dryout_surrendered_mol", 0.0)
                     + float(sum(np.abs(residual[pd]).sum()
                                 for pd in surrendered)))
+                # D2 (review): per-element surrendered mass (signed) and the
+                # z-layers of the surrendered domains, so a fallback that
+                # materially moves the front is visible, not just counted
+                surr_el = np.zeros(len(ELEMENT_IDS))
+                for pd in surrendered:
+                    surr_el += residual[pd]
+                prev = exchange_metrics.get("dryout_surrendered_elements")
+                exchange_metrics["dryout_surrendered_elements"] = (
+                    (np.asarray(prev) + surr_el).tolist() if prev is not None
+                    else surr_el.tolist())
+                if recon is not None:
+                    zl = sorted({int(z) for pd in surrendered
+                                 for z in np.unique(np.nonzero(recon == pd)[0])})
+                    exchange_metrics["dryout_surrendered_z_layers"] = zl
         trial.cluster_inventory = remap.inventory
         # E2: pools follow the assemblage — a solved cluster's pool IS its own
         # parcels (absolute replacement, non-compounding); frozen clusters
@@ -2163,6 +2181,21 @@ class Engine:
             # run's species diffusivities, and which species fell to the
             # declared default — audit trail, spec §2.2 report duty
             summary["species_transport"] = dict(self._np_provenance)
+        # D2 (review): accumulate the SIZE of numerical fallbacks, not only
+        # counts - per-element mol moved to the boundary by bath sweep and by
+        # dryout surrender, the count of frozen domain-steps, and the z-layers
+        # touched by surrender - so a fallback that materially moves the front
+        # is distinguishable from negligible numerical cleanup.
+        n_el = len(ELEMENT_IDS)
+        fb = {
+            "bath_swept_elements": np.zeros(n_el),
+            "dryout_surrendered_elements": np.zeros(n_el),
+            "nonconv_frozen_domain_steps": 0.0,
+            "water_frozen_domain_steps": 0.0,
+            "dryout_surrendered_domains": 0.0,
+            "bath_flushed_domains": 0.0,
+            "surrender_z_layers": {},
+        }
         if audit_hook is not None:
             audit_hook({
                 "event": "run_start",
@@ -2232,6 +2265,22 @@ class Engine:
                     trial.dt_h = min(dt_try * 2.0, next_cap)
                 state = trial
                 last_metrics = metrics
+                # D2: fold this accepted step's fallback sizes into the run total
+                for k in ("bath_swept_elements", "dryout_surrendered_elements"):
+                    v = metrics.get(k)
+                    if v is not None:
+                        fb[k] = fb[k] + np.asarray(v, dtype=np.float64)
+                fb["nonconv_frozen_domain_steps"] += metrics.get(
+                    "nonconv_frozen_domains", 0.0)
+                fb["water_frozen_domain_steps"] += metrics.get(
+                    "water_frozen_domains", 0.0)
+                fb["dryout_surrendered_domains"] += metrics.get(
+                    "dryout_surrendered_domains", 0.0)
+                fb["bath_flushed_domains"] += metrics.get(
+                    "bath_flushed_domains", 0.0)
+                for z in metrics.get("dryout_surrendered_z_layers", ()):
+                    fb["surrender_z_layers"][z] = (
+                        fb["surrender_z_layers"].get(z, 0) + 1)
                 if audit_hook is not None:
                     audit_hook({
                         "event": "step_accepted",
@@ -2262,9 +2311,71 @@ class Engine:
         summary["final"] = self._snapshot_row(state, last_metrics)
         summary["sanity_band"] = analysis.sanity_band(summary["outputs"],
                                                       self.config)
+        # RT-02: surface any gel-vs-RT connectivity mismatch (a reported finite
+        # diffusivity coexisting with a disconnected RT path) as a run-summary
+        # warning - never silently. Deduplicated across output rows.
+        gel_warn: List[str] = []
+        for r in (*summary["outputs"], summary["final"]):
+            for w in r.get("gel_connectivity_warnings", ()):
+                if w not in gel_warn:
+                    gel_warn.append(w)
+        if gel_warn:
+            summary["gel_connectivity_warnings"] = gel_warn
+        # D2: fallback size report - per-element cumulative mol and its fraction
+        # of the final total inventory and of the cumulative boundary flux, so
+        # the reader can judge whether a fallback materially moved the front.
+        # dissolved-solution ledger (per-cluster inventory) is what these
+        # fallbacks move; the boundary flux is the cumulative bath exchange
+        total_inv = np.abs(np.asarray(state.cluster_inventory)).sum(axis=0)
+        bnd_flux = np.abs(getattr(state, "boundary_exchanged_elements",
+                                  np.zeros(n_el)))
+
+        inv_mag = float(total_inv.sum())
+        bnd_mag = float(bnd_flux.sum())
+
+        def _el_report(vec):
+            # per-element mol (signed) plus SCALAR fractions of the fallback's
+            # total magnitude against the solute inventory and the boundary
+            # flux. Per-element ratios are deliberately avoided: a trace
+            # element's near-zero denominator turns a dust-scale sweep into a
+            # meaningless 100x ratio (review D2 wants "material vs cleanup",
+            # which the aggregate magnitude answers robustly).
+            vec = np.asarray(vec)
+            mag = float(np.abs(vec).sum())
+            mol = {ELEMENT_IDS[i]: float(vec[i]) for i in range(n_el)
+                   if vec[i] != 0.0}
+            return {
+                "mol": mol,
+                "total_abs_mol": mag,
+                "frac_of_total_inventory": (mag / inv_mag if inv_mag > 0.0
+                                            else None),
+                "frac_of_boundary_flux": (mag / bnd_mag if bnd_mag > 0.0
+                                          else None),
+            }
+
+        report = {
+            "bath_swept": _el_report(fb["bath_swept_elements"]),
+            "dryout_surrendered": _el_report(fb["dryout_surrendered_elements"]),
+            "nonconv_frozen_domain_steps": fb["nonconv_frozen_domain_steps"],
+            "water_frozen_domain_steps": fb["water_frozen_domain_steps"],
+            "dryout_surrendered_domains": fb["dryout_surrendered_domains"],
+            "bath_flushed_domains": fb["bath_flushed_domains"],
+            "surrender_z_layer_histogram": {str(k): v for k, v
+                                            in sorted(fb["surrender_z_layers"].items())},
+        }
+        if any(report[k]["mol"] for k in ("bath_swept", "dryout_surrendered")) \
+                or fb["nonconv_frozen_domain_steps"] \
+                or fb["water_frozen_domain_steps"] \
+                or fb["dryout_surrendered_domains"]:
+            summary["fallback_report"] = report
         return state, summary
 
     def _snapshot_row(self, state: SimulationState, metrics: dict) -> dict:
         row = analysis.state_row(state, self.registry, self._gel_eps)
         row["ledger_metrics"] = dict(metrics)
+        # RT-02: only meaningful when transport actually uses the RT graph
+        if self.config.transport is not None:
+            row["gel_connectivity_warnings"] = (
+                analysis.gel_connectivity_warnings(
+                    state, self._gel_eps, self.config))
         return row

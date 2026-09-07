@@ -193,6 +193,38 @@ def test_np_applied_flux_charge_residual_rt01():
     assert r0.np_applied_charge_rel_max == 0.0
 
 
+def test_gel_connectivity_warning_rt02():
+    """RT-02: the reported diffusivity network conducts through gel-bearing
+    voxels but the RT labelling is capillary-liquid only. The review's 4x4x4
+    case - liquid layers on opposite z-faces, gel-only layers between - has 2
+    RT clusters, 0 connecting edges, yet a finite reported diffusivity through
+    the gel bridge; the run summary must warn."""
+    import types
+    from tinn import analysis
+    n = 4
+    liq = np.zeros((n, n, n))
+    liq[0] = 1.0
+    liq[-1] = 1.0                                   # opposite z faces only
+    hyd = np.zeros((1, n, n, n))
+    hyd[0, 1] = 1.0
+    hyd[0, 2] = 1.0                                 # gel-bearing middle layers
+    state = types.SimpleNamespace(capillary_liquid=liq, hydrate_fraction=hyd)
+    cfg = types.SimpleNamespace(transport=types.SimpleNamespace(
+        boundary=types.SimpleNamespace(axis="z")))
+    warns = analysis.gel_connectivity_warnings(state, np.array([1.0]), cfg)
+    assert len(warns) == 1 and "RT-02" in warns[0]
+    # gel conducts, liquid does not span:
+    g = transport.conductance_field(liq, hyd, np.array([1.0]), 0.0025)
+    assert analysis._spans_axis(g, 0, (False, True, True))
+    assert not analysis._spans_axis(liq, 0, (False, True, True))
+    # filling the middle with capillary liquid restores the RT path -> no warn
+    liq2 = liq.copy()
+    liq2[1] = 1.0
+    liq2[2] = 1.0
+    state2 = types.SimpleNamespace(capillary_liquid=liq2, hydrate_fraction=hyd)
+    assert analysis.gel_connectivity_warnings(state2, np.array([1.0]), cfg) == []
+
+
 # ------------------------------------------------- P0a: worker protocol v2
 
 @needs_gems

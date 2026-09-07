@@ -14,7 +14,7 @@ import json
 import struct
 import zlib
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -762,6 +762,59 @@ def relative_diffusivity_network(state: SimulationState, gel_eps: np.ndarray,
             "face_mixing_beta": beta,
             "background_floor": NETWORK_FLOOR,
             "cg_iterations": iters, "status": status}
+
+
+def _spans_axis(field: np.ndarray, axis: int,
+                periodic_axes: Tuple[bool, bool, bool]) -> bool:
+    """True when a single conducting cluster of `field` (labelled with the RT
+    cluster rule) touches both faces of `axis` - i.e. that cluster spans the
+    domain along that axis."""
+    labels, n = transport.label_clusters(field.astype(np.float64),
+                                          periodic_axes=periodic_axes)
+    if n == 0:
+        return False
+    for c in range(n):
+        vox = np.moveaxis(labels == c, axis, 0)
+        if vox[0].any() and vox[-1].any():
+            return True
+    return False
+
+
+def gel_connectivity_warnings(state, gel_eps: np.ndarray,
+                              config: TinnConfig,
+                              gel_rel_diffusivity: float = GEL_REL_DIFFUSIVITY
+                              ) -> List[str]:
+    """RT-02 (external review 2026-09-07): the reported diffusivity network
+    conducts through gel-bearing hydrate voxels, but the RT cluster labelling
+    is built only from capillary-liquid voxels (> LIQ_EPS), so a gel-only
+    voxel cannot connect two wet domains. Warn when the reported (gel-aware)
+    conductance network spans an axis that the capillary-liquid RT graph does
+    NOT - a reported finite diffusivity coexisting with a disconnected RT
+    path. Cheap topological check (two cluster labellings, no CG solve), so it
+    can ride every output row. On a boundary run the exposed axis is the one
+    that matters (the review's exposure-face-to-interior gap); otherwise every
+    axis is checked."""
+    g = transport.conductance_field(state.capillary_liquid,
+                                    state.hydrate_fraction, gel_eps,
+                                    gel_rel_diffusivity)
+    periodic = [True, True, True]
+    axes = (0, 1, 2)
+    bnd = config.transport.boundary if config.transport is not None else None
+    if bnd is not None:
+        b_axis = {"z": 0, "y": 1, "x": 2}[bnd.axis]
+        periodic[b_axis] = False        # the exposed face de-periodizes it
+        axes = (b_axis,)
+    warnings: List[str] = []
+    for a in axes:
+        rep = _spans_axis(g, a, tuple(periodic))
+        liq = _spans_axis(state.capillary_liquid, a, tuple(periodic))
+        if rep and not liq:
+            warnings.append(
+                f"RT-02: axis {'zyx'[a]} - the reported diffusivity network "
+                f"spans the domain through gel-mediated conduction, but no "
+                f"capillary-liquid RT cluster does; reported finite "
+                f"diffusivity coexists with a disconnected RT path")
+    return warnings
 
 
 # ------------------------------------------------------------- §6.3 judgment
