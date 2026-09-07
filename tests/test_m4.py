@@ -90,6 +90,33 @@ def test_backend_cnash_bundle_channels_and_react(tmp_path):
     w.close()
 
 
+@needs_gems
+def test_sorption_structural_alkali_endmember_refused(tmp_path):
+    """RT-04A: the PC/PC-Cl CSHQ solid solution carries KSiOH/NaSiOH
+    endmembers, so additional Na surface sorption double-counts alkali
+    uptake. The config is valid (alkali_exchange: true) but the engine must
+    refuse it on the sorbent's actual endmember rows - a CSHQ name (no CNASH
+    phase in this bundle) does not prove it is alkali-free."""
+    raw = json.loads((REPO / "examples" / "opc_gems_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(BUNDLE)
+    raw["chemistry"]["gems_worker_python"] = str(GEMS_PYTHON)
+    raw["schedule"] = {"output_times_h": [2.0], "dt_initial_h": 2.0,
+                       "dt_min_h": 0.001}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    cemdat = REPO / "gems_bundles" / "PHREEQC-cemdata18" / "cemdata18.dat"
+    raw["sorption"] = {
+        "operator": "phreeqc_surface", "phreeqc_dat": str(cemdat),
+        "site_density_mol_per_mol": {"CSHQ-TobH": 0.02},
+        "surface_species": [{"reaction": "Surf_sOH + Na+ = Surf_sONa + H+",
+                             "log_k": 0.0,
+                             "sorbed_elements": {"Na": 1.0, "H": -1.0}}],
+        "elements": ["Na"], "alkali_exchange": True}
+    cfg = TinnConfig.model_validate(raw)          # config is valid
+    with pytest.raises(RuntimeError, match="structural alkali"):
+        Engine(cfg)
+
+
 def _release():
     return {"C3S": 2e-12, "C2S": 3e-13, "C3A": 2e-13, "C4AF": 1.5e-13}
 

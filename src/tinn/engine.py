@@ -364,13 +364,31 @@ class Engine:
                 raise RuntimeError(
                     "sorption needs the CSHQ solid solution as the sorbent "
                     f"- this bundle declares {self.hydrate_ids[:6]}...")
-            if (any(el in ("Na", "K") for el in config.sorption.elements)
-                    and "CNASH" in self.hydrate_ids):
+            alkali_sorbed = [el for el in ("Na", "K")
+                             if el in config.sorption.elements]
+            if alkali_sorbed and "CNASH" in self.hydrate_ids:
                 raise RuntimeError(
                     "alkali sorption with a CNASH-bearing bundle would "
                     "double-count alkali uptake (the solid solution binds "
                     "them thermodynamically) - refused, mechanism table")
             cshq_dcs = self._hydrate_endmembers["CSHQ"]
+            # RT-04A: a CSHQ name does not prove the solid solution is free of
+            # structural alkali. Inspect the sorbent endmembers' own element
+            # rows: any KSiOH/NaSiOH-type endmember that binds Na/K structurally
+            # would be double-counted by additional Na/K surface sorption, so
+            # refuse it even with alkali_exchange (the review's PC-Cl gap).
+            if alkali_sorbed and self._endmember_elements is not None:
+                struct = [dc for dc in cshq_dcs
+                          if any(self._endmember_elements[dc][ELEMENT_IDS.index(el)]
+                                 != 0.0 for el in alkali_sorbed)]
+                if struct:
+                    raise RuntimeError(
+                        f"alkali sorption {alkali_sorbed} with a CSHQ sorbent "
+                        f"whose endmembers already bind structural alkali "
+                        f"{struct} would double-count uptake - refused even "
+                        f"with alkali_exchange (the solid solution takes Na/K "
+                        f"thermodynamically; a CSHQ name does not prove it is "
+                        f"alkali-free)")
             unknown = sorted(set(config.sorption.site_density_mol_per_mol)
                              - set(cshq_dcs))
             if unknown:
