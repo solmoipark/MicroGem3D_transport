@@ -70,6 +70,33 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def chemistry_identity(config: TinnConfig) -> Dict:
+    """RT (external review 2026-09-07): content identity of the external
+    thermodynamic inputs a restart must reproduce - the GEMS bundle files and
+    the PHREEQC database by sha256, plus the chemistry-engine versions.
+    Matching paths, species names, or endmember stoichiometry does not detect
+    a changed equilibrium constant under the same name; a content hash does.
+    Reuses gems.audit_bundle (the same sha map the worker guards with)."""
+    ident: Dict = {}
+    lst = getattr(config.chemistry, "gems_bundle_lst", None)
+    if lst is not None:
+        from .gems import audit_bundle
+        ident["gems_bundle_sha256"] = audit_bundle(str(Path(lst).resolve()))
+    if config.sorption is not None:
+        dat = Path(config.sorption.phreeqc_dat).resolve()
+        ident["phreeqc_dat_sha256"] = (_sha256_file(dat) if dat.is_file()
+                                       else None)
+    versions: Dict = {}
+    for mod in ("xgems", "phreeqpython"):
+        try:
+            m = __import__(mod)
+            versions[mod] = str(getattr(m, "__version__", "unknown"))
+        except Exception:
+            versions[mod] = None      # not importable in this interpreter
+    ident["engine_versions"] = versions
+    return ident
+
+
 def _write_zarr_array(dir_path: Path, arr: np.ndarray) -> None:
     dir_path.mkdir(parents=True)
     meta = {"zarr_format": 2, "shape": list(arr.shape), "chunks": list(arr.shape),
@@ -132,6 +159,11 @@ def save_checkpoint(state: SimulationState, out_dir: str, name: str) -> Path:
             # RT-P0b: run-scoped aqueous species order, positional over
             # domain_species_mol columns (empty when species transport off)
             "aq_species_ids": list(state.aq_species_ids),
+            # RT reproducibility: content hashes of the external chemistry
+            # inputs (checked on restart; a hard error on mismatch unless
+            # TINN_ALLOW_CHEMISTRY_MISMATCH is set). Header-key addition only,
+            # no format break; a pre-review checkpoint lacks this key -> warn.
+            "chemistry_identity": chemistry_identity(state.config),
         }
         for k in _LEDGER_SCALARS:
             header[k] = getattr(state, k)
@@ -215,6 +247,34 @@ def load_checkpoint(path: str, registry: Registry) -> SimulationState:
             "checkpoint config_hash does not match the hash of its own embedded "
             "config under this build - the config schema changed between versions; "
             "restarting would silently poison run provenance (no silent fallback)")
+    # RT reproducibility: the external chemistry inputs must be byte-identical.
+    # A checkpoint predating this check has no key -> warn and proceed (there is
+    # nothing to compare against). Present -> recompute from the embedded
+    # config's paths and hard-fail on any content-hash mismatch unless the
+    # explicit TINN_ALLOW_CHEMISTRY_MISMATCH override is set (versions are
+    # recorded for provenance but not enforced).
+    stored_ident = header.get("chemistry_identity")
+    if stored_ident is None:
+        import warnings
+        warnings.warn(
+            "checkpoint predates the chemistry-identity record; the GEMS "
+            "bundle / PHREEQC database content cannot be verified on this "
+            "restart (rerun from the config for a guaranteed-consistent run)",
+            stacklevel=2)
+    else:
+        current_ident = chemistry_identity(config)
+        drift = [k for k in ("gems_bundle_sha256", "phreeqc_dat_sha256")
+                 if stored_ident.get(k) != current_ident.get(k)]
+        if drift and not os.environ.get("TINN_ALLOW_CHEMISTRY_MISMATCH"):
+            raise StorageError(
+                f"checkpoint chemistry inputs changed since it was written "
+                f"{drift}: the GEMS bundle or PHREEQC database content no "
+                f"longer matches (a changed equilibrium constant under the "
+                f"same name is exactly what this guards). Restarting would "
+                f"mix chemistries - refused. Set TINN_ALLOW_CHEMISTRY_MISMATCH "
+                f"to override deliberately, or rerun from the config.\n"
+                f"  stored:  {stored_ident.get('engine_versions')}\n"
+                f"  current: {current_ident.get('engine_versions')}")
 
     arrays = {f: _read_zarr_array(root / "arrays" / f) for f in _DENSE_FIELDS}
     cluster_inventory = _read_zarr_array(root / "arrays" / "cluster_inventory")

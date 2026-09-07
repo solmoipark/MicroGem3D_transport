@@ -584,6 +584,53 @@ def test_checkpoint_no_overwrite(full_run, tmp_path):
         save_checkpoint(state, str(tmp_path), "ck")
 
 
+def test_chemistry_identity_content():
+    """RT (review D1): the chemistry-input identity carries sha256 content
+    hashes of the GEMS bundle files and the PHREEQC database, plus engine
+    versions - matching a path or a species name would not detect a changed
+    equilibrium constant under the same name."""
+    from tinn import storage
+    repo = Path(__file__).resolve().parents[1]
+    cemdat = repo / "gems_bundles" / "PHREEQC-cemdata18" / "cemdata18.dat"
+    raw = json.loads((EXAMPLES / "opc_gems_32.json"
+                      ).read_text(encoding="utf-8"))
+    raw["chemistry"]["gems_bundle_lst"] = str(
+        repo / "gems_bundles" / "PC" / "PC-dat.lst")
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    raw["sorption"] = {
+        "operator": "phreeqc_surface", "phreeqc_dat": str(cemdat),
+        "site_density_mol_per_mol": {"CSHQ-TobH": 0.02},
+        "surface_species": [{"reaction": "Surf_sOH + SO4-2 = Surf_sSO4- + OH-",
+                             "log_k": 0.5,
+                             "sorbed_elements": {"S": 1.0, "O": 3.0, "H": -1.0}}],
+        "elements": ["S"]}
+    ident = storage.chemistry_identity(TinnConfig.model_validate(raw))
+    assert isinstance(ident["gems_bundle_sha256"], dict)
+    assert ident["gems_bundle_sha256"]                 # at least one file
+    assert all(len(v) == 64 for v in ident["gems_bundle_sha256"].values())
+    assert len(ident["phreeqc_dat_sha256"]) == 64
+    assert set(ident["engine_versions"]) == {"xgems", "phreeqpython"}
+
+
+def test_checkpoint_chemistry_mismatch_refused(full_run, tmp_path, monkeypatch):
+    """RT (review D1): a restart whose external chemistry inputs no longer
+    match the recorded content hashes is a hard error, unless the explicit
+    TINN_ALLOW_CHEMISTRY_MISMATCH override is set."""
+    from tinn import storage
+    _, state, _, _ = full_run
+    ck = save_checkpoint(state, str(tmp_path), "ck")
+    header = json.loads((ck / "header.json").read_text(encoding="utf-8"))
+    assert "chemistry_identity" in header             # recorded on save
+
+    drifted = {"gems_bundle_sha256": {"MySystem-dch.json": "d" * 64},
+               "phreeqc_dat_sha256": "e" * 64, "engine_versions": {}}
+    monkeypatch.setattr(storage, "chemistry_identity", lambda cfg: drifted)
+    with pytest.raises(StorageError, match="chemistry inputs changed"):
+        load_checkpoint(str(ck), REG)
+    monkeypatch.setenv("TINN_ALLOW_CHEMISTRY_MISMATCH", "1")
+    load_checkpoint(str(ck), REG)                     # override lets it through
+
+
 def test_restart_bitwise_equivalence(full_run):
     _, straight, _, out = full_run
     mid = load_checkpoint(str(out / "ckpt_001"), REG)   # t = 24 h
