@@ -880,6 +880,8 @@ class Engine:
                 # RT-01: charge carried by the APPLIED flux (frozen partition)
                 exchange_metrics["np_applied_charge_rel_max"] = float(
                     ex.np_applied_charge_rel_max)
+                exchange_metrics["np_applied_ratio_clamped"] = float(
+                    ex.np_applied_ratio_clamped)
                 rtol = self._np_cfg.applied_charge_rtol
                 if rtol is not None and ex.np_applied_charge_rel_max > rtol:
                     return None, StepReject(

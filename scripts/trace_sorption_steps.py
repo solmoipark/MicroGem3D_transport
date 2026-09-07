@@ -18,7 +18,11 @@ from tinn.engine import Engine                          # noqa: E402
 KEYS = ("sorbed_total_mol", "sorbed_delta_mol", "sorption_sites_mol",
         "sorption_sites_c_mol", "sorption_buffer_dissolved_mol",
         "sorption_dry_reactors", "sorption_pool_coverage",
-        "n_frozen_domains", "domains_selected", "domains_deferred")
+        "n_frozen_domains", "domains_selected", "domains_deferred",
+        # RT-01: frozen-projection witness vs applied-flux residual
+        "np_charge_flux_rel_max", "np_applied_charge_rel_max",
+        "np_phi_clamped", "np_fick_clamped", "np_cap_clamped",
+        "boundary_supply_ratio")
 
 
 def main() -> None:

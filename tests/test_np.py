@@ -565,6 +565,14 @@ def test_np_applied_flux_charge_residual_reproduces_review_case():
     ex = transport.exchange_be(graph, inv.copy(), 0.1, None, np_cond=npc)
     assert ex.status == "ok"
     assert 0.03 < ex.np_applied_charge_rel_max < 0.06
+    assert ex.np_applied_ratio_clamped == 0           # ratios stay O(1) here
+    # a dust frozen gradient with a large implicit change must not
+    # dominate the witness: the ratio is clamped and counted
+    inv2 = inv.copy()
+    inv2[1, 2] = inv2[0, 2] * (1.0 - 1e-8)            # ion 3: no real gradient
+    npc2 = transport.np_effective_conductance(graph, inv2, graph.water, dw, z, nu)
+    ex2 = transport.exchange_be(graph, inv2.copy(), 0.1, None, np_cond=npc2)
+    assert ex2.np_applied_charge_rel_max <= 1.0
     new = inv + ex.delta
     assert abs(float(new[0] @ z)) > 0.03            # the charge really moved
     ex_small = transport.exchange_be(graph, inv.copy(), 1e-3, None, np_cond=npc)
