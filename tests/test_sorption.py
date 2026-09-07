@@ -298,6 +298,26 @@ def test_sorption_ddl_config_gates():
     assert h_bare == h_explicit
 
 
+def test_sorption_buffer_with_per_phase_tau_refused():
+    """RT-04B: an owned sorption buffer combined with per-phase rate
+    limitation is refused at config validation, the same way the engine
+    already refuses buffer_phase + global exchange_tau_h. The review's exact
+    combo (buffer_phase Portlandite + exchange_tau_h_per_phase Portlandite:100)
+    must not pass."""
+    raw = json.loads((REPO / "examples" / "qualification"
+                      / "chloride_binding_28d_0.5M.json"
+                      ).read_text(encoding="utf-8"))
+    assert raw["sorption"]["buffer_phase"] == "Portlandite"
+    TinnConfig.model_validate(raw)                 # baseline is valid
+    raw["transport"]["exchange_tau_h_per_phase"] = {"Portlandite": 100.0}
+    with pytest.raises(Exception, match="RT-04B"):
+        TinnConfig.model_validate(raw)
+    # a per-phase tau on any other phase is refused too while a buffer is owned
+    raw["transport"]["exchange_tau_h_per_phase"] = {"ettringite": 50.0}
+    with pytest.raises(Exception, match="RT-04B"):
+        TinnConfig.model_validate(raw)
+
+
 def test_sorption_reaction_oh_stoichiometry():
     """RT-03: the solution-removal vector is derived from the reaction and
     the declared sorbed_elements must match it for EVERY element, O and H

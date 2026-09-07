@@ -1161,6 +1161,30 @@ class TinnConfig(BaseModel):
                     "bundle, whose C-S-H binds alkalis thermodynamically - "
                     "surface exchange on top would double-count; the engine "
                     "re-checks the actual bundle)")
+            # RT-04B: an owned sorption buffer with per-phase rate limitation
+            # is refused for the same reason as the global exchange_tau_h case
+            # (the engine already rejects that). The S stage draws the full
+            # owned buffer amount, while the R stage's offer of that solid can
+            # be restricted by any active per-phase tau, so the buffer would
+            # access an amount excluded from the corresponding reaction
+            # transaction. Refuse whenever a buffer is owned and any phase
+            # carries an active (tau > 0) per-phase limit.
+            if (self.sorption.buffer_phase is not None
+                    and self.transport is not None
+                    and self.transport.exchange_tau_h_per_phase is not None):
+                active = {ph: t for ph, t
+                          in self.transport.exchange_tau_h_per_phase.items()
+                          if t > 0.0}
+                if active:
+                    raise ValueError(
+                        f"sorption.buffer_phase "
+                        f"{self.sorption.buffer_phase!r} with per-phase rate "
+                        f"limitation exchange_tau_h_per_phase {active} is "
+                        f"refused: the S stage draws the full owned buffer "
+                        f"amount while the R stage's offer of that solid is "
+                        f"rate-restricted, so the buffer would access an "
+                        f"amount excluded from the reaction transaction "
+                        f"(review RT-04B, no silent inconsistency)")
         if (self.transport is not None and self.transport.boundary is not None
                 and self.chemistry.backend != "gems3k"):
             # the stoichiometric backend's solution ledger is identically
