@@ -1375,6 +1375,20 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   (`run_rt06_dt_ladder.py`, Cl 0.5 M + 황산염)으로 CH 소진의 dt-불변을 확인하는
   일은 다른 컴퓨터 항목(작업 지시서 v2). S1d 기록의 수치(수착 S 4.0 %/0.93 %)와
   RT-S1e·RT-Cl-3의 CH 소진 속도는 이 아티팩트의 영향 아래 측정된 것으로 표기.
+- **RT-S1f 검증 실측 (2026-09-08, 다른 컴퓨터, 브랜치 `rt-s1f-verify`)**: dt 사다리 재실행
+  결과 RT-S1f는 (1) **수화를 깨는 결함**을 드러냈다 — `n_ch=min(n_ch,buf_mol)`가 용해만
+  소유 CH로 상한하고 석출(n_ch<0)은 무제한이라, S 흡착(리간드 교환→CH 석출)이 trace-Ca
+  포켓에서 용액에 없는 Ca를 석출→`chloride_binding_28d_0.5M` 672 h 수화가 t=216 h에
+  overdraw 하드에러(cluster 16, Ca −7.18e-19; pre-S1f는 정상). 대칭인 **가용 Ca 하한**
+  `n_ch≥−(용액 Ca)`을 추가해야 수화가 통과(브랜치 커밋; test_sorption+m4 31 passed).
+  (2) 그 수정 후에도 **CH 1/dt 아티팩트를 제거하지 못한다** — 0.2 h 노출 CH_vox
+  3126/2467/1386(dt 0.0014/0.0007/0.00035)은 pre-S1f 3049/2367/1276과 거의 동일,
+  dt 반감당 소비 여전히 ~2배(변화 21–44 % ≫ 수용 5 %); 결합 Cl는 dt-강건(spread 1.5 %<2 %),
+  수착 S는 여전히 dt마다 ~반감. 해석 — CH 부기(회계)를 바꿔도 R-단계 GEMS가 구동하는 실제
+  CH 고갈의 dt 의존은 그대로다. **판정: S–R 고정점 반복 설계 항목은 여전히 필요**
+  (RT-S1f로 불필요해지지 않음). 산출물 `results_back/RT_S1f_VERIFICATION.md`,
+  `rt06_cl05_RTS1f_comparison.json`. 미결: dt 0.00035의 0.4 h 미도달(drained-바스 GEMS 엣지),
+  황산염 대조(진행 중).
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
