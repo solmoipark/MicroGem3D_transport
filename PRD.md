@@ -1481,7 +1481,14 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   판정: 수용 기준의 1차 수렴이 CH·수착 S에서 성립하지 않으므로 **S–R 반복(고정점) 설계
   항목으로 등록**(아래). 미결 — (a) dt 0.00035의 0.4 h 도달을 막는 drained-바스 용액
   수렴 엣지(trace-water 스킵을 sites≈0/바스-용액 케이스로 확장 검토); (b) 황산염
-  CH-소진 후 regime 대조(진행 중, `runs/rt06_so4`).
+  CH-소진 후 regime 대조(아래).
+  **황산염 CH-소진 대조 (2026-09-08, 실측; `sulfate_attack_opc32`, dt 0.0014 / 0.0007,
+  168.0→168.4 h; `results_back/rt06_so4_dt_ladder_comparison.json`, 벽시계 dt 0.0014
+  1112 s·dt 0.0007 7294 s)**: **CH 부피가 여기서도 강한 dt 비수렴** — 0.3 h에서
+  dt 0.0014 1618 vs 0.0007 819 vox(dt 반감당 소비 ~2배), CH가 소진을 향해 감. 반면
+  자유 S ~294 mmol/L·pH ~13.145·수착 S 2.22e-11(고-S 배스라 포화)로 dt-robust. →
+  **CH-완충 S-단계의 dt 비수렴이 Cl·황산염 두 노출에서 재현**(리뷰 RT-06 확정),
+  자유 용액 이온·pH는 dt-강건. 위 S–R 고정점 반복 설계 항목의 근거를 보강.
 
 - **미결(설계) — S–R 고정점 반복 (RT-06 후속)**: CH-완충 S-단계가 dt 수렴하지 않으므로
   (위 실측), S(수착)→R(GEM) 사이에 명시적 수렴 기준(예: CH 소진량·수착 S의 상대 변화
