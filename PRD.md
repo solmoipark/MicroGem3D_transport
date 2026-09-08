@@ -1387,8 +1387,10 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   수착 S는 여전히 dt마다 ~반감. 해석 — CH 부기(회계)를 바꿔도 R-단계 GEMS가 구동하는 실제
   CH 고갈의 dt 의존은 그대로다. **판정: S–R 고정점 반복 설계 항목은 여전히 필요**
   (RT-S1f로 불필요해지지 않음). 산출물 `results_back/RT_S1f_VERIFICATION.md`,
-  `rt06_cl05_RTS1f_comparison.json`. 미결: dt 0.00035의 0.4 h 미도달(drained-바스 GEMS 엣지),
-  황산염 대조(진행 중).
+  `rt06_cl05_RTS1f_comparison.json`. **황산염 대조 확정**(`sulfate_attack_opc32`,
+  dt 0.0014/0.0007): CH_vox가 RT-S1f≈pre-S1f(0.3 h 1614/815 vs 1618/819, 차 ~0.2 %),
+  dt 반감당 소비 여전히 ~2배 — Cl·황산염 두 노출 모두에서 아티팩트 미제거 확정. 미결:
+  dt 0.00035의 0.4 h 미도달(drained-바스 GEMS 엣지, RT-S1f 무관).
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
