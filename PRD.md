@@ -1332,6 +1332,49 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
   경계 원장으로 surrender(정확 부동소수, 폐합 항등), 물질 행이면 하드 거부
   유지; `StepReject.detail`로 거부 진단 기록(익명 거부 금지); ③ RT-S3.
   벽시계: 케이스당 25–35 분(672 h 수화 + 286 노출 스텝).
+- **review-2026-09 병합 (2026-09-08)**: 다른 컴퓨터(브랜치 `review-2026-09`, base
+  60e5c55, GEMS/libm 다른 빌드)가 지시서의 코드 항목(RT-03/04/05/01/D1/D2/RT-02)을
+  독자 구현했으나 이쪽 main이 같은 항목을 먼저 확정했으므로 **중복 항목은 main 구현
+  유지**(그쪽 RT-01은 이쪽이 실측으로 기각한 "적용 플럭스 전하 재구성" 정의 — 32³
+  용출 p50 0.475 — 라 채택 안 함). 고유 성과만 편입: ① `analyze_chloride_ingress`의
+  S 분배·CH 부피·전하수지 pH 열(cfc1a0c cherry-pick), ② RT-06 dt 사다리 드라이버
+  `scripts/run_rt06_dt_ladder.py`·`compare_rt06_ladder.py`, ③ RT-05 후속: 물이
+  최대 반응기의 1e-3 미만인 배수된 미세 포켓의 PHREEQC 실패는 dt와 무관(s_fac ~
+  1/물, 1.9e-16 mol에서 1.5e12 실측)이므로 거부 대신 건조 반응기처럼 저장소 동결·
+  계수(`sorption_trace_water_skips`; 그 빌드에서 수화 216/378 h 런을 죽이던 엣지),
+  ④ 아래 RT-R06 실측과 RT-S1f. **교차 플랫폼 발견**: 그 머신의 앵커 A/B dense는
+  4cc99c84…/3a016e96…으로 PRD 권위값과 다르고, 레거시 지오메트리 해시도 다름 —
+  numpy 버전 무관(2.3.2/2.4.6 동일값), libm/BLAS 마지막 비트 차이가 PSD 래스터화의
+  초월함수에 누적된 것(§6.2 주석). 비트 재현성은 **플랫폼 내** 계약이며 config_hash는
+  플랫폼 독립.
+- **RT-R06 — S–R 분리의 dt 수렴 실측 (2026-09-08, 다른 컴퓨터, 배제 적용 상태)**:
+  `chloride_binding_28d_0.5M`을 672 h까지 1회 수화(907 s) 후 노출 dt 0.0014 / 0.0007 /
+  0.00035 h로 재개(`results_back/rt06_cl05_dt_ladder_comparison.json`; dt 0.00035는
+  0.2 h 이후 물 6.6e-11 mol·사이트≈0 반응기의 GEMS 수렴 엣지로 0.4 h 미도달). 0.2 h
+  노출: **결합 Cl 10.49 / 10.58 / 10.44 mg/g cement — spread 0.48 % (< 2 %)**, 자유
+  Cl ~500 mM, 수착 Cl ~5.4e-12 mol, pH(전하수지) ~12.82, Friedel 882/896/880 vox —
+  모두 dt-강건. 그러나 **CH 부피 3049 / 2367 / 1276 vox — dt 반감마다 소비 ~2배**,
+  수착 S도 1.57e-13 / 5.2e-14 / 2.6e-14 mol로 반감; 결합 Cl의 dt/2→dt/4 변화(0.144)가
+  dt→dt/2(0.093)보다 커 1차 수렴 미충족. 황산염 노출(`sulfate_attack_opc32`, dt
+  0.0014/0.0007, 168→168.4 h; `rt06_so4_…json`)에서도 CH 0.3 h 1618 vs 819 vox로
+  같은 비수렴 재현(자유 S ~294 mM·pH 13.145·수착 S 2.22e-11은 강건). 판정: 자유
+  이온·결합 Cl은 dt에 강건, **CH-완충 S 단계의 CH 소진은 1/dt 아티팩트** → 원인·
+  수정은 RT-S1f.
+- **RT-S1f — 완충 booking을 저장소 변화의 전하 등가로 (2026-09-08, 설계·구현;
+  실측 대기)**: 원인 — S1d는 PHREEQC 서브시스템이 보고한 `d_Portlandite`를 매 호출
+  용액↔CH 전이로 부기했다. 그 값에는 저장소 변화가 요구하는 염기 외에 재제공
+  저장소(산성 프레임)를 포화시키느라 녹은 CH 몫이 들어 있고, R 단계가 그 Ca(OH)₂를
+  다시 CH로만 돌려놓지 않고 열역학적으로 선호되는 다른 싱크(CSHQ 재칼슘화·AFt)로
+  일부 재분배하므로 **호출마다 ~d_CH의 CH가 전환** → 총량 ∝ 호출 수 ∝ 1/dt. 수정
+  — 부기량을 **저장소 변화 Δs의 산화수 전하 합 q = Σ ox_el·Δs_el의 절반**(mol CH;
+  `engine.buffer_demand_mol`, ox: Ca 2·Si 4·Al 3·Fe 3·S 6·Na/K 1·Mg 2·C 4·H 1·O −2·
+  Cl −1)로 바꾼다: 배위자 교환(SO4 흡착)은 −½ CH(침전), 양성자 방출형(Ca 착화)은
+  +½(용해), 탈착은 반대 부호; 소유 CH로 상한; PHREEQC 서브시스템은 여전히 CH 포화
+  pH에서 저장소 평형을 구하되 자체 용해량은 버린다 — 원장 행의 순수 함수라 dt-불변.
+  테스트(부호·크기). **실측 미완**: 이 컴퓨터는 계산 금지 — dt 사다리 재실행
+  (`run_rt06_dt_ladder.py`, Cl 0.5 M + 황산염)으로 CH 소진의 dt-불변을 확인하는
+  일은 다른 컴퓨터 항목(작업 지시서 v2). S1d 기록의 수치(수착 S 4.0 %/0.93 %)와
+  RT-S1e·RT-Cl-3의 CH 소진 속도는 이 아티팩트의 영향 아래 측정된 것으로 표기.
 - **RT-S2a — ddl 능력 + 실측 판정 (2026-09-02)**: `surface_model: "ddl"`
   구현 — config가 `specific_area_m2_per_mol_site`(ddl 필수/no_edl 금지,
   Labbez×Divet = 1.2544e5 m²/mol-사이트)와 `charging_reactions`(실란올
@@ -1444,6 +1487,12 @@ SURFACE만 — **상 조합 권위는 GEMS**, EQUILIBRIUM_PHASES/SOLID_SOLUTIONS
 | 물 항등식 (v4.0/RT 확장) | 자유+겔+결합 = 초기 + `boundary_water_mol`(RT-W3 전까지 0) |
 
 ### 6.2 재현 앵커 (회귀 테스트 — 문헌/기측정 값과의 일치)
+
+> 플랫폼 주석(2026-09-08): dense/full 해시의 비트 동일성은 **같은 플랫폼(libm/BLAS
+> 빌드)** 안에서의 계약이다. 다른 머신(review-2026-09 작업기)은 무수정 base
+> 60e5c55에서 A dense 4cc99c84…, B dense 3a016e96…, 레거시 지오메트리 c4fecadd…를
+> 재현했고(numpy 2.3.2/2.4.6 동일), 그 머신 안에서는 작업 전후 불변이었다. 교차
+> 플랫폼 검증은 config_hash(플랫폼 독립)와 물리량 허용오차 대조로 한다.
 
 | 앵커 | 값 | 용도 |
 |---|---|---|

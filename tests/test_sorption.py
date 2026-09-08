@@ -716,3 +716,22 @@ def test_sorption_transient_failure_is_a_retried_reject(tmp_path):
     assert state.reject_counts.get("sorption_failure") == 1
     assert state.time_h == pytest.approx(4.0)
     assert calls["n"] > 1
+
+
+def test_buffer_demand_from_store_delta():
+    """RT-S1f: the CH transfer is sized by the store change's oxidation-
+    state charge, not by the subsystem's own portlandite churn - ligand
+    exchange precipitates half a CH per bound sulfate, proton-releasing
+    Ca complexation dissolves half, chloride on a neutral site precipitates
+    half, and a zero change books nothing."""
+    from tinn.engine import buffer_demand_mol
+    E = len(ELEMENT_IDS)
+    idx = {el: ELEMENT_IDS.index(el) for el in ELEMENT_IDS}
+    so4 = np.zeros(E); so4[idx["S"]] = 1.0; so4[idx["O"]] = 3.0; so4[idx["H"]] = -1.0
+    assert buffer_demand_mol(2.0 * so4) == pytest.approx(-1.0)     # precipitates
+    ca = np.zeros(E); ca[idx["Ca"]] = 1.0; ca[idx["H"]] = -1.0
+    assert buffer_demand_mol(2.0 * ca) == pytest.approx(1.0)        # dissolves
+    cl = np.zeros(E); cl[idx["Cl"]] = 1.0
+    assert buffer_demand_mol(cl) == pytest.approx(-0.5)
+    assert buffer_demand_mol(np.zeros(E)) == 0.0
+    assert buffer_demand_mol(-2.0 * so4) == pytest.approx(1.0)      # desorption

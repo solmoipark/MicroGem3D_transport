@@ -173,6 +173,29 @@ def _fold_dead_sorbed_rows(rows: np.ndarray, result_rows: np.ndarray,
     return events
 
 
+# oxidation-state charge per ledger element (cement solute frame: sulfur
+# as S(VI), iron as Fe(III), carbon as C(IV)) - the charge equivalent an
+# element removal carries; RT-S1f uses it to size the CH buffer transfer
+_OX_CHARGE = {"Ca": 2.0, "Si": 4.0, "Al": 3.0, "Fe": 3.0, "S": 6.0,
+              "Na": 1.0, "K": 1.0, "Mg": 2.0, "C": 4.0, "H": 1.0, "O": -2.0,
+              "Cl": -1.0}
+_OX_VEC = np.array([_OX_CHARGE[el] for el in ELEMENT_IDS])
+
+
+def buffer_demand_mol(store_delta: np.ndarray) -> float:
+    """RT-S1f: mol of Ca(OH)2 the pore solution must dissolve (+) or
+    precipitate (-) so that a sorbed-store change leaves it charge-neutral
+    at portlandite saturation. The store row's oxidation-state charge
+    sum q = sum_el ox_el * d_store_el is the charge the solution LOST;
+    ligand exchange (Surf_sOH + SO4-2 -> Surf_sSO4- + OH-) removes -1 per
+    bound (solution keeps an OH- excess -> CH precipitates 1/2), proton
+    release (Surf_sOH + Ca+2 -> Surf_sOCa+ + H+) removes +1 (solution turns
+    acid -> CH dissolves 1/2). Pure function of the ledger rows - no
+    subsystem churn, dt-invariant by construction."""
+    q_removed = float(np.dot(_OX_VEC, np.asarray(store_delta, dtype=np.float64)))
+    return 0.5 * q_removed
+
+
 def sorption_reactor_dry(water_mol: float, offer: np.ndarray,
                          dust_floor: float, sites_mol: float = 0.0) -> bool:
     """S-stage wetness/dust contract (RT-S1c, PRD 4.6.5): a reactor is an
@@ -1320,6 +1343,24 @@ class Engine:
                     # the committed state stays, the step halves dt. Config /
                     # stoichiometry errors (ValueError, RuntimeError) still
                     # propagate: they are not fixed by a smaller step.
+                    #
+                    # Trace-water guard (review-2026-09 branch, measured on a
+                    # second machine): a drained sub-voxel pocket with water
+                    # far below the largest reactor cannot converge PHREEQC's
+                    # A(H2O) balance at ANY dt (s_fac ~ 1/water, 1.5e12 at
+                    # 1.9e-16 mol H2O) - halving dt is futile and killed
+                    # otherwise healthy hydration runs at 216/378 h on that
+                    # GEMS/libm build. Skip it exactly like a dry reactor
+                    # (store frozen, material conserved, counted); a failure
+                    # in a substantial reactor still rejects the trial.
+                    wmax = float(water_mol_c.max()) if water_mol_c.size else 0.0
+                    if float(water_mol_c[c]) < 1e-3 * wmax:
+                        sorb_new[c] = sorb_in[c]
+                        n_sorb_dry += 1
+                        exchange_metrics["sorption_trace_water_skips"] = (
+                            exchange_metrics.get(
+                                "sorption_trace_water_skips", 0.0) + 1.0)
+                        continue
                     return None, StepReject(
                         "sorption_failure",
                         f"cluster {c}: water {float(water_mol_c[c])!r} mol, "
@@ -1334,7 +1375,26 @@ class Engine:
                     # fed amount double-counts; measured: balance_element
                     # Ca,H,O reject at 6 h). R then sees solids + solution
                     # as one conserved system and re-decides the assemblage.
-                    bd = res.buffer_delta_mol
+                    #
+                    # RT-S1f (2026-09-08, after the review-2026-09 RT-06 dt
+                    # ladder measured CH consumption DOUBLING per dt halving
+                    # in both the chloride and the sulfate exposure): the
+                    # PHREEQC subsystem dissolves CH to saturate its own
+                    # pseudo-solution (the re-offered store rides as an
+                    # acid frame) and that churn was booked every call, so
+                    # the R stage redistributed ~d_CH of portlandite to
+                    # other sinks once per S call - a 1/dt artifact. Book
+                    # only the base the STORE CHANGE itself demands, via the
+                    # portlandite stoichiometry (buffer_demand_mol); the
+                    # subsystem still equilibrates at CH saturation, its
+                    # own dissolution is discarded. Dissolution is capped by
+                    # the owned CH; the remainder rides the frame as before.
+                    n_ch = buffer_demand_mol(res.sorbed_mol - sorb_in[c])
+                    n_ch = min(n_ch, buf_mol)
+                    bd = np.zeros_like(res.buffer_delta_mol)
+                    for el, v in backend_mod._BUFFER_ROWS[
+                            self.config.sorption.buffer_phase].items():
+                        bd[ELEMENT_IDS.index(el)] = n_ch * v
                     inv_eff[c] = inv_eff[c] + bd
                     sorb_buffer_bd[c] = bd
                     # Portlandite = Ca(OH)2: one Ca per mol of buffer
