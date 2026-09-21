@@ -151,6 +151,27 @@ PK_PRESETS: Dict[str, PKPreset] = {
         surface_scales_all_rates=True,
         source="Elakneswaran, Owaki, Nawa (2018), doi:10.3390/app8122597, Appendix A.2",
     ),
+    # Lothenbach, Matschei, Moeschner, Glasser (2008) CCR 38, 1-18, Table 2
+    # (Parrot & Killoh OPC constants) + Table 3 activation energies (bold:
+    # C3S 42, C2S 21, C3A 54, C4AF 34 kJ/mol, from Kishi & Maekawa /
+    # Swaddiwudhipong), T0 = 293 K, f(w/c) = (1 + 4.444 w/c - 3.333 alpha)^4
+    # for alpha > 1.333 w/c (so H = 1.333 for EVERY phase, unlike the
+    # per-phase H of Lothenbach & Winnefeld 2006 carried by the 2018 preset).
+    # Surface-area scaling "using the data given in [12]" (Parrot 1989) is
+    # not tabulated in the paper; the Blaine ratio scales all rates as in
+    # the 2018 preset. Adopted 2026-09-22 as the project's DEFAULT P&K set.
+    "pk_lothenbach_2008": PKPreset(
+        name="pk_lothenbach_2008",
+        params=(
+            (1.5, 0.70, 0.050, 1.10, 3.3, 1.333, 42000.0),   # C3S (alite)
+            (0.5, 1.00, 0.006, 0.20, 5.0, 1.333, 21000.0),   # C2S (belite)
+            (1.0, 0.85, 0.040, 1.00, 3.2, 1.333, 54000.0),   # C3A (aluminate)
+            (0.37, 0.70, 0.015, 0.40, 3.7, 1.333, 34000.0),  # C4AF (ferrite)
+        ),
+        reference_temperature_k=293.15,
+        surface_scales_all_rates=True,
+        source="Lothenbach, Matschei, Moeschner, Glasser (2008), doi:10.1016/j.cemconres.2007.08.017, Tables 2-3",
+    ),
     "pk_cemgems_2021": PKPreset(
         name="pk_cemgems_2021",
         params=(

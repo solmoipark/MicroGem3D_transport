@@ -1,0 +1,101 @@
+{
+  "binder": {
+    "mass_fractions": {
+      "C3S": 0.7229,
+      "C2S": 0.1069,
+      "C3A": 0.0394,
+      "C4AF": 0.0578,
+      "gypsum": 0.0368,
+      "arcanite": 0.0043,
+      "thenardite": 0.0034
+    }
+  },
+  "w_c": 0.5,
+  "temperature_K": 299.15,
+  "kinetics": {
+    "kind": "pk",
+    "preset": "pk_lothenbach_2008",
+    "blaine_m2_kg": 385.0
+  },
+  "rve": {
+    "grid_size": 32,
+    "voxel_size_um": 1.0,
+    "seed": 20260731
+  },
+  "chemistry": {
+    "backend": "gems3k",
+    "gems_bundle_lst": "gems_bundles/PC/PC-dat.lst",
+    "gems_worker_python": "C:/Users/solmo/miniforge3/envs/py313-xgems/python.exe",
+    "suppressed_species": [
+      "HS-",
+      "H2S@",
+      "S-2",
+      "S2O3-2",
+      "HSO3-",
+      "SO3-2",
+      "H2S",
+      "Sulfur"
+    ],
+    "suppressed_phases": [
+      "Pyrite",
+      "Troilite"
+    ]
+  },
+  "schedule": {
+    "output_times_h": [
+      24.0,
+      168.0,
+      672.0,
+      1344.0,
+      2160.0,
+      2160.05,
+      2160.1,
+      2160.15,
+      2160.2,
+      2160.3,
+      2160.45,
+      2160.6,
+      2160.8,
+      2161.0,
+      2161.2
+    ],
+    "dt_initial_h": 2.0,
+    "dt_min_h": 0.0005,
+    "max_retries": 8,
+    "dt_windows": [
+      {
+        "until_h": 24.0,
+        "dt_h": 2.0
+      },
+      {
+        "until_h": 2160.0,
+        "dt_h": 6.0
+      },
+      {
+        "until_h": 2161.2,
+        "dt_h": 0.0014
+      }
+    ]
+  },
+  "transport": {
+    "domains": {
+      "tile_vox": 8,
+      "tile_zyx": [
+        2,
+        32,
+        32
+      ],
+      "d0_m2_s": 1e-09,
+      "dirty_rtol": 0.001,
+      "eq_max_age_steps": 20
+    },
+    "boundary": {
+      "axis": "z",
+      "side": "low",
+      "start_h": 2160.0,
+      "composition_mol_per_m3": {
+        "O": 0.5
+      }
+    }
+  }
+}

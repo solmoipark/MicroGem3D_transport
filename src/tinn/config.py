@@ -25,7 +25,7 @@ RASTER_HALO_VOX = 2.0 + math.sqrt(3.0)
 
 _STRICT = ConfigDict(extra="forbid")
 
-PK_PRESETS = ("pk_elakneswaran_2018", "pk_cemgems_2021")
+PK_PRESETS = ("pk_elakneswaran_2018", "pk_cemgems_2021", "pk_lothenbach_2008")
 
 
 class BinderRecipe(BaseModel):

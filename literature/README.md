@@ -27,3 +27,18 @@
 `chloride_tdm.db` (SQLite, 200 MB): papers 2,179 · mixes 20,360 · binding_isotherms 3,403(피팅형·계수)
 · binding_points 318 · profiles 15,386 · profile_points 3,808 · aux_observations 341,682.
 용도: 페이스트/콘크리트 수준 결합 등온선·침투 프로파일의 sanity 밴드(표면 상수 원천은 아님).
+
+## leaching/ (용출 검증 앵커, 2026-09-22 공급)
+
+| 파일 | 서지 | 용도 |
+|---|---|---|
+| 1992_Adenot_Buil_CCR22_… | Adenot & Buil, CCR 22(2–3) 489–496 (1992), doi:10.1016/0008-8846(92)90092-A | 탈이온수 용출 메커니즘·√t 기준(조성 미기재) |
+| 2000_Mainguy_…_CCR30_… | Mainguy, Tognazzi, Torrenti, Adenot, CCR 30(1) 83–90 (2000), doi:10.1016/S0008-8846(99)00208-2 | OPC w/c 0.4: 1.45 mm/3 mo, 2.1 mm/6 mo(Table 2); XRF 4 산화물만(Fe₂O₃ 없음) |
+| 2008_Kamali_…_CCR38_… | Kamali, Moranville, Leclercq, CCR 38(4) 575–585 (2008), doi:10.1016/j.cemconres.2007.10.009 | CEM I 전체 XRF(Table 1), w/c 0.5/0.4/0.25·온도별 a(Table 7), f(w/c) 식 — **1차 앵커** |
+| 2005_Haga_CCR35_… | Haga, Sutou, Hironaga, Tanaka, Nagasaki, CCR 35(9) 1764–1775 (2005), doi:10.1016/j.cemconres.2004.06.034 | OPC XRF(Table 1), w/c 0.4–1.0 CH 전선 vs √t(Fig. 11), 공극률–Ca 용출 |
+
+## kinetics/
+
+| 파일 | 서지 | 용도 |
+|---|---|---|
+| 2008_Lothenbach_…_CCR38_… | Lothenbach, Matschei, Möschner, Glasser, CCR 38(1) 1–18 (2008), doi:10.1016/j.cemconres.2007.08.017 | P&K 상수(Table 2)·활성화 에너지(Table 3) → 기본 프리셋 `pk_lothenbach_2008` |

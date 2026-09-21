@@ -258,7 +258,7 @@ src/tinn/
 - **KineticsModel**: 구간 [t, t+dt]에 대한 상별 목표 alpha 벡터만 반환. 위치·화학·형태 무관여.
   - `TabulatedKinetics`: 단조 보간, 시간 증가·alpha∈[0,1] 검증.
   - `ParrotKilloh`: 상별 min(R_ng, R_df, R_hs) 적분, Blaine/온도/RH/물접근 보정.
-    프리셋 `pk_elakneswaran_2018`(기본), `pk_cemgems_2021`. RH<0.55 컷오프.
+    프리셋 `pk_lothenbach_2008`(기본, 2026-09-22), `pk_elakneswaran_2018`, `pk_cemgems_2021`. RH<0.55 컷오프.
 - **ReactionBackend**: 클러스터별 (기존 용액 인벤토리 + 이번에 방출된 원소)를 받아
   (잔여 용액 인벤토리, 신규 침전 parcel 목록, 상태/잔차)를 반환. 미반응 클링커는 절대 입력하지 않는다.
   좌표를 모른다. 계산 불가 필드는 NaN + `not_available`이지 0이 아니다.
@@ -637,6 +637,29 @@ Deschner OPC **64³ @ 1 µm(64 µm)**, 밴드 타일 (2,64,64), 168 h 밀봉 →
   저장 매체로 쓰지 않는 안).
 - 유지보수 권고(`try_step` 분할)는 기록만; 기능 변경 없음.
 
+### RT-W5 — 용출 문헌 앵커 케이스 설계 (2026-09-22; 계산은 다른 컴퓨터)
+
+기존 W4 결과는 전부 Deschner OPC(C3A 4 %, w/c 0.5)라 문헌 √t 계수와는 정성 대조뿐이었다.
+사용자 결정: **P&K 기본 프리셋 = Lothenbach et al. 2008**(`pk_lothenbach_2008`: Table 2의
+K1/N1/K2/K3/N3 = 2018 프리셋과 동일, H = 1.333 전 상 공통[f(w/c) 적용 문턱 α > 1.333·w/c],
+Ea = 42/21/54/34 kJ/mol[Table 3 굵은 값], T₀ 293.15 K; 24 h·T₀에서는 2018 프리셋과 비트 동일,
+28 d·w/c 0.5에서 α_C3S 0.838→0.813); Blaine은 논문값, 없으면 P&K 기준 385 m²/kg; 조성은
+XRD가 없으면 **XRF → Bogue**(ASTM C150, 유리 CaO 보정), SO₃는 K₂O·Na₂O를 먼저 K₂SO₄/Na₂SO₄로
+(수용성 알칼리 = 전량 용해 가정), 남는 SO₃는 gypsum; MgO·유리 CaO·미기재 잔여는 불활성.
+문헌(`literature/leaching/`):
+
+| 앵커 | 조성 입력 → Bogue(wt%) | 조건 | 목표 a (μm/√day) |
+|---|---|---|---|
+| **Kamali 2008 CEM I** (1차) | XRF CaO 67.1 SiO₂ 22.75 Al₂O₃ 2.7 Fe₂O₃ 1.9 SO₃ 2.1 K₂O 0.23 Na₂O 0.15 MgO 0.85 유리CaO 0.55 → C3S 72.3 / C2S 10.7 / C3A 3.9 / C4AF 5.8 / gypsum 3.7 / arcanite 0.43 / thenardite 0.34 / 불활성 2.9 | 3 개월 양생, 갱신 순수(N₂), **26 °C**; 등온 엔진이라 전 구간 299.15 K(양생 20 °C와 차이 명시); Blaine 미기재 → 385 | Table 7: w/c 0.5 **169**, 0.4 **140**, 0.25 **75**; f(w/c) = 0.81·ln(8.592·w/c) |
+| Adenot 1992 / Mainguy 2000 OPC | XRF 4종만(CaO 62.9 SiO₂ 20.6 Al₂O₃ 5.8 SO₃ 3.1; **Fe₂O₃ 미기재** → Bogue 시 C3A 15 %로 왜곡) → **config 미작성**, Kamali w/c 0.4 케이스의 대조점으로만 사용 | w/c 0.4, 6 개월 석회수 양생, 20 °C, pH 7 갱신 | 1.45 mm/3 mo, 2.1 mm/6 mo → **152–156** |
+| **Haga 2005 OPC** | XRF SiO₂ 20.55 Al₂O₃ 5.26 Fe₂O₃ 2.73 CaO 64.26 MgO 1.18 SO₃ 1.98 Na₂O 0.29 K₂O 0.36 → C3S 62.5 / C2S 11.8 / C3A 9.3 / C4AF 8.3 / gypsum 2.8 / arcanite 0.67 / thenardite 0.66 / 불활성 4.0 | 56 d **50 °C** 수중 양생(등온 엔진에선 불가 → 20 °C 수화로 대체, 편차 명시), 20 °C 용출, L/S 1000 배치(비갱신 — 전선이 움직이는 w/c 0.4·0.6만 고정 배스로 근사) | Fig. 11 눈대중(±15 %): w/c 0.4 **~110**, 0.6 **~140**, 0.8 ~250, 1.0 ~430 |
+
+config: `examples/qualification/leach_kamali_cemI_wc{050,040,025}.json`, `leach_haga_opc_wc{040,060}.json`
+(32³, 노출 시각 2160 h / 1344 h, 노출 1.2 h dt 0.0014 h, 폭기수 배스 O 0.5, PC 번들 + S(VI) 배제;
+주석은 `README_leach_anchors.md`). 판정 계획: ① 32³ t_half 스크리닝으로 w/c 의존 지수(Kamali f식,
+Haga 기울기)와 비교, ② 64³ 전선(W4.2 절차)으로 a 직접값 — Kamali 0.4(≈Adenot)와 0.5 두 점 우선.
+미결: 양생 온도·기간 전환(온도 스케줄) 미지원, Blaine 미기재 2건, Haga 50 °C 양생의 수화도 차이.
+
 ### RT-W4② 실측 기록 1단계 (2026-09-03, 32³ NP 스크리닝 — 스칼라 사다리와 등가 D₀ 확정)
 
 - 런 `runs/leach_w4_dt0.5s_np_dwdef_1.0em09`(W4.1 32³ 기반, Tier 0 종별 NP,
@@ -687,6 +710,9 @@ R_df = K2(1−α)^(2/3) / [1−(1−α)^(1/3)],
 R_hs = K3(1−α)^N3, 제어속도 = min(세 후보).
 보정: Blaine 비 × Arrhenius(프리셋별 기준온도 293.15/298.15 K) × RH 인자 × 물접근 인자.
 프리셋별 차이: 2018은 전체 제어속도에 표면 스케일링, 2021은 nucleation/growth에만.
+**기본 프리셋(2026-09-22)**: `pk_lothenbach_2008` — Lothenbach et al. 2008 CCR 38 Table 2 상수 + Table 3
+활성화 에너지(42/21/54/34 kJ/mol), 물접근 문턱 α > 1.333·w/c 전 상 공통(2018 프리셋의 상별 H 1.8/1.35/1.6/1.45와
+다른 유일한 항), T₀ 293.15 K, 표면 스케일링은 2018과 같이 전체 속도. 기존 예제·기록은 2018 프리셋 그대로(해시 불변).
 총 클링커 alpha = 4상 질량가중 alpha / 4상 분율 합 (전체 시멘트 질량 아님).
 alpha 시드·적분 스텝은 config 명시 수치 정책.
 **가용성 염 담체(v3.0/E3b)**: 동역학 모듈은 이들에 대해 **아무 속도식도 갖지 않는다** —

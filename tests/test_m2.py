@@ -134,9 +134,21 @@ def test_alpha_24h_regression_snapshot():
                                  0.3893882681136848, 0.19067470813260054],
         "pk_cemgems_2021": [0.3594571813942425, 0.2617245655269392,
                             0.32338514256745915, 0.15004453532690035],
+        # Lothenbach 2008 (Tables 2-3, H = 1.333, Ea 42/21/54/34 kJ/mol):
+        # pinned 2026-09-22 from the first run of the preset
+        # (identical to the 2018 preset at 24 h and T0: H and Ea only act
+        # past the water threshold / away from 293.15 K; 28 d alpha differs)
+        "pk_lothenbach_2008": [0.41207163630249377, 0.13621110905159375,
+                               0.3893882681136848, 0.19067470813260054],
     }
     for preset, vals in expect.items():
         assert _pk(preset).alpha_at(24.0)[:4] == pytest.approx(vals, rel=1e-12)
+    # the presets DO differ where H/Ea act: 28 d at w/c 0.5 and 40 C
+    a18 = ParrotKilloh("pk_elakneswaran_2018", 0.5, 313.15, 385.0,
+                       {"C3S": 0.6, "C2S": 0.15, "C3A": 0.08, "C4AF": 0.08}).alpha_at(672.0)
+    a08 = ParrotKilloh("pk_lothenbach_2008", 0.5, 313.15, 385.0,
+                       {"C3S": 0.6, "C2S": 0.15, "C3A": 0.08, "C4AF": 0.08}).alpha_at(672.0)
+    assert not np.allclose(a18[:4], a08[:4])
 
 
 def test_srm114q_1d_within_plausible_band():
