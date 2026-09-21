@@ -1391,6 +1391,20 @@ class Engine:
                     # the owned CH; the remainder rides the frame as before.
                     n_ch = buffer_demand_mol(res.sorbed_mol - sorb_in[c])
                     n_ch = min(n_ch, buf_mol)
+                    # RT-S1f cap (verification 2026-09-08): dissolution is
+                    # capped above by the owned CH; precipitation (n_ch < 0)
+                    # must likewise be capped by the Ca the pore solution
+                    # actually holds - CH cannot precipitate Ca that is not in
+                    # solution. Without this bound the charge-equivalent booking
+                    # overdrew a trace-Ca micro-pocket (measured: cluster 16,
+                    # Ca -7.18e-19 mol, 672 h hydration hard-errored). The
+                    # remainder rides the O/H frame exactly as the uncapped
+                    # dissolution surplus already does.
+                    ca_avail = float(inv_eff[c][ELEMENT_IDS.index("Ca")])
+                    if n_ch < 0.0 and ca_avail > 0.0:
+                        n_ch = max(n_ch, -ca_avail)
+                    elif n_ch < 0.0:
+                        n_ch = 0.0
                     bd = np.zeros_like(res.buffer_delta_mol)
                     for el, v in backend_mod._BUFFER_ROWS[
                             self.config.sorption.buffer_phase].items():
