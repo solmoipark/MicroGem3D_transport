@@ -162,7 +162,9 @@ percolation, 상 분율, 슬라이스 PNG, §6.3 sanity band.
       `pk_lothenbach_2008`(Lothenbach 2008 Tables 2–3), Kamali 2008 CEM I(w/c 0.5/0.4/0.25,
       a 169/140/75 μm/√day)·Haga 2005 OPC(w/c 0.4/0.6) Bogue config 5개
       (`examples/qualification/leach_kamali_*`, `leach_haga_*`, 주석 `README_leach_anchors.md`).
-      계산은 다른 컴퓨터(지시서 3차 작업).
+      계산은 다른 컴퓨터(지시서 3차 작업). **실측 ① 32³ 스크리닝(2026-09-23)**: 32 μm 슬랩은
+      균일 용출 regime(전선 없음) → CH t_half w/c 비율 Kamali 0.4/0.5 1.44 vs 문헌 1.46 일치;
+      Kamali 0.25는 1 μm 해상도 모세관 비퍼콜레이션으로 봉인(RT-02 한계). 64³ 전선 진행 중.
 - [x] **review-2026-09 병합 + RT-R06/RT-S1f (2026-09-08)** — 다른 컴퓨터의 dt
       사다리 실측: 결합 Cl dt-강건(0.48 %), **CH-완충 S 단계는 1/dt 아티팩트**
       (CH 소비 dt 반감당 2배; Cl·황산염 재현). 원인 = 서브시스템 CH 용해량을
