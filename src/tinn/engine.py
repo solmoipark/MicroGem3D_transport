@@ -871,7 +871,8 @@ class Engine:
             tiles = self._domains_cfg.tiles(trial.grid_size)
             graph = transport.build_domain_graph(
                 labels, n_clusters, g_field, prev_liquid, axes_now,
-                tuple(float(t) for t in tiles))
+                tuple(float(t) for t in tiles),
+                dust_water_rel=self._domains_cfg.dust_water_rel)
             bath = None
             bnd_coupled = None
             if bath_active:

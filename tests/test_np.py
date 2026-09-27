@@ -602,3 +602,36 @@ def test_rt_connectivity_check_flags_gel_only_paths():
     assert chk["y"]["gel_only_path"] is False         # liquid spans
     assert chk["x"]["gel_only_path"] is False         # floor only
     assert chk["any_gel_only_axis"] is True
+
+
+def test_domain_graph_dust_water_rel_knob():
+    """RT-W5: the dust cutoff is a config knob. A sliver domain just above
+    the module default (1e-6 x mean) keeps its edges by default and is
+    frozen (no edges) once dust_water_rel is raised; None reproduces the
+    default exactly, and the Optional field pops from the config hash."""
+    import json
+    from tinn.config import TinnConfig
+    n = 4
+    dom = np.zeros((n, n, n), dtype=np.int64)
+    dom[2:] = 1
+    liq = np.ones((n, n, n))
+    liq[2:] = 1e-5                     # domain 1 is a water sliver
+    g = np.ones((n, n, n))
+    kw = dict(periodic_axes=(True, True, True), pitch_zyx=(2.0, 1.0, 1.0))
+    g_def = transport.build_domain_graph(dom, 2, g, liq, **kw)
+    g_none = transport.build_domain_graph(dom, 2, g, liq,
+                                          dust_water_rel=None, **kw)
+    g_hi = transport.build_domain_graph(dom, 2, g, liq,
+                                        dust_water_rel=1e-2, **kw)
+    assert g_def.edge_a.size == 1 and not g_def.dust.any()
+    assert np.array_equal(g_none.edge_g, g_def.edge_g)
+    assert g_hi.edge_a.size == 0 and g_hi.dust[1] and not g_hi.dust[0]
+    raw = json.loads((REPO / "examples" / "c3s_32.json").read_text(
+        encoding="utf-8"))
+    raw["chemistry"] = {"backend": "gems3k"}
+    raw["transport"] = {"domains": {"tile_vox": 8, "d0_m2_s": 1.0e-9}}
+    h0 = TinnConfig.model_validate(raw).config_hash()
+    raw["transport"]["domains"]["dust_water_rel"] = None
+    assert TinnConfig.model_validate(raw).config_hash() == h0
+    raw["transport"]["domains"]["dust_water_rel"] = 1e-4
+    assert TinnConfig.model_validate(raw).config_hash() != h0

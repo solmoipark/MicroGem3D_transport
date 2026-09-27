@@ -597,6 +597,15 @@ class DomainPartitionConfig(BaseModel):
     dirty_rtol: float = Field(default=0.0, ge=0.0)
     eq_max_age_steps: int = Field(default=16, ge=1)
     max_gem_calls_per_step: Optional[int] = Field(default=None, ge=1)
+    # RT-W5 (2026-09-28): dust cutoff for transport nodes - a domain whose
+    # water is below dust_water_rel x (mean wet-domain water) carries no
+    # graph edges (transport-frozen). None = the transport module default
+    # (1e-6) and pops from the config hash, so every earlier config is
+    # untouched. Measured need: a mature 64^3 w/c 0.4 paste at 1e-6 keeps
+    # sliver domains (0.0004 % of the water) that push the BE conjugate
+    # gradient past its iteration ceiling (transport_failure); 1e-4 cuts the
+    # iteration count 15x.
+    dust_water_rel: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
 
     @model_validator(mode="after")
     def _check(self) -> "DomainPartitionConfig":

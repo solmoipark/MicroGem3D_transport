@@ -193,7 +193,8 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
                        periodic_axes: Tuple[bool, bool, bool] = (True, True,
                                                                  True),
                        pitch_zyx: Tuple[float, float, float] = (1.0, 1.0,
-                                                                1.0)
+                                                                1.0),
+                       dust_water_rel: Optional[float] = None
                        ) -> DomainGraph:
     """Edges between face-adjacent wet voxels of DIFFERENT domains (always
     domains of the same cluster, by construction of the 6-neighbor flood).
@@ -210,7 +211,14 @@ def build_domain_graph(domain_id: np.ndarray, n_domains: int,
     if wet.any():
         np.add.at(water, domain_id[wet], liquid[wet])
     wp = water[water > 0.0]
-    dust_floor = DUST_WATER_REL * float(wp.mean()) if wp.size else 0.0
+    # RT-W5 (2026-09-28): the dust cutoff is a config knob. Measured on the
+    # 64^3 Kamali w/c 0.4 paste at 1344 h: at the 1e-6 default, sliver
+    # domains holding 0.0004 % of the water span an 8.75e7 water contrast and
+    # drive the Jacobi-PCG to ~7,800 iterations (transport_failure once the
+    # 1e4 ceiling is hit as the paste matures); 1e-4 brings the contrast to
+    # 4.6e5 and 524 iterations. None keeps the module default exactly.
+    rel = DUST_WATER_REL if dust_water_rel is None else float(dust_water_rel)
+    dust_floor = rel * float(wp.mean()) if wp.size else 0.0
     dust = water < dust_floor
     keys = []
     conds = []
